@@ -57,7 +57,7 @@ As we move forward, we'll keep adding improvements, fixing issues, and adding su
 
 ## Credits
 
-Made by **Heitor Spectre**.
+Made by [Heitor Spectre](https://github.com/HeitorSpectre).
 
 Special thanks to:
 - [iMrShadow](https://github.com/iMrShadow)
