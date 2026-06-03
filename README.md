@@ -39,6 +39,14 @@ The reason is that I still haven't been able to find a proper solution for conve
 
 **If anyone has information about this** — especially for older Telltale games like The Wolf Among Us and others — or wants to help, feel free to reach out. Everything is uploaded here so people can take a look.
 
+## Help with testing
+
+I need your help with testing. If you find any kind of bug, please submit an issue so it can be fixed.
+
+I've already done several tests, covering many different possible scenarios, but something may still have slipped through.
+
+As we move forward, we'll keep adding improvements, fixing issues, and adding support for more games over time.
+
 ## Credits
 
 Made by **Heitor Spectre**.
