@@ -1,5 +1,6 @@
 using System.Diagnostics;
 using TelltaleD3DMeshEditor.Core;
+using TelltaleD3DMeshEditor.Formats.Archives;
 using TelltaleD3DMeshEditor.Formats.Mesh;
 using TelltaleD3DMeshEditor.Formats.Skeleton;
 using TelltaleD3DMeshEditor.Formats.Texture;
@@ -15,6 +16,7 @@ public sealed class MainForm : Form
 {
     private readonly ToolStrip _toolStrip = new();
     private readonly ToolStripButton _btnOpen = new("Open Folder...");
+    private readonly ToolStripButton _btnOpenArchive = new("Open Archive...");
     private readonly ToolStripButton _btnExtractSelected = new("Extract Selected...");
     private readonly ToolStripButton _btnExtractAll = new("Extract All...");
     private readonly ToolStripButton _btnReimportSelected = new("Reimport Selected...");
@@ -75,6 +77,7 @@ public sealed class MainForm : Form
         _toolStrip.Items.AddRange(new ToolStripItem[]
         {
             _btnOpen,
+            _btnOpenArchive,
             new ToolStripSeparator(),
             _btnExtractSelected,
             _btnExtractAll,
@@ -95,6 +98,7 @@ public sealed class MainForm : Form
         _btnPan.CheckOnClick = true;
         _btnPose.CheckOnClick = true;
         _btnCombineParts.CheckOnClick = true;
+        _btnOpenArchive.ToolTipText = "Opens one or more Telltale .ttarch/.ttarch2 game containers and extracts their .d3dmesh, .d3dtx and .skl files automatically, then loads them. Select a mesh + texture archive together to see models with their textures.";
         _btnPan.ToolTipText = "Left-drag pans. Middle/Shift+drag also pans; mouse wheel zooms; F centers.";
         _btnPose.ToolTipText = "Select and drag skeleton joints; weighted mesh vertices deform in the preview.";
         _btnFormat.ToolTipText = "Toggles the extraction output format between GLB (single file) and GLTF + files.";
@@ -168,12 +172,13 @@ public sealed class MainForm : Form
 
     private void WireEvents()
     {
-        _btnOpen.Click += (_, _) => OpenFolderDialog();
-        _btnReload.Click += (_, _) =>
+        _btnOpen.Click += async (_, _) => await OpenFolderDialogAsync();
+        _btnOpenArchive.Click += async (_, _) => await OpenArchiveAsync();
+        _btnReload.Click += async (_, _) =>
         {
             if (_rootFolder is not null)
             {
-                LoadFolder(_rootFolder);
+                await LoadFolderAsync(_rootFolder);
             }
         };
         _btnExtractSelected.Click += async (_, _) => await ExtractSelectedAsync();
@@ -247,11 +252,11 @@ public sealed class MainForm : Form
             var path = paths[0];
             if (Directory.Exists(path))
             {
-                LoadFolder(path);
+                _ = LoadFolderAsync(path);
             }
             else if (File.Exists(path))
             {
-                LoadFolder(Path.GetDirectoryName(path)!);
+                _ = LoadFolderAsync(Path.GetDirectoryName(path)!);
             }
         };
     }
@@ -282,7 +287,7 @@ public sealed class MainForm : Form
         return $"{models} | {groups}";
     }
 
-    private void OpenFolderDialog()
+    private async Task OpenFolderDialogAsync()
     {
         using var dialog = new FolderBrowserDialog
         {
@@ -292,18 +297,141 @@ public sealed class MainForm : Form
 
         if (dialog.ShowDialog(this) == DialogResult.OK)
         {
-            LoadFolder(dialog.SelectedPath);
+            await LoadFolderAsync(dialog.SelectedPath);
         }
     }
 
-    private void LoadFolder(string folder)
+    // Opens one or more Telltale containers (.ttarch / .ttarch2), extracts the editor-relevant
+    // assets, and loads them through the normal folder-loading path. Selecting several archives at
+    // once is useful because games like The Wolf Among Us split meshes and their textures across
+    // separate archives (e.g. "..._mesh.ttarch2" + "..._tx.ttarch2"); extracting them together lets
+    // a model show up with its textures. No external unpacking tool is needed.
+    private async Task OpenArchiveAsync()
+    {
+        using var dialog = new OpenFileDialog
+        {
+            Title = "Select one or more Telltale archives (.ttarch / .ttarch2)",
+            Filter = "Telltale archives (*.ttarch;*.ttarch2)|*.ttarch;*.ttarch2|All files (*.*)|*.*",
+            CheckFileExists = true,
+            Multiselect = true
+        };
+
+        if (dialog.ShowDialog(this) != DialogResult.OK)
+        {
+            return;
+        }
+
+        var archivePaths = dialog.FileNames;
+        var baseDir = Path.GetDirectoryName(archivePaths[0]) ?? Environment.CurrentDirectory;
+
+        // Group archives by their scene/episode "section" (Boot, Fables101, Menu...) instead of by raw
+        // file name. Every archive of the same section extracts into one section-named subfolder, and
+        // the shared parent folder is loaded, so the viewer shows one tidy group per scene with each
+        // mesh sitting next to the textures from that scene's other archives (data / mesh / tx / txmesh).
+        var single = archivePaths.Length == 1;
+        var loadFolder = single
+            ? Path.Combine(baseDir, Path.GetFileNameWithoutExtension(archivePaths[0]) + "_extracted")
+            : Path.Combine(baseDir, "ttarch_extracted");
+
+        var totalExtracted = 0;
+        var failures = new List<string>();
+
+        await RunWithUiLockAsync(async () =>
+        {
+            _statusLabel.Text = archivePaths.Length == 1
+                ? "Extracting archive..."
+                : $"Extracting {archivePaths.Length} archives...";
+
+            await Task.Run(() =>
+            {
+                foreach (var archivePath in archivePaths)
+                {
+                    // Single archive: extract straight into its own folder. Multiple: one subfolder
+                    // per section (Boot, Fables101, ...) so same-scene archives merge together.
+                    var destFolder = single
+                        ? loadFolder
+                        : Path.Combine(loadFolder, ArchiveImporter.GetSectionName(archivePath));
+                    try
+                    {
+                        var result = ArchiveImporter.Extract(
+                            archivePath,
+                            destFolder,
+                            ArchiveImporter.WolfAmongUsKey);
+                        totalExtracted += result.ExtractedCount;
+                    }
+                    catch (Exception ex)
+                    {
+                        failures.Add($"{Path.GetFileName(archivePath)}: {ex.Message}");
+                    }
+                }
+            });
+
+            if (totalExtracted > 0)
+            {
+                var loadProgress = new Progress<double>(fraction =>
+                    SetProgress((int)(fraction * 1000), 1000, $"Reading folder... {(int)(fraction * 100)}%"));
+                await ReloadAssetsAsync(loadFolder, loadProgress);
+            }
+
+            var message = totalExtracted > 0
+                ? $"Extracted {totalExtracted} asset file(s) from {archivePaths.Length} archive(s)\n\ninto:\n{loadFolder}"
+                : "No .d3dmesh, .d3dtx or .skl files were found in the selected archive(s).";
+
+            if (failures.Count > 0)
+            {
+                message += $"\n\nCould not open {failures.Count} archive(s):\n" + string.Join("\n", failures);
+            }
+
+            return message;
+        });
+    }
+
+    // Entry point for Open Folder / Reload / drag-drop. Owns the busy state, the progress bar and error
+    // reporting so a large folder loads on a background thread without freezing the window.
+    private async Task LoadFolderAsync(string folder)
+    {
+        SetBusy(true);
+        try
+        {
+            var progress = new Progress<double>(fraction =>
+                SetProgress((int)(fraction * 1000), 1000, $"Reading folder... {(int)(fraction * 100)}%"));
+            await ReloadAssetsAsync(folder, progress);
+        }
+        catch (Exception ex)
+        {
+            _statusLabel.Text = "Error.";
+            var logPath = ErrorLog.Write(ex, "Folder load failed");
+            MessageBox.Show(
+                $"Could not load the folder. A detailed log was written to:\n{logPath}\n\n{ex.Message}",
+                Text,
+                MessageBoxButtons.OK,
+                MessageBoxIcon.Error);
+        }
+        finally
+        {
+            SetBusy(false);
+        }
+    }
+
+    // Runs the heavy discovery off the UI thread, reporting 0..1 progress, then rebuilds the tree and
+    // toolbar state on the UI thread. The caller is responsible for the busy state (so it can be reused
+    // both standalone and inside the archive-import flow, which already holds the UI lock).
+    private async Task ReloadAssetsAsync(string folder, IProgress<double>? progress)
     {
         _rootFolder = folder;
         _selectedAsset = null;
         _selectedGroup = null;
         _preview.SetScene(null, null);
-        _assets = ModelAsset.Discover(folder);
-        _assetGroups = ModelAssetGroup.Discover(_assets, folder);
+
+        var (assets, groups) = await Task.Run(() =>
+        {
+            var discovered = ModelAsset.Discover(folder, SubRange(progress, 0.0, 0.7));
+            var grouped = ModelAssetGroup.Discover(discovered, folder, SubRange(progress, 0.7, 1.0));
+            return (discovered, grouped);
+        });
+
+        _assets = assets;
+        _assetGroups = groups;
         _searchText.Enabled = true;
         if (_searchText.TextLength > 0)
         {
@@ -323,6 +451,20 @@ public sealed class MainForm : Form
         _statusLabel.Text = _assets.Count == 0
             ? "No .d3dmesh files were found in this folder."
             : $"Loaded: {folder}";
+    }
+
+    // Forwards a 0..1 sub-progress into a [start, end] slice of an overall 0..1 progress. Forwards
+    // synchronously on the caller's (background) thread; the wrapped UI Progress<T> does the marshaling.
+    private static IProgress<double>? SubRange(IProgress<double>? target, double start, double end)
+    {
+        return target is null
+            ? null
+            : new DelegateProgress(value => target.Report(start + value * (end - start)));
+    }
+
+    private sealed class DelegateProgress(Action<double> report) : IProgress<double>
+    {
+        public void Report(double value) => report(value);
     }
 
     private void RebuildAssetTree()
@@ -1283,6 +1425,7 @@ public sealed class MainForm : Form
         _isBusy = busy;
         UseWaitCursor = busy;
         _btnOpen.Enabled = !busy;
+        _btnOpenArchive.Enabled = !busy;
         _btnReload.Enabled = !busy && _rootFolder is not null;
         _btnExtractAll.Enabled = !busy && _rootFolder is not null && _assets.Count > 0;
         _btnExtractSelected.Enabled = !busy && _rootFolder is not null && HasExtractSelection();

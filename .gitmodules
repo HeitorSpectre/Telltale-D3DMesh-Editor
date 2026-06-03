@@ -1,0 +1,3 @@
+[submodule "external/TelltaleToolKit"]
+	path = external/TelltaleToolKit
+	url = https://github.com/iMrShadow/TelltaleToolKit

@@ -1,0 +1,20 @@
+# --- Backups / local-only archives (never publish) ---
+*.rar
+*.zip
+*.7z
+
+# Local backup / working folders (not part of the published project)
+/Codigo Fonte/
+/Validacao/
+/src/
+
+# --- .NET build artifacts ---
+[Bb]in/
+[Oo]bj/
+*.user
+.vs/
+
+# --- OS / editor cruft ---
+Thumbs.db
+desktop.ini
+.DS_Store

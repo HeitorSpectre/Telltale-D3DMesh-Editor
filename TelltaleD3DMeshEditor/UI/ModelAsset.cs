@@ -15,7 +15,12 @@ public sealed class ModelAsset
     public string MeshPath { get; }
     public string? SkeletonPath { get; }
 
-    public static List<ModelAsset> Discover(string inputPath)
+    // Discovers every mesh under <paramref name="inputPath"/> and pairs it with its skeleton.
+    // <paramref name="progress"/> (optional) receives a 0..1 fraction as meshes are processed; it is
+    // throttled to whole-percent changes so reporting never slows the scan down. This is the slow part
+    // of loading a folder (each mesh may be parsed to find its skeleton), so callers run it on a
+    // background thread and surface the fraction on the progress bar to keep the UI responsive.
+    public static List<ModelAsset> Discover(string inputPath, IProgress<double>? progress = null)
     {
         if (!Directory.Exists(inputPath))
         {
@@ -33,9 +38,27 @@ public sealed class ModelAsset
             .ToDictionary(group => group.Key, group => group.ToList(), StringComparer.OrdinalIgnoreCase);
         var skeletonHashes = BuildSkeletonHashIndex(skeletonFiles);
 
-        return meshFiles
-            .Select(mesh => new ModelAsset(mesh, ResolveSkeleton(mesh, skeletonsByStem, skeletonHashes)))
-            .ToList();
+        var result = new List<ModelAsset>(meshFiles.Count);
+        var lastPercent = -1;
+        for (var i = 0; i < meshFiles.Count; i++)
+        {
+            var mesh = meshFiles[i];
+            result.Add(new ModelAsset(mesh, ResolveSkeleton(mesh, skeletonsByStem, skeletonHashes)));
+
+            if (progress is null)
+            {
+                continue;
+            }
+
+            var percent = (int)((i + 1) * 100L / meshFiles.Count);
+            if (percent != lastPercent)
+            {
+                lastPercent = percent;
+                progress.Report(percent / 100.0);
+            }
+        }
+
+        return result;
     }
 
     public override string ToString()

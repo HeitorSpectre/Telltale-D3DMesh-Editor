@@ -24,6 +24,8 @@ public sealed class ModelAssetGroup
         "teeth",
         "tongue",
         "body",
+        "torso",
+        "chest",
         "head",
         "hands",
         "arms",
@@ -74,7 +76,13 @@ public sealed class ModelAssetGroup
 
     public string OutputStem => Sanitize(Name + "_combined");
 
-    public static List<ModelAssetGroup> Discover(IReadOnlyList<ModelAsset> assets, string inputRoot)
+    // <paramref name="progress"/> (optional) receives a 0..1 fraction as buckets are grouped; some
+    // groupers parse mesh bounds, so this can be slow on large folders and is reported on the progress
+    // bar. Throttled to whole-percent changes to avoid adding any overhead.
+    public static List<ModelAssetGroup> Discover(
+        IReadOnlyList<ModelAsset> assets,
+        string inputRoot,
+        IProgress<double>? progress = null)
     {
         var buckets = new Dictionary<string, (string SkeletonPath, string RelativeDirectory, List<ModelAsset> Assets)>(
             StringComparer.OrdinalIgnoreCase);
@@ -103,8 +111,28 @@ public sealed class ModelAssetGroup
             bucket.Assets.Add(asset);
         }
 
-        return buckets.Values
-            .SelectMany(bucket => BuildGroups(bucket.SkeletonPath, bucket.RelativeDirectory, bucket.Assets))
+        var bucketList = buckets.Values.ToList();
+        var groups = new List<ModelAssetGroup>();
+        var lastPercent = -1;
+        for (var i = 0; i < bucketList.Count; i++)
+        {
+            var bucket = bucketList[i];
+            groups.AddRange(BuildGroups(bucket.SkeletonPath, bucket.RelativeDirectory, bucket.Assets));
+
+            if (progress is null)
+            {
+                continue;
+            }
+
+            var percent = (int)((i + 1) * 100L / bucketList.Count);
+            if (percent != lastPercent)
+            {
+                lastPercent = percent;
+                progress.Report(percent / 100.0);
+            }
+        }
+
+        return groups
             .OrderBy(group => group.RelativeDirectory, StringComparer.OrdinalIgnoreCase)
             .ThenBy(group => group.Name, StringComparer.OrdinalIgnoreCase)
             .ToList();
@@ -134,9 +162,22 @@ public sealed class ModelAssetGroup
         string relativeDirectory,
         List<ModelAsset> assets)
     {
-        var core = BuildGroupsCore(skeletonPath, relativeDirectory, assets).ToList();
-        return AppendOptionalAccessories(core, skeletonPath, relativeDirectory, assets);
+        // Drop parts that must never be merged into a combined model before any grouping runs. They
+        // still appear individually in the tree; they just never join a group.
+        var combinable = assets
+            .Where(asset => !IsExcludedFromCombine(Path.GetFileNameWithoutExtension(asset.MeshPath)))
+            .ToList();
+
+        var core = BuildGroupsCore(skeletonPath, relativeDirectory, combinable).ToList();
+        return AppendOptionalAccessories(core, skeletonPath, relativeDirectory, combinable);
     }
+
+    // Parts that should never be combined. Headlight beam cones ("..._lightsBeamsHeadlights") are
+    // volumetric light projections, not body geometry: combined, they show up as large stray shapes
+    // that do not fit the car. They are kept out of every group and remain available on their own.
+    private static bool IsExcludedFromCombine(string stem)
+        => stem.Contains("BeamsHeadlights", StringComparison.OrdinalIgnoreCase);
+
 
     private static IEnumerable<ModelAssetGroup> AppendOptionalAccessories(
         List<ModelAssetGroup> core,
@@ -499,10 +540,28 @@ public sealed class ModelAssetGroup
         foreach (var asset in assets)
         {
             var stem = Path.GetFileNameWithoutExtension(asset.MeshPath);
-            var prefix = GetModelPrefix(stem);
-            if (prefix is null || !prefix.StartsWith(skeletonStem, StringComparison.OrdinalIgnoreCase))
+
+            // A vehicle's identity is its skeleton. Group the bare body (named exactly like the
+            // skeleton, e.g. obj_carGenericB) together with every "<skeleton>_<component>" part under a
+            // single prefix. This both keeps the body in the group (it used to be dropped, leaving the
+            // car invisible) and pulls in two-segment components like "_lightsTurnSignal_L"/"_R" that
+            // GetModelPrefix would otherwise split into their own group. Parts with a genuinely
+            // different model prefix that merely begins with the skeleton name (e.g.
+            // obj_carPoliceWithInterior_* sharing obj_carPolice.skl) keep their own prefix and stay
+            // separate, because they do not start with "<skeleton>_".
+            string? prefix;
+            if (stem.Equals(skeletonStem, StringComparison.OrdinalIgnoreCase) ||
+                stem.StartsWith(skeletonStem + "_", StringComparison.OrdinalIgnoreCase))
             {
-                continue;
+                prefix = skeletonStem;
+            }
+            else
+            {
+                prefix = GetModelPrefix(stem);
+                if (prefix is null || !prefix.StartsWith(skeletonStem, StringComparison.OrdinalIgnoreCase))
+                {
+                    continue;
+                }
             }
 
             if (!byPrefix.TryGetValue(prefix, out var list))
@@ -546,13 +605,30 @@ public sealed class ModelAssetGroup
                 DamageVariantPlanner.GetBounds(asset.MeshPath)))
             .ToList();
 
+        // The single largest mesh is the prop's main body and must always be present, so it never acts
+        // as a swappable variant. This stops a small proxy part (e.g. obj_carMary_obj, a bumper-sized
+        // mesh sitting inside the full obj_carMary_car body) from pairing with the body and producing a
+        // bodyless combination. Real alternates that are not the body (a taxi's roof sign A vs B, a
+        // police car's light bar on vs off) are unaffected, since the body never paired with them anyway.
+        var dominantIndex = -1;
+        var dominantVolume = double.NegativeInfinity;
+        for (var i = 0; i < items.Count; i++)
+        {
+            var volume = items[i].Bounds is { } bounds ? Volume(bounds) : 0;
+            if (volume > dominantVolume)
+            {
+                dominantVolume = volume;
+                dominantIndex = i;
+            }
+        }
+
         var parent = Enumerable.Range(0, items.Count).ToArray();
         int Find(int i) => parent[i] == i ? i : parent[i] = Find(parent[i]);
         for (var i = 0; i < items.Count; i++)
         {
             for (var j = i + 1; j < items.Count; j++)
             {
-                if (AreExclusiveVariants(items[i], items[j]))
+                if (i != dominantIndex && j != dominantIndex && AreExclusiveVariants(items[i], items[j]))
                 {
                     parent[Find(i)] = Find(j);
                 }
@@ -613,6 +689,9 @@ public sealed class ModelAssetGroup
         var minVolume = Math.Min(volA, volB);
         return minVolume <= 0 ? 0 : inter / minVolume;
     }
+
+    private static double Volume(DamageVariantPlanner.Bounds b)
+        => (double)(b.MaxX - b.MinX) * (b.MaxY - b.MinY) * (b.MaxZ - b.MinZ);
 
     private static int CommonPrefixLength(string a, string b)
     {

@@ -16,6 +16,13 @@
     <DebugSymbols>false</DebugSymbols>
   </PropertyGroup>
 
+  <!-- TelltaleToolKit (git submodule at /external/TelltaleToolKit) — used to open and
+       extract .ttarch / .ttarch2 game containers so users don't have to unpack them manually.
+       Referenced from source so it stays linked to the upstream repo via the submodule. -->
+  <ItemGroup>
+    <ProjectReference Include="..\external\TelltaleToolKit\src\TelltaleToolKit\TelltaleToolKit.csproj" />
+  </ItemGroup>
+
   <!-- Telltale hash databases (BoneNames/TexNames) embedded in the tool
        (Resources/HashDBs) and copied next to the .exe. Everything is offline and self-contained,
        with no dependency on external folders, so the tool can be distributed on its own. -->

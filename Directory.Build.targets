@@ -1,0 +1,14 @@
+<Project>
+
+  <!--
+    The TelltaleToolKit submodule multi-targets net8.0;net9.0;net10.0;netstandard2.1.
+    This repo's app targets net9.0-windows and is built with the .NET 9 SDK, which cannot
+    evaluate the net10.0 target (error NETSDK1045) during restore. Since the Toolkit is only
+    consumed here as a net9.0 dependency, pin it to net9.0 when it is built from inside this repo.
+    This file lives in the parent repo (not the submodule), so it never alters the upstream project.
+  -->
+  <PropertyGroup Condition="'$(MSBuildProjectName)' == 'TelltaleToolKit'">
+    <TargetFrameworks>net9.0</TargetFrameworks>
+  </PropertyGroup>
+
+</Project>

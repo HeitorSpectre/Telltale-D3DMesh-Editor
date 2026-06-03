@@ -15,11 +15,25 @@ In short: it's now possible to **edit any existing model, import models from the
 
 ## How to use
 
-1. Extract the **texture** (`.d3dtx`) from the game.
-2. Extract the **model** (`.d3dmesh`) from the game.
-3. Extract the **skeleton** (`.skl`) file.
-4. Put all of them inside a **single folder**.
-5. Open that folder in the tool — it will load and display everything for you.
+There are two ways to load assets.
+
+### Option A — Open an archive (recommended)
+
+You can open the game's container files directly, without unpacking them with an external tool first.
+
+1. Click **Open Archive…** in the toolbar.
+2. Select one or more `.ttarch` / `.ttarch2` files (hold **Ctrl** to pick several at once).
+3. The tool extracts only the relevant assets (`.d3dmesh`, `.d3dtx` and `.skl`) and loads them automatically.
+
+Because games like *The Wolf Among Us* split models and their textures across separate archives (for example a `…_mesh.ttarch2` and a `…_tx.ttarch2`), you can select both at the same time so the models show up with their correct textures. Each archive is extracted into its own folder, while the viewer still shows everything together.
+
+### Option B — Open a folder (manual)
+
+If you already have the files extracted, or want to load custom assets:
+
+1. Extract the **texture** (`.d3dtx`), the **model** (`.d3dmesh`) and, optionally, the **skeleton** (`.skl`) from the game.
+2. Put them inside a **single folder**.
+3. Click **Open Folder…** and select it — the tool will load and display everything for you.
 
 ## Safe, isolated textures
 
@@ -31,6 +45,7 @@ So if the original model uses 10 textures, the tool can still take a custom mode
 
 | Platform | Game | Status |
 |----------|------|--------|
+| PC | The Walking Dead: Season 2 | 🚧 Working |
 | PC | The Wolf Among Us | ✅ Working |
 
 ## A note about skeletons and animations

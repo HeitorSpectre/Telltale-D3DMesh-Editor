@@ -447,6 +447,16 @@ internal static class DamageVariantPlanner
         }
 
         var suffix = woundTail[anchorTail.Length..];
+
+        // "<part>Damaged" / "<part>Damage" is the wounded version OF that specific part, so it replaces
+        // that part (e.g. headNose -> headNoseDamaged replaces the nose, NOT the whole head). Only the
+        // bare suffix counts: "Damage<Spot>" families (head -> headDamageBase) stay additive layers.
+        if (suffix.Equals("Damaged", StringComparison.OrdinalIgnoreCase) ||
+            suffix.Equals("Damage", StringComparison.OrdinalIgnoreCase))
+        {
+            return true;
+        }
+
         return !suffix.StartsWith("Damage", StringComparison.OrdinalIgnoreCase) &&
                !suffix.StartsWith("State", StringComparison.OrdinalIgnoreCase);
     }
