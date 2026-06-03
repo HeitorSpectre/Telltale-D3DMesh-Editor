@@ -13,6 +13,14 @@ It helps modders inspect models, meshes, textures, and skeletons, and modify the
 
 In short: it's now possible to **edit any existing model, import models from the internet into the game, and modify the game's original models too.**
 
+## How to use
+
+1. Extract the **texture** (`.d3dtx`) from the game.
+2. Extract the **model** (`.d3dmesh`) from the game.
+3. Extract the **skeleton** (`.skl`) file.
+4. Put all of them inside a **single folder**.
+5. Open that folder in the tool — it will load and display everything for you.
+
 ## Safe, isolated textures
 
 The tool **does not replace any texture already used by the game.** Instead, it assigns the new textures to your model and makes the game accept them properly.
