@@ -1,0 +1,31 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <OutputType>WinExe</OutputType>
+    <TargetFramework>net9.0-windows</TargetFramework>
+    <Nullable>enable</Nullable>
+    <UseWindowsForms>true</UseWindowsForms>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <RootNamespace>TelltaleD3DMeshEditor</RootNamespace>
+    <AssemblyName>TelltaleD3DMeshEditor</AssemblyName>
+    <ApplicationIcon>Resources\Icons\logo.ico</ApplicationIcon>
+  </PropertyGroup>
+
+  <PropertyGroup Condition="'$(Configuration)' == 'Release'">
+    <DebugType>none</DebugType>
+    <DebugSymbols>false</DebugSymbols>
+  </PropertyGroup>
+
+  <!-- Telltale hash databases (BoneNames/TexNames) embedded in the tool
+       (Resources/HashDBs) and copied next to the .exe. Everything is offline and self-contained,
+       with no dependency on external folders, so the tool can be distributed on its own. -->
+  <ItemGroup>
+    <None Include="Resources\HashDBs\BoneNames.HashDB" Link="HashDBs\BoneNames.HashDB">
+      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+    </None>
+    <None Include="Resources\HashDBs\TexNames.HashDB" Link="HashDBs\TexNames.HashDB">
+      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+    </None>
+  </ItemGroup>
+
+</Project>
