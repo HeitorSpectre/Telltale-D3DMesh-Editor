@@ -548,9 +548,18 @@ public sealed class MeshPreviewControl : Control
                 }
 
                 color = ApplyVertexColor(color, vertexColorR, vertexColorG, vertexColorB, vertexColorA);
-                if (((color >> 24) & 0xFF) < 8)
+                var pixelAlpha = (color >> 24) & 0xFF;
+                if (pixelAlpha < 8)
                 {
                     continue;
+                }
+
+                // Semi-transparent pixels (e.g. Sarah's glasses lens, soft hair edges) blend over what
+                // is already drawn behind them instead of overwriting it opaquely. Fully opaque pixels
+                // (the vast majority, including all of The Wolf Among Us) are written unchanged.
+                if (pixelAlpha < 250)
+                {
+                    color = BlendOver(color, pixels[index], pixelAlpha);
                 }
 
                 depth[index] = z;
@@ -562,6 +571,16 @@ public sealed class MeshPreviewControl : Control
     private static float Edge(float ax, float ay, float bx, float by, float cx, float cy)
     {
         return (cx - ax) * (by - ay) - (cy - ay) * (bx - ax);
+    }
+
+    // Source-over alpha blend of a semi-transparent pixel onto the pixel already in the framebuffer.
+    private static int BlendOver(int src, int dst, int srcAlpha)
+    {
+        var inv = 255 - srcAlpha;
+        var r = (((src >> 16) & 0xFF) * srcAlpha + ((dst >> 16) & 0xFF) * inv) / 255;
+        var g = (((src >> 8) & 0xFF) * srcAlpha + ((dst >> 8) & 0xFF) * inv) / 255;
+        var b = ((src & 0xFF) * srcAlpha + (dst & 0xFF) * inv) / 255;
+        return (0xFF << 24) | (r << 16) | (g << 8) | b;
     }
 
     private void DrawSkeleton(Graphics g, Matrix4x4 transform, float scale, PointF center)

@@ -51,6 +51,8 @@ public static class TextureResolver
                 Shadow = LoadMatched(FindBestTexture(textureFiles, shadowFiles, mesh.Submeshes[i], TextureRole.Shadow), loaded),
             };
 
+            ApplyCompanionAlpha(set, diffuse, textureFiles, loaded);
+
             if (set.Count > 0)
             {
                 result[i] = set;
@@ -58,6 +60,70 @@ public static class TextureResolver
         }
 
         return result;
+    }
+
+    // For games that keep opacity in a separate companion texture (e.g. The Walking Dead: Season 2 hair
+    // uses "<name>Alpha"), merge that companion's mask into the diffuse's alpha channel so transparency
+    // renders. Only runs for games configured this way and only when the diffuse has no usable alpha of
+    // its own, so The Wolf Among Us (alpha in the diffuse) is untouched.
+    private static void ApplyCompanionAlpha(
+        MaterialTextureSet set,
+        TextureCandidate? diffuse,
+        IReadOnlyList<TextureCandidate> textureFiles,
+        Dictionary<string, TextureImage> loaded)
+    {
+        if (!GameConfig.Current.UsesCompanionAlphaTextures || set.Diffuse is null || diffuse is null)
+        {
+            return;
+        }
+
+        // The diffuse already carries its own opacity — leave it alone.
+        if (set.Diffuse.AverageAlpha < 0.99f)
+        {
+            return;
+        }
+
+        var stem = Path.GetFileNameWithoutExtension(diffuse.Value.Path);
+        string[] wanted = [stem + "Alpha", stem + "_alpha", stem + "_alp", stem + "Opacity"];
+        var companionFile = textureFiles
+            .Where(candidate => wanted.Contains(Path.GetFileNameWithoutExtension(candidate.Path), StringComparer.OrdinalIgnoreCase))
+            .Cast<TextureCandidate?>()
+            .FirstOrDefault();
+        if (companionFile is null)
+        {
+            return;
+        }
+
+        var companion = LoadMatched(companionFile, loaded);
+        if (companion is null)
+        {
+            return;
+        }
+
+        set.Diffuse = MergeAlpha(set.Diffuse, companion);
+    }
+
+    // Returns a copy of <paramref name="diffuse"/> whose alpha comes from <paramref name="mask"/>. The
+    // mask is taken from the companion's alpha channel when it varies, otherwise from its luminance (some
+    // games store the opacity mask as a greyscale image instead of in the alpha channel).
+    private static TextureImage MergeAlpha(TextureImage diffuse, TextureImage mask)
+    {
+        var useAlphaChannel = mask.AverageAlpha < 0.99f;
+        var merged = new int[diffuse.Pixels.Length];
+        for (var y = 0; y < diffuse.Height; y++)
+        {
+            var maskY = diffuse.Height == mask.Height ? y : y * mask.Height / diffuse.Height;
+            for (var x = 0; x < diffuse.Width; x++)
+            {
+                var maskX = diffuse.Width == mask.Width ? x : x * mask.Width / diffuse.Width;
+                var maskArgb = mask.Pixels[maskY * mask.Width + maskX];
+                var alpha = useAlphaChannel ? (maskArgb >> 24) & 0xFF : (maskArgb >> 16) & 0xFF;
+                var rgb = diffuse.Pixels[y * diffuse.Width + x] & 0x00FFFFFF;
+                merged[y * diffuse.Width + x] = (alpha << 24) | rgb;
+            }
+        }
+
+        return new TextureImage(diffuse.Width, diffuse.Height, merged, diffuse.SourcePath);
     }
 
     private static TextureImage? LoadMatched(TextureCandidate? match, Dictionary<string, TextureImage> loaded)

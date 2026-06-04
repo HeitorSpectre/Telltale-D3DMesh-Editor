@@ -15,11 +15,7 @@ public static class ArchiveImporter
     // Archive extensions we can open. Used to build the open-file dialog filter.
     public static readonly string[] ArchiveExtensions = [".ttarch", ".ttarch2"];
 
-    // Known Blowfish keys per game. The only supported game today is The Wolf Among Us (key "Fables").
-    // Kept here so adding more games later is a one-line change.
-    public const string WolfAmongUsKey = "Fables";
-
-    public sealed record ExtractResult(string OutputFolder, int ExtractedCount, int TotalEntries);
+    public sealed record ExtractResult(string OutputFolder, int ExtractedCount, int TotalEntries, string DetectedGame);
 
     public static bool IsSupportedArchive(string path)
         => ArchiveExtensions.Contains(Path.GetExtension(path), StringComparer.OrdinalIgnoreCase);
@@ -46,15 +42,16 @@ public static class ArchiveImporter
     }
 
     // Extracts the editor-relevant assets from <paramref name="archivePath"/> into
-    // <paramref name="outputFolder"/>. Returns how many files were written. The folder can then be
-    // handed straight to the normal folder-loading path.
+    // <paramref name="outputFolder"/>. The game (and its Blowfish key) is detected automatically from
+    // the TelltaleToolKit catalogue, so any catalogued game can be opened without the user picking one.
+    // Returns how many files were written; the folder can then be handed to the normal folder loader.
     public static ExtractResult Extract(
         string archivePath,
         string outputFolder,
-        string blowfishKey,
         Action<string>? onFile = null)
     {
-        using Archive archive = OpenArchive(archivePath, blowfishKey);
+        var (archive, key) = OpenArchiveAuto(archivePath);
+        using var _ = archive;
 
         var entries = archive.GetAllEntries()
             .Where(e => AssetExtensions.Contains(Path.GetExtension(e.Name), StringComparer.OrdinalIgnoreCase))
@@ -89,19 +86,70 @@ public static class ArchiveImporter
             onFile?.Invoke(Path.GetFileName(destPath));
         }
 
-        return new ExtractResult(outputFolder, extracted, entries.Count);
+        return new ExtractResult(outputFolder, extracted, entries.Count, GameProfiles.DescribeKey(key));
     }
 
-    private static Archive OpenArchive(string archivePath, string blowfishKey)
+    // Opens the archive by trying every Blowfish key catalogued by the toolkit until one yields a valid
+    // entry table (sane file names). This detects the game automatically. If no key works, the archive
+    // uses an encryption/compression the bundled toolkit can't read yet, and a clear error is raised.
+    private static (Archive Archive, string Key) OpenArchiveAuto(string archivePath)
     {
         var ext = Path.GetExtension(archivePath).ToLowerInvariant();
-        return ext switch
+        if (ext is not (".ttarch" or ".ttarch2"))
         {
-            ".ttarch2" => Archive.Load<TTArchive2>(archivePath, blowfishKey),
-            ".ttarch" => Archive.Load<TTArchive>(archivePath, blowfishKey),
-            _ => throw new NotSupportedException($"Unsupported archive type: '{ext}'.")
-        };
+            throw new NotSupportedException($"Unsupported archive type: '{ext}'.");
+        }
+
+        Exception? lastError = null;
+        foreach (var key in GameProfiles.CandidateKeys())
+        {
+            Archive? archive = null;
+            try
+            {
+                archive = ext == ".ttarch"
+                    ? Archive.Load<TTArchive>(archivePath, key)
+                    : Archive.Load<TTArchive2>(archivePath, key);
+
+                if (LooksValid(archive))
+                {
+                    return (archive, key);
+                }
+
+                archive.Dispose();
+            }
+            catch (Exception ex)
+            {
+                lastError = ex;
+                archive?.Dispose();
+            }
+        }
+
+        throw new InvalidDataException(
+            "Could not open this archive with any Telltale game key known to the bundled TelltaleToolKit. "
+            + "It likely uses an encryption or compression that isn't supported yet.",
+            lastError);
     }
+
+    // A wrong key usually throws while parsing the entry table, but can occasionally produce garbage
+    // entries instead. Treat the archive as correctly decrypted only when most sampled entry names look
+    // like real file names.
+    private static bool LooksValid(Archive archive)
+    {
+        var sample = archive.GetAllEntries().Take(24).ToList();
+        if (sample.Count == 0)
+        {
+            return false;
+        }
+
+        var saneNames = sample.Count(entry => IsSaneName(entry.Name));
+        return saneNames * 2 >= sample.Count;
+    }
+
+    private static bool IsSaneName(string name)
+        => !string.IsNullOrEmpty(name)
+           && name.Length <= 260
+           && name.Contains('.')
+           && name.All(ch => ch is >= ' ' and < (char)127);
 
     // Turns an archive entry name into a safe relative path under the output folder, stripping any
     // leading separators or drive roots so it can never escape the destination directory.

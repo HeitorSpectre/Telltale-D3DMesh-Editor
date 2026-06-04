@@ -16,6 +16,16 @@
     <DebugSymbols>false</DebugSymbols>
   </PropertyGroup>
 
+  <!-- Stamp the build time as a UTC instant into the assembly. The window converts it to the user's
+       local timezone at runtime, so the displayed build time is correct everywhere (a file timestamp
+       would not survive zipping, which stores timezone-naive local times). -->
+  <ItemGroup>
+    <AssemblyAttribute Include="System.Reflection.AssemblyMetadata">
+      <_Parameter1>BuildTimestampUtc</_Parameter1>
+      <_Parameter2>$([System.DateTime]::UtcNow.ToString("yyyy-MM-ddTHH:mm:ssZ"))</_Parameter2>
+    </AssemblyAttribute>
+  </ItemGroup>
+
   <!-- TelltaleToolKit (git submodule at /external/TelltaleToolKit) — used to open and
        extract .ttarch / .ttarch2 game containers so users don't have to unpack them manually.
        Referenced from source so it stays linked to the upstream repo via the submodule. -->

@@ -23,6 +23,15 @@ public sealed class ModelAssetGroup
         "wingLeft",
         "teeth",
         "tongue",
+        "backpack",
+        "haircut",
+        "shoulder",
+        "neck",
+        "nose",
+        "mouth",
+        "brow",
+        "cheek",
+        "ear",
         "body",
         "torso",
         "chest",
@@ -237,6 +246,39 @@ public sealed class ModelAssetGroup
         }
 
         var skeletonStem = Path.GetFileNameWithoutExtension(skeletonPath);
+
+        // Several character versions can share one skeleton (sk54_lee is used by sk54_lee, sk54_lee105,
+        // sk54_lee104...). Split the bucket by model stem so each version combines as its own complete
+        // model instead of all collapsing into the same slots. A single model (the common case, incl.
+        // every Wolf Among Us character and the cars) yields one partition and behaves exactly as before.
+        var byModel = assets
+            .GroupBy(asset => ModelStem(Path.GetFileNameWithoutExtension(asset.MeshPath), skeletonStem),
+                StringComparer.OrdinalIgnoreCase)
+            .ToList();
+        if (byModel.Count > 1)
+        {
+            return byModel.SelectMany(group =>
+                BuildGroupsForModel(skeletonPath, group.Key, relativeDirectory, group.ToList()));
+        }
+
+        return BuildGroupsForModel(skeletonPath, skeletonStem, relativeDirectory, assets);
+    }
+
+    // Builds the groups for one model (identified by <paramref name="stem"/>, which is the skeleton name
+    // possibly plus an episode-number infix). The stem — not the raw skeleton name — drives part-name
+    // classification and group naming.
+    private static IEnumerable<ModelAssetGroup> BuildGroupsForModel(
+        string skeletonPath,
+        string stem,
+        string relativeDirectory,
+        List<ModelAsset> assets)
+    {
+        if (assets.Count <= 1)
+        {
+            return [];
+        }
+
+        var skeletonStem = stem;
         var parts = assets
             .Select(asset => ClassifyPart(asset, skeletonStem))
             .ToList();
@@ -306,10 +348,13 @@ public sealed class ModelAssetGroup
         IReadOnlyList<PartInfo> allParts,
         bool includeDamagePresets = true)
     {
+        // One default part per slot. Many fragmented characters (e.g. Walking Dead Season 2) have no
+        // plain base for a slot — only stated variants (headHat/headNoHat, armLSleeveUp/Down + bites) —
+        // so the default picks the cleanest representative (prefer no variant, then the fewest
+        // damage/state markers) instead of dropping the slot and leaving the body missing limbs.
         var defaultParts = recognized
-            .Where(part => string.IsNullOrEmpty(part.Variant))
             .GroupBy(part => part.Slot, StringComparer.OrdinalIgnoreCase)
-            .Select(group => group.OrderBy(part => part.Asset.MeshPath, StringComparer.OrdinalIgnoreCase).First())
+            .Select(PickSlotDefault)
             .ToList();
 
         // When DamageVariantPlanner owns this character it produces the clean baseline (_clean), so the
@@ -384,8 +429,18 @@ public sealed class ModelAssetGroup
             groupParts.AddRange(relatedVariants);
             groupParts.AddRange(variants);
 
+            // Keep exactly one part per slot so a preset never ends up with two left arms / two heads.
+            // Prefer the explicitly selected variant, then a related variant, then the default part.
+            var variantPaths = variants.Select(part => part.Asset.MeshPath).ToHashSet(StringComparer.OrdinalIgnoreCase);
+            var relatedPaths = relatedVariants.Select(part => part.Asset.MeshPath).ToHashSet(StringComparer.OrdinalIgnoreCase);
             var unique = groupParts
                 .DistinctBy(part => part.Asset.MeshPath, StringComparer.OrdinalIgnoreCase)
+                .GroupBy(part => part.Slot, StringComparer.OrdinalIgnoreCase)
+                .Select(slotGroup => slotGroup
+                    .OrderByDescending(part => variantPaths.Contains(part.Asset.MeshPath) ? 2
+                        : relatedPaths.Contains(part.Asset.MeshPath) ? 1 : 0)
+                    .ThenBy(part => part.Asset.MeshPath, StringComparer.OrdinalIgnoreCase)
+                    .First())
                 .ToList();
             if (unique.Count <= 1)
             {
@@ -870,6 +925,13 @@ public sealed class ModelAssetGroup
             return new PartInfo(asset, tail, "", "", false);
         }
 
+        // Left/right parts (legL/legR, neckL/neckR, armLSleeveUp, earLeft, eyeRightDamageA...) are
+        // distinct sides that coexist, so the side belongs to the slot identity, not the variant.
+        if (TryClassifySided(tail) is { } sided)
+        {
+            return new PartInfo(asset, tail, sided.Slot, sided.Variant, true, LooksLikeAdditiveStatePart(tail));
+        }
+
         var slot = KnownSlots
             .OrderByDescending(value => value.Length)
             .FirstOrDefault(candidate =>
@@ -892,6 +954,72 @@ public sealed class ModelAssetGroup
         }
 
         return new PartInfo(asset, tail, slot, variant, true, LooksLikeAdditiveStatePart(tail));
+    }
+
+    // Body parts that come in left/right copies. A part named "<base><Side><rest>" is the <Side> copy of
+    // that part; both sides are kept (they coexist), and <rest> is the part's variant.
+    private static readonly string[] SidedBases =
+    [
+        "shoulder", "clavicle", "forearm", "elbow", "thigh", "knee", "ankle", "wrist",
+        "leg", "arm", "hand", "foot", "neck", "ear", "eye", "mouth", "brow", "cheek", "lip", "horn",
+    ];
+
+    // Side tokens, longest first so "Left"/"Right" win before the single-letter "L"/"R".
+    private static readonly (string Token, string Canonical)[] SideTokens =
+    [
+        ("Left", "Left"), ("Right", "Right"), ("L", "L"), ("R", "R"),
+    ];
+
+    private static (string Slot, string Variant)? TryClassifySided(string tail)
+    {
+        foreach (var bone in SidedBases.OrderByDescending(value => value.Length))
+        {
+            if (!tail.StartsWith(bone, StringComparison.OrdinalIgnoreCase))
+            {
+                continue;
+            }
+
+            var afterBone = tail[bone.Length..];
+            foreach (var (token, _) in SideTokens)
+            {
+                if (!afterBone.StartsWith(token, StringComparison.Ordinal))
+                {
+                    continue;
+                }
+
+                var afterSide = afterBone[token.Length..];
+
+                // The side must end the word or be followed by a new uppercase token, so "leg"+"L"+"Bite"
+                // matches but "leg"+"acy" (legacy) or "arm"+"or" (armor) does not.
+                if (afterSide.Length == 0 || char.IsUpper(afterSide[0]))
+                {
+                    return (tail[..(bone.Length + token.Length)], afterSide);
+                }
+            }
+        }
+
+        return null;
+    }
+
+    // Damage/state words used to tell a clean part from a damaged/alternate one when choosing the
+    // default for a slot that has no plain base part.
+    private static readonly string[] StateWords =
+    [
+        "Damage", "Bite", "Bitten", "Bandaged", "Sewn", "Dog", "Dried", "Broken", "Bloody", "Blood",
+        "Cut", "Amputated", "Gutted", "Ripped", "Torn", "Tourniqet", "Wound", "Scratch", "Bruise",
+        "Sever", "Rotten", "Burn", "Gun", "Stomach", "NoBandage",
+    ];
+
+    // Picks the most "default-looking" part for a slot: prefer no variant, then the fewest damage/state
+    // markers, then the shortest variant — so a clean limb/head wins over its wounded or alternate forms.
+    private static PartInfo PickSlotDefault(IEnumerable<PartInfo> slotParts)
+    {
+        return slotParts
+            .OrderBy(part => string.IsNullOrEmpty(part.Variant) ? 0 : 1)
+            .ThenBy(part => StateWords.Count(word => part.Variant.Contains(word, StringComparison.OrdinalIgnoreCase)))
+            .ThenBy(part => part.Variant.Length)
+            .ThenBy(part => part.Asset.MeshPath, StringComparer.OrdinalIgnoreCase)
+            .First();
     }
 
     private static bool LooksLikeAdditiveStatePart(string tail)
@@ -984,6 +1112,27 @@ public sealed class ModelAssetGroup
         }
 
         return meshStem;
+    }
+
+    // The model identity for a part, which may differ from the skeleton name when several character
+    // versions share one skeleton (skeleton "sk54_lee" is used by "sk54_lee", "sk54_lee105", ...).
+    // Adds an episode-number infix to the skeleton stem so each version combines as its own model.
+    private static string ModelStem(string meshStem, string skeletonStem)
+    {
+        if (!meshStem.StartsWith(skeletonStem, StringComparison.OrdinalIgnoreCase) ||
+            meshStem.Length <= skeletonStem.Length)
+        {
+            return skeletonStem;
+        }
+
+        var rest = meshStem[skeletonStem.Length..];
+        var digits = 0;
+        while (digits < rest.Length && char.IsDigit(rest[digits]))
+        {
+            digits++;
+        }
+
+        return digits > 0 ? skeletonStem + rest[..digits] : skeletonStem;
     }
 
     private static string Sanitize(string value)

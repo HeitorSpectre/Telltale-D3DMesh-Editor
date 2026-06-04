@@ -1,4 +1,6 @@
 using System.Diagnostics;
+using System.Globalization;
+using System.Reflection;
 using TelltaleD3DMeshEditor.Core;
 using TelltaleD3DMeshEditor.Formats.Archives;
 using TelltaleD3DMeshEditor.Formats.Mesh;
@@ -15,6 +17,7 @@ namespace TelltaleD3DMeshEditor.UI;
 public sealed class MainForm : Form
 {
     private readonly ToolStrip _toolStrip = new();
+    private readonly ToolStrip _viewerOverlay = new();
     private readonly ToolStripButton _btnOpen = new("Open Folder...");
     private readonly ToolStripButton _btnOpenArchive = new("Open Archive...");
     private readonly ToolStripButton _btnExtractSelected = new("Extract Selected...");
@@ -22,6 +25,7 @@ public sealed class MainForm : Form
     private readonly ToolStripButton _btnReimportSelected = new("Reimport Selected...");
     private readonly ToolStripButton _btnFormat = new();
     private readonly ToolStripButton _btnCombineParts = new("Combine Parts");
+    private readonly ToolStripDropDownButton _gameSelector = new();
     private readonly ToolStripButton _btnReload = new("Reload");
     private readonly ToolStripButton _btnPan = new("Pan");
     private readonly ToolStripButton _btnPose = new("Pose");
@@ -33,6 +37,7 @@ public sealed class MainForm : Form
     private readonly ToolStripMenuItem _miFaces = new("Solid");
     private readonly ToolStripMenuItem _miPolygons = new("Polygons");
     private readonly ToolStripMenuItem _miSkeleton = new("Skeleton");
+    private readonly ToolStripButton _btnCheckUpdates = new("Check for Updates");
     private readonly SplitContainer _split = new();
     private readonly TreeView _tree = new();
     private readonly TextBox _searchText = new();
@@ -55,9 +60,8 @@ public sealed class MainForm : Form
 
     public MainForm()
     {
-        // Includes the build time in the title so the running version is unambiguous.
-        var buildTime = File.GetLastWriteTime(System.Reflection.Assembly.GetExecutingAssembly().Location);
-        Text = $"Telltale D3DMesh Editor  (build {buildTime:HH:mm:ss})";
+        // Shows the version and build time (in the user's own timezone) in the title.
+        Text = $"Telltale D3DMesh Editor  v{UpdateChecker.CurrentVersion}  (build {GetLocalBuildTime():HH:mm:ss})";
         Width = 1180;
         Height = 760;
         MinimumSize = new Size(920, 560);
@@ -69,6 +73,10 @@ public sealed class MainForm : Form
         WireEvents();
         UpdateFormatButton();
         SetReadyState();
+
+        // Quietly check GitHub for a newer release once the window is up. It only notifies when an
+        // update exists and never installs anything by itself; failures (offline, etc.) are ignored.
+        Shown += async (_, _) => await CheckForUpdatesAsync(silent: true);
     }
 
     private void BuildUi()
@@ -85,16 +93,34 @@ public sealed class MainForm : Form
             _btnFormat,
             _btnCombineParts,
             new ToolStripSeparator(),
-            _btnReload,
+            _gameSelector,
             new ToolStripSeparator(),
+            _btnReload,
+            _btnCredits,
+            _btnCheckUpdates
+        });
+
+        // Pan / Pose / View live inside the preview as a bottom-right overlay (set up below).
+        _viewerOverlay.GripStyle = ToolStripGripStyle.Hidden;
+        _viewerOverlay.Dock = DockStyle.None;
+        _viewerOverlay.AutoSize = true;
+        _viewerOverlay.BackColor = SystemColors.Control;
+        // The preview control uses a light-grey ForeColor for its hint text; without overriding it here
+        // the overlay's button text would inherit that grey and look disabled.
+        _viewerOverlay.ForeColor = SystemColors.ControlText;
+        _viewerOverlay.Items.AddRange(new ToolStripItem[]
+        {
             _btnPan,
             _btnPose,
             new ToolStripSeparator(),
-            _btnView,
-            _btnCredits
+            _btnView
         });
+        // The overlay sits at the bottom of the window, so the View menu must open upward.
+        _btnView.DropDownDirection = ToolStripDropDownDirection.AboveLeft;
 
         _btnCredits.Alignment = ToolStripItemAlignment.Right;
+        _btnCheckUpdates.Alignment = ToolStripItemAlignment.Right;
+        _btnCheckUpdates.ToolTipText = "Checks GitHub for a newer version and shows the changelog. Nothing is installed automatically.";
         _btnPan.CheckOnClick = true;
         _btnPose.CheckOnClick = true;
         _btnCombineParts.CheckOnClick = true;
@@ -118,6 +144,16 @@ public sealed class MainForm : Form
             _miSkeleton
         });
 
+        _gameSelector.ToolTipText = "Selects which Telltale game's texture/model rules to apply. The Wolf Among Us behaves exactly as before.";
+        foreach (var game in GameConfig.All)
+        {
+            var item = new ToolStripMenuItem(game.DisplayName) { Tag = game };
+            item.Click += async (_, _) => await SelectGameAsync(game);
+            _gameSelector.DropDownItems.Add(item);
+        }
+
+        UpdateGameSelector();
+
         _split.Dock = DockStyle.Fill;
         _split.SplitterDistance = 330;
         _split.FixedPanel = FixedPanel.Panel1;
@@ -134,6 +170,12 @@ public sealed class MainForm : Form
         _tree.ShowNodeToolTips = false;
 
         _preview.Dock = DockStyle.Fill;
+
+        // Float the Pan/Pose/View controls over the bottom-right corner of the preview.
+        _preview.Controls.Add(_viewerOverlay);
+        _viewerOverlay.BringToFront();
+        _preview.SizeChanged += (_, _) => PositionViewerOverlay();
+        _viewerOverlay.SizeChanged += (_, _) => PositionViewerOverlay();
 
         // Progress lives in the status bar (the conventional spot) so it never overlaps the toolbar.
         _progress.Visible = false;
@@ -185,6 +227,7 @@ public sealed class MainForm : Form
         _btnExtractAll.Click += async (_, _) => await ExtractAllAsync();
         _btnReimportSelected.Click += async (_, _) => await ReimportSelectedAsync();
         _btnCredits.Click += (_, _) => ShowCreditsDialog();
+        _btnCheckUpdates.Click += async (_, _) => await CheckForUpdatesAsync(silent: false);
         _btnFormat.Click += (_, _) =>
         {
             _exportFormat = _exportFormat == ExportFormat.Glb ? ExportFormat.GltfSeparate : ExportFormat.Glb;
@@ -335,6 +378,7 @@ public sealed class MainForm : Form
 
         var totalExtracted = 0;
         var failures = new List<string>();
+        var detectedGames = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
 
         await RunWithUiLockAsync(async () =>
         {
@@ -353,11 +397,9 @@ public sealed class MainForm : Form
                         : Path.Combine(loadFolder, ArchiveImporter.GetSectionName(archivePath));
                     try
                     {
-                        var result = ArchiveImporter.Extract(
-                            archivePath,
-                            destFolder,
-                            ArchiveImporter.WolfAmongUsKey);
+                        var result = ArchiveImporter.Extract(archivePath, destFolder);
                         totalExtracted += result.ExtractedCount;
+                        detectedGames.Add(result.DetectedGame);
                     }
                     catch (Exception ex)
                     {
@@ -373,8 +415,11 @@ public sealed class MainForm : Form
                 await ReloadAssetsAsync(loadFolder, loadProgress);
             }
 
+            var detected = detectedGames.Count > 0
+                ? $"\n\nDetected: {string.Join(", ", detectedGames)}"
+                : "";
             var message = totalExtracted > 0
-                ? $"Extracted {totalExtracted} asset file(s) from {archivePaths.Length} archive(s)\n\ninto:\n{loadFolder}"
+                ? $"Extracted {totalExtracted} asset file(s) from {archivePaths.Length} archive(s)\n\ninto:\n{loadFolder}{detected}"
                 : "No .d3dmesh, .d3dtx or .skl files were found in the selected archive(s).";
 
             if (failures.Count > 0)
@@ -384,6 +429,33 @@ public sealed class MainForm : Form
 
             return message;
         });
+    }
+
+    private void UpdateGameSelector()
+    {
+        _gameSelector.Text = $"Game: {GameConfig.Current.DisplayName}";
+        foreach (var item in _gameSelector.DropDownItems.OfType<ToolStripMenuItem>())
+        {
+            item.Checked = ReferenceEquals(item.Tag, GameConfig.Current);
+        }
+    }
+
+    // Switches the active game and re-loads the current folder so textures and groups are re-resolved
+    // under the new game's rules.
+    private async Task SelectGameAsync(GameConfig game)
+    {
+        if (ReferenceEquals(GameConfig.Current, game))
+        {
+            return;
+        }
+
+        GameConfig.Current = game;
+        UpdateGameSelector();
+
+        if (_rootFolder is not null)
+        {
+            await LoadFolderAsync(_rootFolder);
+        }
     }
 
     // Entry point for Open Folder / Reload / drag-drop. Owns the busy state, the progress bar and error
@@ -1218,8 +1290,51 @@ public sealed class MainForm : Form
         var textureLine = textureCount > 0
             ? $"\nTextures: {textureCount} .d3dtx file(s) written next to the output mesh."
             : "";
+        var skeletonLine = RebuildSkeletonForReimport(asset, model, output);
 
-        return $"Reimported: {Path.GetFileName(asset.MeshPath)}\nInput: {input}\nOutput: {output}{textureLine}\n{status}";
+        return $"Reimported: {Path.GetFileName(asset.MeshPath)}\nInput: {input}\nOutput: {output}{textureLine}{skeletonLine}\n{status}";
+    }
+
+    // Rebuilds the .skl next to the reimported mesh from the skeleton inside the GLB. When the model
+    // keeps the game's original skeleton, the rebuild merges the edits onto the original (so an
+    // untouched skeleton stays byte-identical); a foreign rig is written from scratch. The .skl is named
+    // to match the mesh, so the game pairs them, and the mesh's bone palette already references the
+    // bones by hash. Returns a status line (empty when the GLB carries no skin).
+    private static string RebuildSkeletonForReimport(ModelAsset asset, GltfModel model, string output)
+    {
+        if (model.Skeleton is null || model.Skeleton.Bones.Count == 0)
+        {
+            return "";
+        }
+
+        try
+        {
+            var outputDir = Path.GetDirectoryName(output) ?? "";
+            var skeletonName = asset.SkeletonPath is not null
+                ? Path.GetFileName(asset.SkeletonPath)
+                : Path.GetFileNameWithoutExtension(output) + ".skl";
+            var skeletonOutput = Path.Combine(outputDir, skeletonName);
+
+            byte[] skeletonBytes;
+            string how;
+            if (asset.SkeletonPath is not null && File.Exists(asset.SkeletonPath))
+            {
+                skeletonBytes = SkeletonRebuilder.RebuildWithEdits(asset.SkeletonPath, model.Skeleton);
+                how = "rebuilt from the original skeleton + your edits";
+            }
+            else
+            {
+                skeletonBytes = SkeletonRebuilder.WriteNewSkeleton(model.Skeleton);
+                how = "built from scratch for the imported rig";
+            }
+
+            File.WriteAllBytes(skeletonOutput, skeletonBytes);
+            return $"\nSkeleton: {skeletonName} {how} ({model.Skeleton.Bones.Count} bones).";
+        }
+        catch (Exception ex)
+        {
+            return $"\nSkeleton: could not rebuild the .skl ({ex.Message}).";
+        }
     }
 
     private static string ReimportCombinedGroup(
@@ -1438,6 +1553,8 @@ public sealed class MainForm : Form
         _btnPose.Enabled = !busy;
         _btnView.Enabled = !busy;
         _btnCredits.Enabled = !busy;
+        _btnCheckUpdates.Enabled = !busy;
+        _gameSelector.Enabled = !busy;
         _searchText.Enabled = !busy && _rootFolder is not null;
 
         if (busy)
@@ -1471,6 +1588,150 @@ public sealed class MainForm : Form
         _progress.Maximum = total;
         _progress.Value = Math.Clamp(done, 0, total);
         _progressLabel.Text = label;
+    }
+
+    // Looks for a newer GitHub release. When silent (startup), stays quiet unless an update is found;
+    // when triggered from the menu, also confirms when the tool is already up to date.
+    private async Task CheckForUpdatesAsync(bool silent)
+    {
+        var info = await UpdateChecker.CheckForUpdateAsync();
+        if (info is null)
+        {
+            if (!silent)
+            {
+                MessageBox.Show(
+                    $"You're on the latest version (v{UpdateChecker.CurrentVersion}).",
+                    Text,
+                    MessageBoxButtons.OK,
+                    MessageBoxIcon.Information);
+            }
+
+            return;
+        }
+
+        ShowUpdateDialog(info);
+    }
+
+    // Shows the new version and its changelog, and lets the user download it or open the release page.
+    // Deliberately never downloads or replaces files on its own — the user stays in control.
+    private void ShowUpdateDialog(UpdateInfo info)
+    {
+        using var dialog = new Form
+        {
+            Text = "Update available",
+            StartPosition = FormStartPosition.CenterParent,
+            FormBorderStyle = FormBorderStyle.Sizable,
+            MinimizeBox = false,
+            ShowInTaskbar = false,
+            ClientSize = new Size(560, 470),
+            MinimumSize = new Size(440, 320),
+            Font = Font,
+        };
+
+        var layout = new TableLayoutPanel
+        {
+            Dock = DockStyle.Fill,
+            ColumnCount = 1,
+            RowCount = 4,
+            Padding = new Padding(16, 14, 16, 14),
+        };
+        layout.RowStyles.Add(new RowStyle(SizeType.AutoSize));
+        layout.RowStyles.Add(new RowStyle(SizeType.AutoSize));
+        layout.RowStyles.Add(new RowStyle(SizeType.Percent, 100));
+        layout.RowStyles.Add(new RowStyle(SizeType.AutoSize));
+
+        var header = new Label
+        {
+            Text = $"A new version is available: {info.Title}",
+            AutoSize = true,
+            Font = new Font(Font, FontStyle.Bold),
+            Margin = new Padding(0, 0, 0, 4),
+        };
+
+        var subtitle = new Label
+        {
+            Text = $"You have v{UpdateChecker.CurrentVersion}; the latest is v{info.Version}. "
+                 + "Nothing is installed automatically — you choose what to do.",
+            AutoSize = true,
+            Margin = new Padding(0, 0, 0, 8),
+        };
+
+        var changelog = new TextBox
+        {
+            Text = string.IsNullOrWhiteSpace(info.Changelog)
+                ? "(No changelog was provided for this release.)"
+                : info.Changelog.Replace("\r\n", "\n").Replace("\n", Environment.NewLine),
+            Multiline = true,
+            ReadOnly = true,
+            ScrollBars = ScrollBars.Vertical,
+            WordWrap = true,
+            Dock = DockStyle.Fill,
+            BorderStyle = BorderStyle.FixedSingle,
+            BackColor = SystemColors.Window,
+            Margin = new Padding(0, 0, 0, 10),
+        };
+
+        var buttons = new FlowLayoutPanel
+        {
+            Dock = DockStyle.Fill,
+            FlowDirection = FlowDirection.RightToLeft,
+            AutoSize = true,
+            WrapContents = false,
+        };
+        var close = new Button { Text = "Close", AutoSize = true, DialogResult = DialogResult.Cancel, Margin = new Padding(6, 0, 0, 0) };
+        var viewOnGitHub = new Button { Text = "View on GitHub", AutoSize = true, Margin = new Padding(6, 0, 0, 0) };
+        var download = new Button { Text = "Download", AutoSize = true, Margin = new Padding(6, 0, 0, 0) };
+        viewOnGitHub.Click += (_, _) => OpenUrl(info.ReleaseUrl);
+        download.Click += (_, _) => OpenUrl(string.IsNullOrEmpty(info.DownloadUrl) ? info.ReleaseUrl : info.DownloadUrl!);
+        buttons.Controls.Add(close);
+        buttons.Controls.Add(viewOnGitHub);
+        buttons.Controls.Add(download);
+
+        layout.Controls.Add(header, 0, 0);
+        layout.Controls.Add(subtitle, 0, 1);
+        layout.Controls.Add(changelog, 0, 2);
+        layout.Controls.Add(buttons, 0, 3);
+        dialog.Controls.Add(layout);
+        dialog.CancelButton = close;
+        dialog.ShowDialog(this);
+    }
+
+    // Reads the UTC build timestamp stamped into the assembly at compile time and converts it to the
+    // local timezone, so the build time in the title shows correctly for every user. Falls back to the
+    // file's last-write time if the stamp is missing.
+    private static DateTime GetLocalBuildTime()
+    {
+        var stamp = Assembly.GetExecutingAssembly()
+            .GetCustomAttributes<AssemblyMetadataAttribute>()
+            .FirstOrDefault(attribute => attribute.Key == "BuildTimestampUtc")?.Value;
+
+        if (stamp is not null &&
+            DateTimeOffset.TryParse(stamp, CultureInfo.InvariantCulture, DateTimeStyles.AssumeUniversal, out var built))
+        {
+            return built.ToLocalTime().DateTime;
+        }
+
+        return File.GetLastWriteTime(Assembly.GetExecutingAssembly().Location);
+    }
+
+    // Keeps the Pan/Pose/View overlay pinned to the bottom-right corner of the preview as it resizes.
+    private void PositionViewerOverlay()
+    {
+        const int margin = 8;
+        _viewerOverlay.Left = Math.Max(0, _preview.ClientSize.Width - _viewerOverlay.Width - margin);
+        _viewerOverlay.Top = Math.Max(0, _preview.ClientSize.Height - _viewerOverlay.Height - margin);
+    }
+
+    private static void OpenUrl(string url)
+    {
+        try
+        {
+            Process.Start(new ProcessStartInfo(url) { UseShellExecute = true });
+        }
+        catch
+        {
+            // Opening the browser is best-effort; ignore failures.
+        }
     }
 
     private void ShowCreditsDialog()

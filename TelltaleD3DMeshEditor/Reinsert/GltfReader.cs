@@ -3,6 +3,8 @@ using System.Globalization;
 using System.Numerics;
 using System.Text;
 using System.Text.Json;
+using TelltaleD3DMeshEditor.Core;
+using TelltaleD3DMeshEditor.Formats.Skeleton;
 
 namespace TelltaleD3DMeshEditor.Reinsert;
 
@@ -15,6 +17,10 @@ public sealed class GltfModel
 {
     public required List<GltfPrimitive> Primitives { get; init; }
     public IReadOnlyList<GltfJoint> Joints { get; init; } = [];
+
+    // The full skeleton read from the first skin (joint names, hierarchy and local pose), used to
+    // rebuild a .skl on reimport. Null when the glTF has no skin.
+    public SkeletonData? Skeleton { get; init; }
 }
 
 public sealed class GltfPrimitive
@@ -168,7 +174,150 @@ public static class GltfReader
             }
         }
 
-        return new GltfModel { Primitives = primitives, Joints = joints };
+        return new GltfModel { Primitives = primitives, Joints = joints, Skeleton = ReadSkeletonData(root) };
+    }
+
+    // Reads the first skin's joints into a full SkeletonData: name, hash, parent and local transform
+    // for every bone. The exporter stores exact float bits in node extras, so an unedited skeleton
+    // reads back to the original values (and rebuilds byte-identically); Blender edits come through as
+    // the node's translation/rotation.
+    private static SkeletonData? ReadSkeletonData(JsonElement root)
+    {
+        if (!root.TryGetProperty("nodes", out var nodes) || nodes.ValueKind != JsonValueKind.Array ||
+            !root.TryGetProperty("skins", out var skins) || skins.ValueKind != JsonValueKind.Array ||
+            skins.GetArrayLength() == 0)
+        {
+            return null;
+        }
+
+        var skin = skins[0];
+        if (!skin.TryGetProperty("joints", out var jointNodes) || jointNodes.ValueKind != JsonValueKind.Array)
+        {
+            return null;
+        }
+
+        var jointNodeIndices = jointNodes.EnumerateArray().Select(j => j.GetInt32()).ToList();
+        if (jointNodeIndices.Count == 0)
+        {
+            return null;
+        }
+
+        var jointIndexByNode = new Dictionary<int, int>();
+        for (var i = 0; i < jointNodeIndices.Count; i++)
+        {
+            jointIndexByNode[jointNodeIndices[i]] = i;
+        }
+
+        var parentNodeByNode = BuildParentNodeMap(nodes);
+
+        var skeleton = new SkeletonData();
+        foreach (var nodeIndex in jointNodeIndices)
+        {
+            var node = nodes[nodeIndex];
+            var name = node.TryGetProperty("name", out var n) ? n.GetString() ?? "" : "";
+            var hash = ReadNodeHash(node) ?? (string.IsNullOrEmpty(name) ? 0UL : Crc64Ecma.Compute(name));
+
+            var (x, y, z) = ReadNodeTranslation(node);
+            var (qx, qy, qz, qw) = ReadNodeRotation(node);
+
+            var parentIndex = -1;
+            ulong parentHash = 0;
+            if (parentNodeByNode.TryGetValue(nodeIndex, out var parentNode) &&
+                jointIndexByNode.TryGetValue(parentNode, out parentIndex))
+            {
+                var parentNodeElem = nodes[parentNode];
+                parentHash = ReadNodeHash(parentNodeElem)
+                    ?? (parentNodeElem.TryGetProperty("name", out var pn) && pn.GetString() is { Length: > 0 } pname
+                        ? Crc64Ecma.Compute(pname)
+                        : 0);
+            }
+
+            skeleton.Bones.Add(new BoneData(name, hash, parentIndex, x, y, z, qx, qy, qz, qw, parentHash));
+        }
+
+        return skeleton;
+    }
+
+    private static Dictionary<int, int> BuildParentNodeMap(JsonElement nodes)
+    {
+        var parentByChild = new Dictionary<int, int>();
+        for (var i = 0; i < nodes.GetArrayLength(); i++)
+        {
+            if (nodes[i].TryGetProperty("children", out var children) && children.ValueKind == JsonValueKind.Array)
+            {
+                foreach (var child in children.EnumerateArray())
+                {
+                    parentByChild[child.GetInt32()] = i;
+                }
+            }
+        }
+
+        return parentByChild;
+    }
+
+    private static (float X, float Y, float Z) ReadNodeTranslation(JsonElement node)
+    {
+        if (TryReadFloatBits(node, "translationBits", 3, out var bits))
+        {
+            return (bits[0], bits[1], bits[2]);
+        }
+
+        if (node.TryGetProperty("translation", out var t) && t.ValueKind == JsonValueKind.Array && t.GetArrayLength() == 3)
+        {
+            return (t[0].GetSingle(), t[1].GetSingle(), t[2].GetSingle());
+        }
+
+        return (0f, 0f, 0f);
+    }
+
+    private static (float X, float Y, float Z, float W) ReadNodeRotation(JsonElement node)
+    {
+        if (TryReadFloatBits(node, "rotationBits", 4, out var bits))
+        {
+            return (bits[0], bits[1], bits[2], bits[3]);
+        }
+
+        if (node.TryGetProperty("rotation", out var r) && r.ValueKind == JsonValueKind.Array && r.GetArrayLength() == 4)
+        {
+            return (r[0].GetSingle(), r[1].GetSingle(), r[2].GetSingle(), r[3].GetSingle());
+        }
+
+        return (0f, 0f, 0f, 1f);
+    }
+
+    private static bool TryReadFloatBits(JsonElement node, string key, int count, out float[] values)
+    {
+        values = [];
+        if (!node.TryGetProperty("extras", out var extras) ||
+            !extras.TryGetProperty(key, out var arr) ||
+            arr.ValueKind != JsonValueKind.Array ||
+            arr.GetArrayLength() != count)
+        {
+            return false;
+        }
+
+        values = new float[count];
+        for (var i = 0; i < count; i++)
+        {
+            // The exporter stores bits as hex strings, e.g. "0x3F800000".
+            var text = arr[i].GetString();
+            if (string.IsNullOrEmpty(text))
+            {
+                values = [];
+                return false;
+            }
+
+            text = text.StartsWith("0x", StringComparison.OrdinalIgnoreCase) ? text[2..] : text;
+            if (!uint.TryParse(text, NumberStyles.HexNumber, CultureInfo.InvariantCulture, out var rawBits))
+            {
+                values = [];
+                return false;
+            }
+
+            values[i] = BitConverter.UInt32BitsToSingle(rawBits);
+        }
+
+        return true;
     }
 
     private static IEnumerable<int> GetSceneRootNodes(JsonElement root, JsonElement nodes)
