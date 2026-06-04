@@ -64,7 +64,7 @@ The reason is that I still haven't been able to find a proper solution for conve
 
 ## Help with testing
 
-I need your help with testing. If you find any kind of bug, please submit an issue so it can be fixed.
+I need your help with testing. If you find any kind of bug, please submit an [issue](https://github.com/HeitorSpectre/Telltale-D3DMesh-Editor/issues) so it can be fixed.
 
 I've already done several tests, covering many different possible scenarios, but something may still have slipped through.
 
