@@ -29,6 +29,11 @@ public sealed class D3DMeshLayout
     public int SubmeshTableLength { get; init; }
     public required List<SubmeshLayout> Submeshes { get; init; }
     public required List<ulong[]> BonePalettes { get; init; }
+    public int OriginalBonePaletteCount { get; init; }
+    public int BonePaletteBlockOffset { get; init; }
+    public int BonePaletteBlockLength { get; init; }
+    public int BonePaletteEntrySize { get; init; }
+    public required byte[] BonePaletteEntryTemplate { get; init; }
     public int TextureGroupBlockOffset { get; init; }
     public int TextureGroupBlockLength { get; init; }
     public required List<TextureGroupLayout> TextureGroups { get; init; }
@@ -156,7 +161,9 @@ public sealed class D3DMeshLayout
         var submeshTableLength = reader.Position - submeshTableOffset;
 
         SkipSizedBlock(reader);
-        var bonePalettes = ReadBonePalettes(reader, 56);
+        var bonePaletteBlockOffset = reader.Position;
+        var (bonePalettes, bonePaletteEntryTemplate) = ReadBonePalettes(reader, 56);
+        var bonePaletteBlockLength = reader.Position - bonePaletteBlockOffset;
         SkipSizedBlock(reader);
         SkipSizedBlock(reader);
         SkipSizedBlock(reader);
@@ -217,6 +224,11 @@ public sealed class D3DMeshLayout
             SubmeshTableLength = submeshTableLength,
             Submeshes = submeshes,
             BonePalettes = bonePalettes,
+            OriginalBonePaletteCount = bonePalettes.Count,
+            BonePaletteBlockOffset = bonePaletteBlockOffset,
+            BonePaletteBlockLength = bonePaletteBlockLength,
+            BonePaletteEntrySize = 56,
+            BonePaletteEntryTemplate = bonePaletteEntryTemplate,
             TextureGroupBlockOffset = textureGroupBlockOffset,
             TextureGroupBlockLength = textureGroupBlockLength,
             TextureGroups = textureGroups,
@@ -241,17 +253,20 @@ public sealed class D3DMeshLayout
         reader.Skip(size);
     }
 
-    private static List<ulong[]> ReadBonePalettes(DataReader reader, int entrySize)
+    private static (List<ulong[]> Palettes, byte[] EntryTemplate) ReadBonePalettes(DataReader reader, int entrySize)
     {
         reader.ReadUInt32();
         var paletteCount = (int)reader.ReadUInt32();
         var palettes = new List<ulong[]>(paletteCount);
+        var entryTemplate = new byte[entrySize];
+        var hasEntryTemplate = false;
         for (var i = 0; i < paletteCount; i++)
         {
             var boneCount = (int)reader.ReadUInt32();
             var hashes = new ulong[boneCount];
             for (var bone = 0; bone < boneCount; bone++)
             {
+                var entryStart = reader.Position;
                 var low = reader.ReadUInt32();
                 var high = reader.ReadUInt32();
                 hashes[bone] = ((ulong)high << 32) | low;
@@ -261,12 +276,18 @@ public sealed class D3DMeshLayout
                 {
                     reader.Skip(remaining);
                 }
+
+                if (!hasEntryTemplate)
+                {
+                    entryTemplate = reader.Slice(entryStart, entrySize);
+                    hasEntryTemplate = true;
+                }
             }
 
             palettes.Add(hashes);
         }
 
-        return palettes;
+        return (palettes, entryTemplate);
     }
 
     private static List<TextureGroupLayout> ReadV13TextureGroups(DataReader reader)
