@@ -45,22 +45,8 @@ So if the original model uses 10 textures, the tool can still take a custom mode
 
 | Platform | Game | Status |
 |----------|------|--------|
-| PC | The Walking Dead: Season 2 | 🚧 Working |
+| PC | The Walking Dead: Season 2 | ✅ Working |
 | PC | The Wolf Among Us | ✅ Working |
-
-## A note about skeletons and animations
-
-There's one important thing to keep in mind. Animation issues mostly apply to models that use a **skeleton**, like character models.
-
-Even though you can import models from the internet, the animations and movements may end up looking buggy or slightly off. For example, if a character is supposed to grab a bottle, their hand might not line up perfectly with it — it could be a little too far to the left, too low, or in a completely wrong position.
-
-This happens because we're **not editing the character's original skeleton.** The model can work visually, but the animations may not always match perfectly.
-
-For **props and other objects that don't rely on a skeleton**, things should work normally. Those can usually be imported or edited without causing this kind of animation problem.
-
-The reason is that I still haven't been able to find a proper solution for converting the game's **SKL** files to GLB/GLTF, rigging a custom model properly, and making the animations work with it. I tried several approaches, but unfortunately couldn't get it working.
-
-**If anyone has information about this** — especially for older Telltale games like The Wolf Among Us and others — or wants to help, feel free to reach out. Everything is uploaded here so people can take a look.
 
 ## Help with testing
 
