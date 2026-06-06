@@ -1,6 +1,6 @@
 # Telltale D3DMesh Editor
 
-A tool to **view, edit, export, and reimport** 3D mesh files from **Telltale Games** titles.
+A tool to **view, edit, export, and reimport** 3D mesh files (d3dmesh, skl and d3dtx) from **Telltale Games** titles.
 
 It helps modders inspect models, meshes, textures, and skeletons, and modify the game's original assets. With it you can preview a model, export it to GLB/GLTF, edit it in your favorite 3D software, and put it back into the game.
 
@@ -35,12 +35,6 @@ If you already have the files extracted, or want to load custom assets:
 2. Put them inside a **single folder**.
 3. Click **Open Folder…** and select it — the tool will load and display everything for you.
 
-## Safe, isolated textures
-
-The tool **does not replace any texture already used by the game.** Instead, it assigns the new textures to your model and makes the game accept them properly.
-
-So if the original model uses 10 textures, the tool can still take a custom model with, say, 15 textures and put it into the game **without replacing the original ones.** This avoids issues like bugs, wrong colors, or texture changes leaking into other characters or objects. The tool creates **exclusive textures for that specific model**, keeping everything separated and safer.
-
 ## Supported games
 
 | Platform | Game | Status |
@@ -61,8 +55,8 @@ As we move forward, we'll keep adding improvements, fixing issues, and adding su
 Made by [Heitor Spectre](https://github.com/HeitorSpectre).
 
 Special thanks to:
-- Telltale ToolKit [iMrShadow](https://github.com/iMrShadow)
-- D3DMeshUtilities [Gamma_02](https://github.com/gamma-02)
-- D3DMESH-Converter [David Matos](https://github.com/frostbone25)
-- TelltaleGames_D3DMesh [RandomTBush](https://github.com/RandomTBush)
-- For testing [Aabii/Arizzble](https://github.com/Arizzble)
+- Telltale ToolKit - [iMrShadow](https://github.com/iMrShadow)
+- D3DMeshUtilities - [Gamma_02](https://github.com/gamma-02)
+- D3DMESH-Converter - [David Matos](https://github.com/frostbone25)
+- TelltaleGames_D3DMesh - [RandomTBush](https://github.com/RandomTBush)
+- For testing - [Aabii/Arizzble](https://github.com/Arizzble)
