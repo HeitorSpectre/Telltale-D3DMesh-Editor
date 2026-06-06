@@ -57,9 +57,12 @@ As we move forward, we'll keep adding improvements, fixing issues, and adding su
 
 Made by [Heitor Spectre](https://github.com/HeitorSpectre).
 
-Special thanks to:
-- Telltale ToolKit - [iMrShadow](https://github.com/iMrShadow)
-- D3DMeshUtilities - [Gamma_02](https://github.com/gamma-02)
-- D3DMESH-Converter - [David Matos](https://github.com/frostbone25)
-- TelltaleGames_D3DMesh - [RandomTBush](https://github.com/RandomTBush)
-- For testing - [Aabii/Arizzble](https://github.com/Arizzble)
+## Contributors
+
+Special thanks to everyone who helped with this project:
+
+- **Telltale ToolKit** by [iMrShadow](https://github.com/iMrShadow)
+- **D3DMeshUtilities** by [Gamma_02](https://github.com/gamma-02)
+- **D3DMESH-Converter** by [David Matos](https://github.com/frostbone25)
+- **TelltaleGames_D3DMesh** by [RandomTBush](https://github.com/RandomTBush)
+- **Testing** by [Aabii / Arizzble](https://github.com/Arizzble)
