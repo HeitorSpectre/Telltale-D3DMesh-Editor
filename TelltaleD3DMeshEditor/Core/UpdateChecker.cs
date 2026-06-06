@@ -12,7 +12,7 @@ public sealed record UpdateInfo(string Version, string Title, string Changelog, 
 public static class UpdateChecker
 {
     // Bump this on every release so the checker can tell when a newer one is published.
-    public const string CurrentVersion = "1.2";
+    public const string CurrentVersion = "1.3";
 
     private const string LatestReleaseApi =
         "https://api.github.com/repos/HeitorSpectre/Telltale-D3DMesh-Editor/releases/latest";
