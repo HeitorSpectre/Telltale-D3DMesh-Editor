@@ -1,4 +1,8 @@
 # Telltale D3DMesh Editor
+-------------------------
+[![Wiki](https://img.shields.io/badge/Wiki-gray?style=flat-square)](https://github.com/HeitorSpectre/Telltale-D3DMesh-Editor/wiki) [![Release](https://img.shields.io/github/v/release/HeitorSpectre/Telltale-D3DMesh-Editor?label=release&style=flat-square)](https://github.com/HeitorSpectre/Telltale-D3DMesh-Editor/releases) [![Discord](https://img.shields.io/badge/Discord-blue?style=flat-square&logo=discord&logoColor=white)](https://discord.com/invite/HqpnTenqwp) [![Downloads](https://img.shields.io/github/downloads/HeitorSpectre/Telltale-D3DMesh-Editor/total?label=downloads&style=flat-square&color=green)](https://github.com/HeitorSpectre/Telltale-D3DMesh-Editor/releases)
+
+
 
 A tool to **view, edit, export, and reimport** 3D mesh files (d3dmesh, skl and d3dtx) from **Telltale Games** titles.
 
