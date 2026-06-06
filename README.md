@@ -61,9 +61,8 @@ As we move forward, we'll keep adding improvements, fixing issues, and adding su
 Made by [Heitor Spectre](https://github.com/HeitorSpectre).
 
 Special thanks to:
-- [iMrShadow](https://github.com/iMrShadow)
-- [Gamma_02](https://github.com/gamma-02)
-- [David Matos](https://github.com/frostbone25)
-- [RandomTBush](https://github.com/RandomTBush)
-
-Without their analysis and the documentation available in their repositories, none of this would have happened. Their work made it possible to build an editor capable of both extracting assets from the game and reinserting them back into it.
+- Telltale ToolKit [iMrShadow](https://github.com/iMrShadow)
+- D3DMeshUtilities [Gamma_02](https://github.com/gamma-02)
+- D3DMESH-Converter [David Matos](https://github.com/frostbone25)
+- TelltaleGames_D3DMesh [RandomTBush](https://github.com/RandomTBush)
+- For testing [Aabii/Arizzble](https://github.com/Arizzble)
