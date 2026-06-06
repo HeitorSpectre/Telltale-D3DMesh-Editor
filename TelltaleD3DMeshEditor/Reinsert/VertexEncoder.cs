@@ -3,10 +3,8 @@ using System.Numerics;
 
 namespace TelltaleD3DMeshEditor.Reinsert;
 
-// Encodes a V13 vertex in the exact binary layout of the template. Writes attributes in parser order
-// (position, uv1, uv2, uv3, uv4, bones, weights, colors, unknown1, normals, binormals, tangents),
-// each only when the template format is != 0, using that exact format. Attributes that do not come
-// from the GLB (unknown1, binormals, tangents) are preserved when available.
+// Encodes a V13/14 vertex in the exact binary layout of the template. Each attribute is written at
+// the offset declared by the .d3dmesh attribute table, using the template format.
 // UV scales (mults) come from the uvScales block, recalculated by the reimporter for the model's
 // real range to avoid int16 overflow.
 public sealed class VertexEncoder
@@ -29,18 +27,29 @@ public sealed class VertexEncoder
             throw new ArgumentException($"Vertex buffer is too small: {dst.Length} < {Stride}");
         }
 
-        var p = 0;
+        var p = (int)_attrs.Position.Offset;
         WritePosition(dst, ref p, v);
+        p = (int)_attrs.Uv1.Offset;
         WriteUv(dst, ref p, _attrs.Uv1.Format, v.U0, v.V0, _mults.Uv1X, _mults.Uv1Y);
+        p = (int)_attrs.Uv2.Offset;
         WriteUv(dst, ref p, _attrs.Uv2.Format, v.U1, v.V1, _mults.Uv2X, _mults.Uv2Y);
+        p = (int)_attrs.Uv3.Offset;
         WriteUv(dst, ref p, _attrs.Uv3.Format, v.U2, v.V2, _mults.Uv3X, _mults.Uv3Y);
+        p = (int)_attrs.Uv4.Offset;
         WriteUv(dst, ref p, _attrs.Uv4.Format, v.U3, v.V3, _mults.Uv4X, _mults.Uv4Y);
+        p = (int)_attrs.Bones.Offset;
         WriteBones(dst, ref p, _attrs.Bones.Format, v);
+        p = (int)_attrs.Weights.Offset;
         WriteWeights(dst, ref p, _attrs.Weights.Format, v);
+        p = (int)_attrs.Colors.Offset;
         WriteColor(dst, ref p, _attrs.Colors.Format, v);
+        p = (int)_attrs.Unknown1.Offset;
         WriteUnknown(dst, ref p, _attrs.Unknown1.Format, v.Unknown1);
+        p = (int)_attrs.Normals.Offset;
         WriteNormal(dst, ref p, _attrs.Normals.Format, v.Nx, v.Ny, v.Nz);
+        p = (int)_attrs.Binormals.Offset;
         WriteVector4(dst, ref p, _attrs.Binormals.Format, v.Bx, v.By, v.Bz, v.Bw);
+        p = (int)_attrs.Tangents.Offset;
         WriteVector4(dst, ref p, _attrs.Tangents.Format, v.Tx, v.Ty, v.Tz, v.Tw);
     }
 
@@ -56,8 +65,8 @@ public sealed class VertexEncoder
         BinaryPrimitives.WriteSingleLittleEndian(dst[p..], v.Z); p += 4;
     }
 
-    // Inverse of D3DMeshParser.ReadUv. The exporter writes gltf_v = 1 - telltale_v; on reimport,
-    // the stored normalized value = gltf_v (and gltf_u for U). So: int16 = round(coord / mult * max).
+    // Inverse of D3DMeshParser.ReadUv + AssetGltfBuilder export. The exporter writes glTF V as the
+    // raw stored d3dmesh V value, so reimport stores the incoming glTF V directly.
     private static void WriteUv(Span<byte> dst, ref int p, uint format, float u, float v, float multX, float multY)
     {
         switch (format)
@@ -66,7 +75,7 @@ public sealed class VertexEncoder
                 return;
             case 1:
                 BinaryPrimitives.WriteSingleLittleEndian(dst[p..], u); p += 4;
-                BinaryPrimitives.WriteSingleLittleEndian(dst[p..], 1f - v); p += 4;
+                BinaryPrimitives.WriteSingleLittleEndian(dst[p..], v); p += 4;
                 return;
             case 4:
                 WriteScaledInt16(dst, ref p, u, multX);

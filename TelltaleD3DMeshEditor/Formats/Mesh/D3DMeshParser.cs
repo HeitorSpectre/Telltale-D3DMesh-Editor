@@ -598,6 +598,8 @@ public static class D3DMeshParser
         var uv3 = ReadAttr(reader);
         var uv4 = ReadAttr(reader);
 
+        var vertexDataStart = reader.Position;
+        var stride = VertexStrideV13(position, uv1, normals, weights, bones, colors, unknown1, binormals, tangents, uv2, uv3, uv4);
         var vertices = new List<VertexData>(vertexCount);
         for (var i = 0; i < vertexCount; i++)
         {
@@ -606,12 +608,18 @@ public static class D3DMeshParser
                 throw new InvalidDataException($"Unknown position format: {position.Format}");
             }
 
+            var vertexStart = vertexDataStart + i * stride;
+            reader.Seek(vertexStart + (int)position.Offset);
             var x = reader.ReadFloat();
             var y = reader.ReadFloat();
             var z = reader.ReadFloat();
+            reader.Seek(vertexStart + (int)uv1.Offset);
             ReadUv(reader, uv1.Format, uv1X, uv1Y, out var u, out var v);
+            reader.Seek(vertexStart + (int)uv2.Offset);
             ReadUv(reader, uv2.Format, uv2X, uv2Y, out var u2, out var v2);
+            reader.Seek(vertexStart + (int)uv3.Offset);
             ReadUv(reader, uv3.Format, uv3X, uv3Y, out var u3, out var v3);
+            reader.Seek(vertexStart + (int)uv4.Offset);
             ReadUv(reader, uv4.Format, uv4X, uv4Y, out var u4, out var v4);
             if (uv2.Format == 0)
             {
@@ -628,14 +636,19 @@ public static class D3DMeshParser
                 u4 = u3;
                 v4 = v3;
             }
+            reader.Seek(vertexStart + (int)bones.Offset);
             var (bone0, bone1, bone2, bone3) = ReadBones(reader, bones.Format);
+            reader.Seek(vertexStart + (int)weights.Offset);
             var (weight0, weight1, weight2, weight3) = ReadWeights(reader, weights.Format);
+            reader.Seek(vertexStart + (int)colors.Offset);
             var (colorR, colorG, colorB, colorA) = ReadColor(reader, colors.Format);
+            reader.Seek(vertexStart + (int)unknown1.Offset);
             var unknown1Value = ReadUnknown(reader, unknown1.Format);
 
             var nx = 0f;
             var ny = 1f;
             var nz = 0f;
+            reader.Seek(vertexStart + (int)normals.Offset);
             if (normals.Format == 2)
             {
                 nx = reader.ReadSByte() / 127f;
@@ -655,10 +668,14 @@ public static class D3DMeshParser
                 throw new InvalidDataException($"Unknown normal format: {normals.Format}");
             }
 
+            reader.Seek(vertexStart + (int)binormals.Offset);
             var (binormalX, binormalY, binormalZ, binormalW) = ReadVector4(reader, binormals.Format);
+            reader.Seek(vertexStart + (int)tangents.Offset);
             var (tangentX, tangentY, tangentZ, tangentW) = ReadVector4(reader, tangents.Format);
             vertices.Add(new VertexData(x, y, z, nx, ny, nz, u, v, u2, v2, u3, v3, u4, v4, bone0, bone1, bone2, bone3, weight0, weight1, weight2, weight3, colorR, colorG, colorB, colorA, unknown1Value, binormalX, binormalY, binormalZ, binormalW, tangentX, tangentY, tangentZ, tangentW));
         }
+
+        reader.Seek(vertexDataStart + vertexCount * stride);
 
         return vertices;
     }
@@ -667,6 +684,103 @@ public static class D3DMeshParser
     {
         return new AttrDescriptor(reader.ReadUInt32(), reader.ReadUInt32(), reader.ReadUInt32());
     }
+
+    private static int VertexStrideV13(
+        AttrDescriptor position,
+        AttrDescriptor uv1,
+        AttrDescriptor normals,
+        AttrDescriptor weights,
+        AttrDescriptor bones,
+        AttrDescriptor colors,
+        AttrDescriptor unknown1,
+        AttrDescriptor binormals,
+        AttrDescriptor tangents,
+        AttrDescriptor uv2,
+        AttrDescriptor uv3,
+        AttrDescriptor uv4)
+        => new[]
+        {
+            AttrEnd(position, PositionSize(position.Format)),
+            AttrEnd(uv1, UvSize(uv1.Format)),
+            AttrEnd(normals, NormalSize(normals.Format)),
+            AttrEnd(weights, WeightSize(weights.Format)),
+            AttrEnd(bones, BoneSize(bones.Format)),
+            AttrEnd(colors, ColorSize(colors.Format)),
+            AttrEnd(unknown1, UnknownSize(unknown1.Format)),
+            AttrEnd(binormals, Vector4Size(binormals.Format)),
+            AttrEnd(tangents, Vector4Size(tangents.Format)),
+            AttrEnd(uv2, UvSize(uv2.Format)),
+            AttrEnd(uv3, UvSize(uv3.Format)),
+            AttrEnd(uv4, UvSize(uv4.Format)),
+        }.Max();
+
+    private static int AttrEnd(AttrDescriptor attr, int size)
+        => size == 0 ? 0 : checked((int)attr.Offset + size);
+
+    private static int PositionSize(uint format) => format switch
+    {
+        0 => 0,
+        1 => 12,
+        _ => throw new InvalidDataException($"Unknown position format: {format}"),
+    };
+
+    private static int UvSize(uint format) => format switch
+    {
+        0 => 0,
+        1 => 8,
+        4 => 4,
+        5 => 4,
+        11 => 4,
+        _ => throw new InvalidDataException($"Unknown UV format: {format}"),
+    };
+
+    private static int NormalSize(uint format) => format switch
+    {
+        0 => 0,
+        2 => 4,
+        4 => 8,
+        _ => throw new InvalidDataException($"Unknown normal format: {format}"),
+    };
+
+    private static int WeightSize(uint format) => format switch
+    {
+        0 => 0,
+        1 => 12,
+        4 => 8,
+        5 => 8,
+        _ => throw new InvalidDataException($"Unknown weight format: {format}"),
+    };
+
+    private static int BoneSize(uint format) => format switch
+    {
+        0 => 0,
+        3 => 4,
+        8 => 4,
+        _ => throw new InvalidDataException($"Unknown bone format: {format}"),
+    };
+
+    private static int ColorSize(uint format) => format switch
+    {
+        0 => 0,
+        1 => 16,
+        3 => 4,
+        _ => throw new InvalidDataException($"Unknown color format: {format}"),
+    };
+
+    private static int UnknownSize(uint format) => format switch
+    {
+        0 => 0,
+        1 => 4,
+        _ => throw new InvalidDataException($"Unknown attribute format: {format}"),
+    };
+
+    private static int Vector4Size(uint format) => format switch
+    {
+        0 => 0,
+        2 => 4,
+        4 => 8,
+        _ => throw new InvalidDataException($"Unknown vector format: {format}"),
+    };
 
     private static void SkipSizedBlock(DataReader reader)
     {

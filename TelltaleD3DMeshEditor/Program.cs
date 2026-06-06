@@ -1,4 +1,5 @@
 using TelltaleD3DMeshEditor.Core;
+using TelltaleD3DMeshEditor.Reinsert;
 using TelltaleD3DMeshEditor.UI;
 
 namespace TelltaleD3DMeshEditor;
@@ -6,8 +7,13 @@ namespace TelltaleD3DMeshEditor;
 internal static class Program
 {
     [STAThread]
-    private static void Main()
+    private static void Main(string[] args)
     {
+        if (ReinsertCli.TryRun(args))
+        {
+            return;
+        }
+
         Application.SetUnhandledExceptionMode(UnhandledExceptionMode.CatchException);
         Application.ThreadException += (_, e) => ShowUnhandledException(e.Exception, "Unhandled UI exception");
         AppDomain.CurrentDomain.UnhandledException += (_, e) =>

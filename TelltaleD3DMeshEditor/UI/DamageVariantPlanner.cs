@@ -487,7 +487,26 @@ internal static class DamageVariantPlanner
     {
         var raw = RawDamageWords.Count(word => tail.Contains(word, StringComparison.OrdinalIgnoreCase));
         var bandaged = tail.Contains("bandaged", StringComparison.OrdinalIgnoreCase) ? 1 : 0;
-        return DamageLevelLetter(tail) * 100 + raw * 10 - bandaged;
+        var level = Math.Max(DamageLevelLetter(tail), TrailingDamageLevel(tail));
+        return level * 100 + raw * 10 - bandaged;
+    }
+
+    // The Walking Dead: Season 2 names damage stages with the level letter at the END, after "Damage"
+    // (eyeLeftDamageA / eyeLeftDamageB / eyeLeftDamageC). The trailing letter is the stage (A=1, B=2, C=3),
+    // so "fully damaged" consistently picks the worst (C) instead of an arbitrary tie-break.
+    private static int TrailingDamageLevel(string tail)
+    {
+        const string marker = "Damage";
+        var index = tail.LastIndexOf(marker, StringComparison.OrdinalIgnoreCase);
+        if (index < 0)
+        {
+            return 0;
+        }
+
+        var after = tail[(index + marker.Length)..];
+        return after.Length == 1 && char.IsLetter(after[0])
+            ? char.ToUpperInvariant(after[0]) - 'A' + 1
+            : 0;
     }
 
     // Dee names damage stages as headDamage<Level><Spot> (headDamageABrowL/headDamageBBrowL): the letter

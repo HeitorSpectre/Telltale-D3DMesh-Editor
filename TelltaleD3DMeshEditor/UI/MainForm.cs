@@ -69,6 +69,8 @@ public sealed class MainForm : Form
         Font = new Font("Segoe UI", 9F);
         Icon = Icon.ExtractAssociatedIcon(Application.ExecutablePath) ?? Icon;
 
+        GameConfig.Current = AppPreferences.LoadGameConfig();
+
         BuildUi();
         WireEvents();
         UpdateFormatButton();
@@ -284,7 +286,7 @@ public sealed class MainForm : Form
                 e.Effect = DragDropEffects.Copy;
             }
         };
-        DragDrop += (_, e) =>
+        DragDrop += async (_, e) =>
         {
             var paths = (string[]?)e.Data?.GetData(DataFormats.FileDrop);
             if (paths is null || paths.Length == 0)
@@ -292,14 +294,19 @@ public sealed class MainForm : Form
                 return;
             }
 
+            if (!EnsureGameSelectedForOpen())
+            {
+                return;
+            }
+
             var path = paths[0];
             if (Directory.Exists(path))
             {
-                _ = LoadFolderAsync(path);
+                await LoadFolderAsync(path);
             }
             else if (File.Exists(path))
             {
-                _ = LoadFolderAsync(Path.GetDirectoryName(path)!);
+                await LoadFolderAsync(Path.GetDirectoryName(path)!);
             }
         };
     }
@@ -332,6 +339,11 @@ public sealed class MainForm : Form
 
     private async Task OpenFolderDialogAsync()
     {
+        if (!EnsureGameSelectedForOpen())
+        {
+            return;
+        }
+
         using var dialog = new FolderBrowserDialog
         {
             Description = "Select the folder containing the .d3dmesh, .d3dtx and .skl files",
@@ -351,6 +363,11 @@ public sealed class MainForm : Form
     // a model show up with its textures. No external unpacking tool is needed.
     private async Task OpenArchiveAsync()
     {
+        if (!EnsureGameSelectedForOpen())
+        {
+            return;
+        }
+
         using var dialog = new OpenFileDialog
         {
             Title = "Select one or more Telltale archives (.ttarch / .ttarch2)",
@@ -450,12 +467,32 @@ public sealed class MainForm : Form
         }
 
         GameConfig.Current = game;
+        AppPreferences.SaveGameConfig(game);
         UpdateGameSelector();
 
         if (_rootFolder is not null)
         {
             await LoadFolderAsync(_rootFolder);
         }
+    }
+
+    private bool EnsureGameSelectedForOpen()
+    {
+        if (GameConfig.Current.Id != GameId.Generic)
+        {
+            return true;
+        }
+
+        using var dialog = new GameSelectionDialog(GameConfig.Current);
+        if (dialog.ShowDialog(this) != DialogResult.OK)
+        {
+            return false;
+        }
+
+        GameConfig.Current = dialog.SelectedGame;
+        AppPreferences.SaveGameConfig(GameConfig.Current);
+        UpdateGameSelector();
+        return true;
     }
 
     // Entry point for Open Folder / Reload / drag-drop. Owns the busy state, the progress bar and error
@@ -1017,7 +1054,7 @@ public sealed class MainForm : Form
             SkeletonData? skeleton = null;
             if (asset.SkeletonPath is not null)
             {
-                skeleton = SkeletonParser.Parse(File.ReadAllBytes(asset.SkeletonPath), version: 13);
+                skeleton = SkeletonLoader.Load(asset.SkeletonPath, version: 13);
             }
 
             var textures = _rootFolder is null
@@ -1275,11 +1312,12 @@ public sealed class MainForm : Form
 
     private static string ReimportSingleAsset(ModelAsset asset, string input, string output)
     {
+        var gameConfig = GameConfig.Current;
         var layout = D3DMeshLayout.Build(File.ReadAllBytes(asset.MeshPath));
-        var model = GltfReader.Load(input);
+        var model = GltfModelPreprocessor.ApplyGameReinsertRules(GltfReader.Load(input), gameConfig);
         var skeleton = LoadSkeletonOrNull(asset.SkeletonPath, layout.Version);
-        var textures = ReinsertTextureService.WriteAllReferencedTextures(model, asset.MeshPath, output);
-        var bytes = MeshReinserter.ReinsertGeometry(layout, model, textures, skeleton);
+        var textures = ReinsertTextureService.WriteAllReferencedTextures(model, asset.MeshPath, output, gameConfig);
+        var bytes = MeshReinserter.ReinsertGeometry(layout, model, textures, skeleton, gameConfig);
         File.WriteAllBytes(output, bytes);
 
         var check = D3DMeshLayout.Build(bytes);
@@ -1297,9 +1335,9 @@ public sealed class MainForm : Form
 
     // Rebuilds the .skl next to the reimported mesh from the skeleton inside the GLB. When the model
     // keeps the game's original skeleton, the rebuild merges the edits onto the original (so an
-    // untouched skeleton stays byte-identical); a foreign rig is written from scratch. The .skl is named
-    // to match the mesh, so the game pairs them, and the mesh's bone palette already references the
-    // bones by hash. Returns a status line (empty when the GLB carries no skin).
+    // untouched skeleton stays byte-identical). Prop targets intentionally stay geometry-only: a
+    // skinned GLB can be used as a static prop, but the target should not gain a brand-new .skl.
+    // Returns a status line (empty when the GLB carries no skin or the target has no skeleton).
     private static string RebuildSkeletonForReimport(ModelAsset asset, GltfModel model, string output)
     {
         if (model.Skeleton is null || model.Skeleton.Bones.Count == 0)
@@ -1307,29 +1345,20 @@ public sealed class MainForm : Form
             return "";
         }
 
+        if (asset.SkeletonPath is null || !File.Exists(asset.SkeletonPath))
+        {
+            return "\nSkeleton: skipped because the target asset has no original .skl; imported rig was baked as static geometry.";
+        }
+
         try
         {
             var outputDir = Path.GetDirectoryName(output) ?? "";
-            var skeletonName = asset.SkeletonPath is not null
-                ? Path.GetFileName(asset.SkeletonPath)
-                : Path.GetFileNameWithoutExtension(output) + ".skl";
+            var skeletonName = Path.GetFileName(asset.SkeletonPath);
             var skeletonOutput = Path.Combine(outputDir, skeletonName);
 
-            byte[] skeletonBytes;
-            string how;
-            if (asset.SkeletonPath is not null && File.Exists(asset.SkeletonPath))
-            {
-                skeletonBytes = SkeletonRebuilder.RebuildWithEdits(asset.SkeletonPath, model.Skeleton);
-                how = "rebuilt from the original skeleton + your edits";
-            }
-            else
-            {
-                skeletonBytes = SkeletonRebuilder.WriteNewSkeleton(model.Skeleton);
-                how = "built from scratch for the imported rig";
-            }
-
+            var skeletonBytes = SkeletonRebuilder.RebuildWithEdits(asset.SkeletonPath, model.Skeleton);
             File.WriteAllBytes(skeletonOutput, skeletonBytes);
-            return $"\nSkeleton: {skeletonName} {how} ({model.Skeleton.Bones.Count} bones).";
+            return $"\nSkeleton: {skeletonName} rebuilt from the original skeleton + your edits ({model.Skeleton.Bones.Count} bones).";
         }
         catch (Exception ex)
         {
@@ -1345,6 +1374,8 @@ public sealed class MainForm : Form
         string outputFolder)
     {
         Directory.CreateDirectory(outputFolder);
+        var gameConfig = GameConfig.Current;
+        combinedModel = GltfModelPreprocessor.ApplyGameReinsertRules(combinedModel, gameConfig);
         var sourcePrimitives = BuildCombinedSourcePrimitiveMap(combinedModel, inputRoot);
         var ok = 0;
         var skipped = 0;
@@ -1373,8 +1404,8 @@ public sealed class MainForm : Form
             var output = Path.Combine(outputFolder, Path.GetFileName(asset.MeshPath));
             var layout = D3DMeshLayout.Build(File.ReadAllBytes(asset.MeshPath));
             var skeleton = LoadSkeletonOrNull(asset.SkeletonPath, layout.Version);
-            var textures = ReinsertTextureService.WriteAllReferencedTextures(partModel, asset.MeshPath, output);
-            var bytes = MeshReinserter.ReinsertGeometry(layout, partModel, textures, skeleton);
+            var textures = ReinsertTextureService.WriteAllReferencedTextures(partModel, asset.MeshPath, output, gameConfig);
+            var bytes = MeshReinserter.ReinsertGeometry(layout, partModel, textures, skeleton, gameConfig);
             File.WriteAllBytes(output, bytes);
 
             var check = D3DMeshLayout.Build(bytes);
@@ -1507,7 +1538,7 @@ public sealed class MainForm : Form
     {
         return string.IsNullOrWhiteSpace(skeletonPath) || !File.Exists(skeletonPath)
             ? null
-            : SkeletonParser.Parse(File.ReadAllBytes(skeletonPath), version);
+            : SkeletonLoader.Load(skeletonPath, version);
     }
 
     private async Task RunWithUiLockAsync(Func<Task<string>> operation)

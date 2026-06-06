@@ -106,7 +106,7 @@ public sealed class ModelAsset
         {
             try
             {
-                var skeleton = SkeletonParser.Parse(File.ReadAllBytes(skeletonPath), version: 13);
+                var skeleton = SkeletonLoader.Load(skeletonPath, version: 13);
                 result[skeletonPath] = skeleton.Bones
                     .Select(bone => bone.Hash)
                     .Where(hash => hash != 0)

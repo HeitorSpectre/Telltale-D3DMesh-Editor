@@ -586,6 +586,7 @@ public sealed class MeshPreviewControl : Control
     private void DrawSkeleton(Graphics g, Matrix4x4 transform, float scale, PointF center)
     {
         var world = BuildBoneWorldPositions(_skeleton!, _boneOffsets, _boneRotations);
+        var visibleBones = BuildVisibleSkeletonBones();
         using var bonePen = new Pen(Color.FromArgb(240, 255, 196, 72), 2f);
         using var jointBrush = new SolidBrush(Color.FromArgb(245, 255, 235, 145));
         using var selectedPen = new Pen(Color.FromArgb(255, 80, 225, 255), 3f);
@@ -593,11 +594,18 @@ public sealed class MeshPreviewControl : Control
 
         for (var i = 0; i < _skeleton!.Bones.Count; i++)
         {
+            if (visibleBones is not null && !visibleBones.Contains(i))
+            {
+                continue;
+            }
+
             var parent = _skeleton.Bones[i].ParentIndex;
             var p = Project(world[i], transform, scale, center);
             var isSelected = i == _selectedBone;
             g.FillEllipse(isSelected ? selectedBrush : jointBrush, p.X - 2.5f, p.Y - 2.5f, 5f, 5f);
-            if (parent >= 0 && parent < world.Length)
+            if (parent >= 0 &&
+                parent < world.Length &&
+                (visibleBones is null || visibleBones.Contains(parent)))
             {
                 var pp = Project(world[parent], transform, scale, center);
                 g.DrawLine(isSelected ? selectedPen : bonePen, pp, p);
@@ -779,10 +787,16 @@ public sealed class MeshPreviewControl : Control
         var scale = GetViewScale(bounds);
         var center = GetViewportCenter();
         var world = BuildBoneWorldPositions(_skeleton, _boneOffsets, _boneRotations);
+        var visibleBones = BuildVisibleSkeletonBones();
         var bestIndex = -1;
         var bestDistance = 14f;
         for (var i = 0; i < world.Length; i++)
         {
+            if (visibleBones is not null && !visibleBones.Contains(i))
+            {
+                continue;
+            }
+
             var p = Project(world[i], transform, scale, center);
             var distance = MathF.Sqrt((p.X - location.X) * (p.X - location.X) + (p.Y - location.Y) * (p.Y - location.Y));
             if (distance < bestDistance)
@@ -794,8 +808,15 @@ public sealed class MeshPreviewControl : Control
 
         for (var i = 0; i < _skeleton.Bones.Count; i++)
         {
+            if (visibleBones is not null && !visibleBones.Contains(i))
+            {
+                continue;
+            }
+
             var parent = _skeleton.Bones[i].ParentIndex;
-            if (parent < 0 || parent >= world.Length)
+            if (parent < 0 ||
+                parent >= world.Length ||
+                (visibleBones is not null && !visibleBones.Contains(parent)))
             {
                 continue;
             }
@@ -964,6 +985,39 @@ public sealed class MeshPreviewControl : Control
         }
 
         return influenced;
+    }
+
+    private HashSet<int>? BuildVisibleSkeletonBones()
+    {
+        if (_mesh is null || _skeleton is null || _skeleton.Bones.Count == 0)
+        {
+            return null;
+        }
+
+        var visible = BuildInfluencedSkeletonBones();
+        if (visible.Count == 0 && _mesh.BonePalettes.Count > 0)
+        {
+            foreach (var submesh in _mesh.Submeshes)
+            {
+                var map = BuildBoneMap(submesh);
+                if (map is null)
+                {
+                    continue;
+                }
+
+                foreach (var skeletonIndex in map)
+                {
+                    if (skeletonIndex >= 0)
+                    {
+                        visible.Add(skeletonIndex);
+                    }
+                }
+            }
+        }
+
+        return visible.Count > 0 && visible.Count < _skeleton.Bones.Count
+            ? visible
+            : null;
     }
 
     private static void AddInfluencedBone(int rawBone, float weight, int[] map, HashSet<int> influenced)

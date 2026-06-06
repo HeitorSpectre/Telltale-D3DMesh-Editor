@@ -926,11 +926,15 @@ internal static class AssetGltfBuilder
 
     private static bool ShouldSkipGltfNormalTexture(string normalTextureName, string materialName)
     {
-        // The shared eye normal in TWAU does not use the same packing as body normals.
-        // Since glTF does not know Telltale's shader, binding this map as normalTexture gives
-        // eyes/eyebrows artificial lighting. Keep the original reference in extras.telltaleTextures.
-        return normalTextureName.Contains("eye_nm", StringComparison.OrdinalIgnoreCase) ||
-               materialName.Contains("eye", StringComparison.OrdinalIgnoreCase);
+        // Telltale normal maps are not standard glTF tangent-space normals — the packing/convention
+        // (and per-material swizzle) differs and isn't always detectable, so binding them as a glTF
+        // normalTexture gives some parts an artificial bright/metallic look in glTF viewers (Blender).
+        // The official 3ds Max importer (RandomTBush) doesn't apply them either — it uses diffuse+alpha
+        // only. So we don't bind them; the original normal is still preserved in extras.telltaleTextures
+        // for anyone who wants to wire it up manually.
+        _ = normalTextureName;
+        _ = materialName;
+        return true;
     }
 
     private static bool IsDarkAlphaMaterial(string materialName, string diffuseName)

@@ -20,16 +20,21 @@ public sealed class VertexAttrLayout
     public required AttrDescriptor Uv3 { get; init; }
     public required AttrDescriptor Uv4 { get; init; }
 
-    public int Stride =>
-        PositionSize(Position.Format)
-        + UvSize(Uv1.Format) + UvSize(Uv2.Format) + UvSize(Uv3.Format) + UvSize(Uv4.Format)
-        + BoneSize(Bones.Format)
-        + WeightSize(Weights.Format)
-        + ColorSize(Colors.Format)
-        + UnknownSize(Unknown1.Format)
-        + NormalSize(Normals.Format)
-        + Vector4Size(Binormals.Format)
-        + Vector4Size(Tangents.Format);
+    public int Stride => new[]
+    {
+        End(Position, PositionSize(Position.Format)),
+        End(Uv1, UvSize(Uv1.Format)),
+        End(Normals, NormalSize(Normals.Format)),
+        End(Weights, WeightSize(Weights.Format)),
+        End(Bones, BoneSize(Bones.Format)),
+        End(Colors, ColorSize(Colors.Format)),
+        End(Unknown1, UnknownSize(Unknown1.Format)),
+        End(Binormals, Vector4Size(Binormals.Format)),
+        End(Tangents, Vector4Size(Tangents.Format)),
+        End(Uv2, UvSize(Uv2.Format)),
+        End(Uv3, UvSize(Uv3.Format)),
+        End(Uv4, UvSize(Uv4.Format)),
+    }.Max();
 
     public static VertexAttrLayout Read(DataReader reader)
     {
@@ -52,6 +57,9 @@ public sealed class VertexAttrLayout
 
     private static AttrDescriptor ReadAttr(DataReader reader)
         => new(reader.ReadUInt32(), reader.ReadUInt32(), reader.ReadUInt32());
+
+    private static int End(AttrDescriptor attr, int size)
+        => size == 0 ? 0 : checked((int)attr.Offset + size);
 
     private static int PositionSize(uint format) => format switch
     {

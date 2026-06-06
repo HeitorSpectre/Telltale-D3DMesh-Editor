@@ -24,7 +24,8 @@ public static class MeshReinserter
         D3DMeshLayout layout,
         GltfModel model,
         IReadOnlyList<string?>? diffuseTextureNames = null,
-        SkeletonData? referenceSkeleton = null)
+        SkeletonData? referenceSkeleton = null,
+        GameConfig? gameConfig = null)
     {
         IReadOnlyList<IReadOnlyDictionary<string, string>>? textureSlotsByPrimitive = null;
         if (diffuseTextureNames is not null)
@@ -37,21 +38,23 @@ public static class MeshReinserter
                 .ToList();
         }
 
-        return ReinsertGeometry(layout, model, textureSlotsByPrimitive, referenceSkeleton);
+        return ReinsertGeometry(layout, model, textureSlotsByPrimitive, referenceSkeleton, gameConfig);
     }
 
     public static byte[] ReinsertGeometry(
         D3DMeshLayout layout,
         GltfModel model,
         ReinsertedTextures textures,
-        SkeletonData? referenceSkeleton = null)
-        => ReinsertGeometry(layout, model, textures.PrimitiveSlots, referenceSkeleton);
+        SkeletonData? referenceSkeleton = null,
+        GameConfig? gameConfig = null)
+        => ReinsertGeometry(layout, model, textures.PrimitiveSlots, referenceSkeleton, gameConfig);
 
     private static byte[] ReinsertGeometry(
         D3DMeshLayout layout,
         GltfModel model,
         IReadOnlyList<IReadOnlyDictionary<string, string>>? textureSlotsByPrimitive,
-        SkeletonData? referenceSkeleton)
+        SkeletonData? referenceSkeleton,
+        GameConfig? gameConfig)
     {
         if (model.Primitives.Count == 0)
         {
@@ -63,13 +66,21 @@ public static class MeshReinserter
             throw new InvalidOperationException("Template has no submesh table to use as a base.");
         }
 
+        var preparedPrimitives = PreparePrimitives(layout, model, textureSlotsByPrimitive, referenceSkeleton);
+        var preparedTextureSlotsByPrimitive = textureSlotsByPrimitive is null
+            ? null
+            : preparedPrimitives
+                .Select(primitive => primitive.TextureSlots ?? EmptyTextureSlots)
+                .ToList();
+
         var verts = new List<EncVertex>();
         var faceIndices = new List<int>(); // global 0-based, flattened (3 per triangle)
-        var subInfo = new SubmeshPatchInfo[model.Primitives.Count];
+        var subInfo = new SubmeshPatchInfo[preparedPrimitives.Count];
 
-        for (var k = 0; k < model.Primitives.Count; k++)
+        for (var k = 0; k < preparedPrimitives.Count; k++)
         {
-            var prim = model.Primitives[k];
+            var prepared = preparedPrimitives[k];
+            var prim = prepared.Primitive;
             var vertexStart = verts.Count;
             var faceStart = faceIndices.Count;
 
@@ -80,7 +91,7 @@ public static class MeshReinserter
             var binormals = HasVertexChannel(prim.Binormals, prim.VertexCount)
                 ? prim.Binormals!
                 : ComputeBinormals(normals, tanX, tanY, tanZ, tanW);
-            var skinning = BuildSkinningMap(layout, model, prim, k, referenceSkeleton);
+            var skinning = BuildSkinningMap(layout, model, prim, k, referenceSkeleton, prepared.BonePaletteIndex);
 
             for (var i = 0; i < prim.VertexCount; i++)
             {
@@ -132,7 +143,7 @@ public static class MeshReinserter
                 VMax: verts.Count - 1,
                 FaceStart: faceStart,
                 PolyCount: (faceIndices.Count - faceStart) / 3,
-                BonePaletteIndex: prim.BonePaletteIndex);
+                BonePaletteIndex: prepared.BonePaletteIndex);
         }
 
         if (verts.Count > 65535)
@@ -162,7 +173,7 @@ public static class MeshReinserter
             new(layout.BoundsOffset, 24, BuildBoundsBytes(verts)),
             new(layout.SubmeshBlockSizeFieldOffset, 4, U32(layout.SubmeshBlockSize + BuildSubmeshTableSizeDelta(layout, subInfo.Length))),
             new(layout.SubmeshCountFieldOffset, 4, U32(subInfo.Length)),
-            new(layout.SubmeshTableOffset, layout.SubmeshTableLength, BuildSubmeshTable(layout, subInfo, textureSlotsByPrimitive)),
+            new(layout.SubmeshTableOffset, layout.SubmeshTableLength, BuildSubmeshTable(layout, subInfo, preparedTextureSlotsByPrimitive, gameConfig ?? GameConfig.Current)),
             new(layout.UvScalesOffset, 32, BuildUvScaleBytes(mults)),
             new(layout.FaceCountFieldOffset, 4, U32(faceIndices.Count)),
             new(layout.FaceDataOffset, layout.FaceDataLength, faceBytes),
@@ -170,13 +181,21 @@ public static class MeshReinserter
             new(layout.VertexDataOffset, layout.VertexDataLength, vertexBytes),
         };
 
-        var texturePlansBySlot = BuildTextureGroupPlans(layout, textureSlotsByPrimitive);
+        var texturePlansBySlot = BuildTextureGroupPlans(layout, preparedTextureSlotsByPrimitive);
         if (texturePlansBySlot.Count > 0)
         {
             patches.Add(new RegionPatch(
                 layout.TextureGroupBlockOffset,
                 layout.TextureGroupBlockLength,
                 BuildTextureGroupBlock(layout, texturePlansBySlot)));
+        }
+
+        if (layout.BonePalettes.Count > layout.OriginalBonePaletteCount)
+        {
+            patches.Add(new RegionPatch(
+                layout.BonePaletteBlockOffset,
+                layout.BonePaletteBlockLength,
+                BuildBonePaletteBlock(layout)));
         }
 
         var result = D3DMeshWriter.Apply(layout, patches);
@@ -188,6 +207,21 @@ public static class MeshReinserter
 
     private readonly record struct SubmeshPatchInfo(int VMin, int VMax, int FaceStart, int PolyCount, int? BonePaletteIndex);
     private sealed record TextureGroupEntryPlan(string TextureName, TextureEntryLayout TemplateEntry, int SortKey, int EncounterIndex);
+    private sealed record PreparedPrimitive(
+        GltfPrimitive Primitive,
+        IReadOnlyDictionary<string, string>? TextureSlots,
+        int? BonePaletteIndex);
+
+    private sealed class PrimitiveJointUsage
+    {
+        public required HashSet<ulong>[] VertexHashes { get; init; }
+        public required HashSet<ulong> AllHashes { get; init; }
+        public required List<string> UnresolvedJoints { get; init; }
+    }
+
+    private static readonly IReadOnlyDictionary<string, string> EmptyTextureSlots =
+        new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+    private const int MaxPaletteBonesForByteEncoding = 86;
 
     private sealed class PrimitiveSkinning
     {
@@ -212,12 +246,363 @@ public static class MeshReinserter
     private static bool IsValidTriangle(int a, int b, int c, int vertexCount)
         => a >= 0 && b >= 0 && c >= 0 && a < vertexCount && b < vertexCount && c < vertexCount;
 
+    private static List<PreparedPrimitive> PreparePrimitives(
+        D3DMeshLayout layout,
+        GltfModel model,
+        IReadOnlyList<IReadOnlyDictionary<string, string>>? textureSlotsByPrimitive,
+        SkeletonData? referenceSkeleton)
+    {
+        var result = new List<PreparedPrimitive>();
+        for (var primitiveIndex = 0; primitiveIndex < model.Primitives.Count; primitiveIndex++)
+        {
+            var primitive = model.Primitives[primitiveIndex];
+            var textureSlots = textureSlotsByPrimitive is not null && primitiveIndex < textureSlotsByPrimitive.Count
+                ? textureSlotsByPrimitive[primitiveIndex]
+                : null;
+
+            if (!HasUsableSkin(primitive) || layout.BonePalettes.Count == 0)
+            {
+                result.Add(new PreparedPrimitive(primitive, textureSlots, primitive.BonePaletteIndex));
+                continue;
+            }
+
+            var usage = AnalyzeJointUsage(primitive, model, referenceSkeleton);
+            if (usage.UnresolvedJoints.Count > 0)
+            {
+                throw new InvalidOperationException(
+                    "Could not resolve GLB joint(s) to Telltale bone hashes: " +
+                    string.Join(", ", usage.UnresolvedJoints.Take(8)) +
+                    (usage.UnresolvedJoints.Count > 8 ? "..." : ""));
+            }
+
+            if (usage.AllHashes.Count == 0)
+            {
+                result.Add(new PreparedPrimitive(primitive, textureSlots, primitive.BonePaletteIndex));
+                continue;
+            }
+
+            var preferredPalette = ResolvePrimitivePaletteIndex(layout, primitive, primitiveIndex);
+
+            // A GLB carries the bone-palette index of the model it was exported from. That index is
+            // only meaningful on the same template (a round-trip); porting a model onto a different
+            // template (e.g. a The Wolf Among Us mesh into a The Walking Dead skeleton) lands on a
+            // palette that holds entirely different bones. So honour the declared palette only when it
+            // actually covers all weighted joints, otherwise fall through to find or build one that does.
+            if (primitive.BonePaletteIndex is { } explicitPalette &&
+                explicitPalette >= 0 &&
+                explicitPalette < layout.BonePalettes.Count &&
+                PaletteCovers(layout.BonePalettes[explicitPalette], usage.AllHashes))
+            {
+                result.Add(new PreparedPrimitive(primitive, textureSlots, explicitPalette));
+                continue;
+            }
+
+            if (FindCoveringPalette(layout, usage.AllHashes, preferredPalette) is { } fullPalette)
+            {
+                result.Add(new PreparedPrimitive(primitive, textureSlots, fullPalette));
+                continue;
+            }
+
+            if (usage.AllHashes.Count <= MaxPaletteBonesForByteEncoding)
+            {
+                var customPalette = AddCustomBonePalette(layout, usage.AllHashes);
+                result.Add(new PreparedPrimitive(primitive, textureSlots, customPalette));
+                continue;
+            }
+
+            var slices = SplitPrimitiveByBonePalette(layout, primitive, usage, textureSlots, preferredPalette);
+            result.AddRange(slices);
+        }
+
+        return result;
+    }
+
+    private static bool HasUsableSkin(GltfPrimitive primitive)
+        => primitive.Joints0 is { } joints &&
+           primitive.Weights0 is { } weights &&
+           joints.Length >= primitive.VertexCount * 4 &&
+           weights.Length == primitive.VertexCount;
+
+    private static PrimitiveJointUsage AnalyzeJointUsage(
+        GltfPrimitive primitive,
+        GltfModel model,
+        SkeletonData? referenceSkeleton)
+    {
+        var vertexHashes = new HashSet<ulong>[primitive.VertexCount];
+        var allHashes = new HashSet<ulong>();
+        var unresolved = new List<string>();
+        var unresolvedSeen = new HashSet<int>();
+
+        for (var vertex = 0; vertex < primitive.VertexCount; vertex++)
+        {
+            var hashes = new HashSet<ulong>();
+            vertexHashes[vertex] = hashes;
+            if (primitive.Joints0 is null || primitive.Weights0 is null)
+            {
+                continue;
+            }
+
+            var jointOffset = vertex * 4;
+            var weights = primitive.Weights0[vertex];
+            for (var influence = 0; influence < 4; influence++)
+            {
+                var weight = influence switch
+                {
+                    0 => weights.X,
+                    1 => weights.Y,
+                    2 => weights.Z,
+                    _ => weights.W,
+                };
+                if (weight <= 0.000001f)
+                {
+                    continue;
+                }
+
+                var gltfJoint = primitive.Joints0[jointOffset + influence];
+                if (TryResolveJointHash(gltfJoint, model, referenceSkeleton, out var hash) && hash != 0)
+                {
+                    hashes.Add(hash);
+                    allHashes.Add(hash);
+                }
+                else if (unresolvedSeen.Add(gltfJoint))
+                {
+                    unresolved.Add(DescribeGltfJoint(gltfJoint, model));
+                }
+            }
+        }
+
+        return new PrimitiveJointUsage
+        {
+            VertexHashes = vertexHashes,
+            AllHashes = allHashes,
+            UnresolvedJoints = unresolved,
+        };
+    }
+
+    private static IEnumerable<int> EnumerateWeightedJoints(GltfPrimitive primitive)
+    {
+        if (primitive.Joints0 is null || primitive.Weights0 is null)
+        {
+            yield break;
+        }
+
+        for (var vertex = 0; vertex < primitive.VertexCount; vertex++)
+        {
+            var jointOffset = vertex * 4;
+            var weights = primitive.Weights0[vertex];
+            if (weights.X > 0.000001f) yield return primitive.Joints0[jointOffset];
+            if (weights.Y > 0.000001f) yield return primitive.Joints0[jointOffset + 1];
+            if (weights.Z > 0.000001f) yield return primitive.Joints0[jointOffset + 2];
+            if (weights.W > 0.000001f) yield return primitive.Joints0[jointOffset + 3];
+        }
+    }
+
+    private static string DescribeGltfJoint(int jointIndex, GltfModel model)
+    {
+        if (jointIndex >= 0 &&
+            jointIndex < model.Joints.Count &&
+            !string.IsNullOrWhiteSpace(model.Joints[jointIndex].Name))
+        {
+            return $"{jointIndex} ({model.Joints[jointIndex].Name})";
+        }
+
+        return jointIndex.ToString();
+    }
+
+    private static int? FindCoveringPalette(D3DMeshLayout layout, IReadOnlySet<ulong> hashes, int preferredPalette)
+    {
+        if (preferredPalette >= 0 &&
+            preferredPalette < layout.BonePalettes.Count &&
+            PaletteCovers(layout.BonePalettes[preferredPalette], hashes))
+        {
+            return preferredPalette;
+        }
+
+        for (var i = 0; i < layout.BonePalettes.Count; i++)
+        {
+            if (PaletteCovers(layout.BonePalettes[i], hashes))
+            {
+                return i;
+            }
+        }
+
+        return null;
+    }
+
+    private static bool PaletteCovers(IReadOnlyList<ulong> palette, IReadOnlySet<ulong> hashes)
+    {
+        if (hashes.Count == 0)
+        {
+            return true;
+        }
+
+        var paletteHashes = palette.ToHashSet();
+        return hashes.All(paletteHashes.Contains);
+    }
+
+    private static int AddCustomBonePalette(D3DMeshLayout layout, IEnumerable<ulong> hashes)
+    {
+        var palette = hashes
+            .Where(hash => hash != 0)
+            .Distinct()
+            .OrderBy(hash => hash)
+            .ToArray();
+        if (palette.Length > MaxPaletteBonesForByteEncoding)
+        {
+            throw new InvalidOperationException(
+                $"The GLB skin uses {palette.Length} weighted bones in one primitive; this template can encode at most {MaxPaletteBonesForByteEncoding} bones per palette.");
+        }
+
+        var paletteSet = palette.ToHashSet();
+        for (var i = 0; i < layout.BonePalettes.Count; i++)
+        {
+            if (layout.BonePalettes[i].Length == palette.Length &&
+                paletteSet.SetEquals(layout.BonePalettes[i]))
+            {
+                return i;
+            }
+        }
+
+        layout.BonePalettes.Add(palette);
+        return layout.BonePalettes.Count - 1;
+    }
+
+    private static List<PreparedPrimitive> SplitPrimitiveByBonePalette(
+        D3DMeshLayout layout,
+        GltfPrimitive primitive,
+        PrimitiveJointUsage usage,
+        IReadOnlyDictionary<string, string>? textureSlots,
+        int preferredPalette)
+    {
+        var trianglesByPalette = new Dictionary<int, List<int>>();
+        var failedTriangles = 0;
+        for (var i = 0; i + 2 < primitive.Indices.Length; i += 3)
+        {
+            var a = primitive.Indices[i];
+            var b = primitive.Indices[i + 1];
+            var c = primitive.Indices[i + 2];
+            if (!IsValidTriangle(a, b, c, primitive.VertexCount))
+            {
+                continue;
+            }
+
+            var triangleHashes = new HashSet<ulong>();
+            triangleHashes.UnionWith(usage.VertexHashes[a]);
+            triangleHashes.UnionWith(usage.VertexHashes[b]);
+            triangleHashes.UnionWith(usage.VertexHashes[c]);
+
+            if (FindCoveringPalette(layout, triangleHashes, preferredPalette) is not { } paletteIndex)
+            {
+                failedTriangles++;
+                continue;
+            }
+
+            if (!trianglesByPalette.TryGetValue(paletteIndex, out var indices))
+            {
+                indices = [];
+                trianglesByPalette[paletteIndex] = indices;
+            }
+
+            indices.Add(a);
+            indices.Add(b);
+            indices.Add(c);
+        }
+
+        if (failedTriangles > 0 || trianglesByPalette.Count == 0)
+        {
+            throw new InvalidOperationException(
+                $"The GLB skin uses bones that cannot fit the template bone palettes ({failedTriangles} triangle(s) failed). " +
+                "Keep the original Telltale bone names and split the model by compatible body parts, or use a template with matching palettes.");
+        }
+
+        return trianglesByPalette
+            .OrderBy(pair => pair.Key == preferredPalette ? -1 : pair.Key)
+            .Select(pair => new PreparedPrimitive(
+                SlicePrimitive(primitive, pair.Value, pair.Key),
+                textureSlots,
+                pair.Key))
+            .ToList();
+    }
+
+    private static GltfPrimitive SlicePrimitive(GltfPrimitive source, IReadOnlyList<int> triangleIndices, int paletteIndex)
+    {
+        var remap = new Dictionary<int, int>();
+        var sourceVertices = new List<int>();
+        foreach (var index in triangleIndices)
+        {
+            if (!remap.ContainsKey(index))
+            {
+                remap[index] = sourceVertices.Count;
+                sourceVertices.Add(index);
+            }
+        }
+
+        var joints = SliceJoints(source.Joints0, sourceVertices, source.VertexCount);
+        return new GltfPrimitive
+        {
+            Positions = SliceChannel(source.Positions, sourceVertices, source.VertexCount)!,
+            Normals = SliceChannel(source.Normals, sourceVertices, source.VertexCount),
+            Uv0 = SliceChannel(source.Uv0, sourceVertices, source.VertexCount),
+            Uv1 = SliceChannel(source.Uv1, sourceVertices, source.VertexCount),
+            Uv2 = SliceChannel(source.Uv2, sourceVertices, source.VertexCount),
+            Uv3 = SliceChannel(source.Uv3, sourceVertices, source.VertexCount),
+            Color0 = SliceChannel(source.Color0, sourceVertices, source.VertexCount),
+            Tangents = SliceChannel(source.Tangents, sourceVertices, source.VertexCount),
+            Binormals = SliceChannel(source.Binormals, sourceVertices, source.VertexCount),
+            Unknown1 = SliceChannel(source.Unknown1, sourceVertices, source.VertexCount),
+            Joints0 = joints,
+            Weights0 = SliceChannel(source.Weights0, sourceVertices, source.VertexCount),
+            Indices = triangleIndices.Select(index => remap[index]).ToArray(),
+            MaterialName = source.MaterialName,
+            BonePaletteIndex = paletteIndex,
+            SourceMeshPath = source.SourceMeshPath,
+            SourceSubmeshIndex = source.SourceSubmeshIndex,
+            IsSkinned = source.IsSkinned,
+            BaseColor = source.BaseColor,
+            TextureSlots = source.TextureSlots,
+            ReferencedTextures = source.ReferencedTextures,
+        };
+    }
+
+    private static T[]? SliceChannel<T>(T[]? source, IReadOnlyList<int> sourceVertices, int vertexCount)
+    {
+        if (!HasVertexChannel(source, vertexCount))
+        {
+            return null;
+        }
+
+        var result = new T[sourceVertices.Count];
+        for (var i = 0; i < sourceVertices.Count; i++)
+        {
+            result[i] = source![sourceVertices[i]];
+        }
+
+        return result;
+    }
+
+    private static ushort[]? SliceJoints(ushort[]? source, IReadOnlyList<int> sourceVertices, int vertexCount)
+    {
+        if (source is null || source.Length < vertexCount * 4)
+        {
+            return null;
+        }
+
+        var result = new ushort[sourceVertices.Count * 4];
+        for (var i = 0; i < sourceVertices.Count; i++)
+        {
+            Array.Copy(source, sourceVertices[i] * 4, result, i * 4, 4);
+        }
+
+        return result;
+    }
+
     private static PrimitiveSkinning? BuildSkinningMap(
         D3DMeshLayout layout,
         GltfModel model,
         GltfPrimitive prim,
         int primitiveIndex,
-        SkeletonData? referenceSkeleton)
+        SkeletonData? referenceSkeleton,
+        int? preparedPaletteIndex)
     {
         if (prim.Joints0 is null ||
             prim.Weights0 is null ||
@@ -228,7 +613,7 @@ public static class MeshReinserter
             return null;
         }
 
-        var paletteIndex = ResolvePrimitivePaletteIndex(layout, prim, primitiveIndex);
+        var paletteIndex = ResolvePrimitivePaletteIndex(layout, prim, primitiveIndex, preparedPaletteIndex);
         var palette = layout.BonePalettes[paletteIndex];
         if (palette.Length == 0)
         {
@@ -236,7 +621,7 @@ public static class MeshReinserter
         }
 
         var mapped = new Dictionary<int, int>();
-        foreach (var gltfJoint in prim.Joints0.Select(j => (int)j).Distinct())
+        foreach (var gltfJoint in EnumerateWeightedJoints(prim).Distinct())
         {
             var localPaletteIndex = ResolvePaletteLocalIndex(gltfJoint, model, referenceSkeleton, palette);
             mapped[gltfJoint] = localPaletteIndex >= 0 ? localPaletteIndex * 3 : -1;
@@ -246,7 +631,17 @@ public static class MeshReinserter
     }
 
     private static int ResolvePrimitivePaletteIndex(D3DMeshLayout layout, GltfPrimitive prim, int primitiveIndex)
+        => ResolvePrimitivePaletteIndex(layout, prim, primitiveIndex, preparedPaletteIndex: null);
+
+    private static int ResolvePrimitivePaletteIndex(D3DMeshLayout layout, GltfPrimitive prim, int primitiveIndex, int? preparedPaletteIndex)
     {
+        if (preparedPaletteIndex is { } prepared &&
+            prepared >= 0 &&
+            prepared < layout.BonePalettes.Count)
+        {
+            return prepared;
+        }
+
         if (prim.BonePaletteIndex is { } explicitIndex &&
             explicitIndex >= 0 &&
             explicitIndex < layout.BonePalettes.Count)
@@ -275,8 +670,7 @@ public static class MeshReinserter
             }
         }
 
-        // Fallback for externally imported GLBs that already use JOINTS_0 as the local palette index.
-        return gltfJoint >= 0 && gltfJoint < palette.Count ? gltfJoint : -1;
+        return -1;
     }
 
     private static bool TryResolveJointHash(
@@ -426,7 +820,11 @@ public static class MeshReinserter
         return total;
     }
 
-    private static byte[] BuildSubmeshTable(D3DMeshLayout layout, IReadOnlyList<SubmeshPatchInfo> subInfo, IReadOnlyList<IReadOnlyDictionary<string, string>>? textureSlotsByPrimitive)
+    private static byte[] BuildSubmeshTable(
+        D3DMeshLayout layout,
+        IReadOnlyList<SubmeshPatchInfo> subInfo,
+        IReadOnlyList<IReadOnlyDictionary<string, string>>? textureSlotsByPrimitive,
+        GameConfig gameConfig)
     {
         using var ms = new MemoryStream(BuildSubmeshTableLength(layout, subInfo.Count));
         var textureIndexBySlot = BuildTextureGroupPlans(layout, textureSlotsByPrimitive)
@@ -458,6 +856,8 @@ public static class MeshReinserter
                 ClearAccessoryLineTextureSlots(bytes, template);
             }
 
+            ClearStaleTemplateTextureSlots(gameConfig, bytes, template, textureSlotsByPrimitive, i);
+
             if (textureSlotsByPrimitive is not null && i < textureSlotsByPrimitive.Count)
             {
                 foreach (var (slot, textureName) in textureSlotsByPrimitive[i])
@@ -480,19 +880,73 @@ public static class MeshReinserter
         return ms.ToArray();
     }
 
+    private static void ClearStaleTemplateTextureSlots(
+        GameConfig gameConfig,
+        byte[] bytes,
+        SubmeshLayout template,
+        IReadOnlyList<IReadOnlyDictionary<string, string>>? textureSlotsByPrimitive,
+        int primitiveIndex)
+    {
+        if (gameConfig.ClearInheritedBakeOnReimport &&
+            !PrimitiveProvidesSlot(textureSlotsByPrimitive, primitiveIndex, "bake"))
+        {
+            ClearTextureSlot(bytes, template, "bake");
+        }
+
+        if (!gameConfig.ClearInheritedSecondaryTexturesOnReimport)
+        {
+            return;
+        }
+
+        foreach (var slot in new[]
+                 {
+                     "bump",
+                     "environment",
+                     "detail_diffuse",
+                     "detail_bump",
+                     "specular",
+                     "tex8",
+                     "gradient",
+                     "tex10",
+                     "shadow",
+                 })
+        {
+            if (!PrimitiveProvidesSlot(textureSlotsByPrimitive, primitiveIndex, slot))
+            {
+                ClearTextureSlot(bytes, template, slot);
+            }
+        }
+    }
+
     private static void ClearAccessoryLineTextureSlots(byte[] bytes, SubmeshLayout template)
     {
         foreach (var slot in new[] { "detail_diffuse", "detail_bump", "tex8" })
         {
-            var slotIndex = Array.FindIndex(TextureSlotsV13, candidate => string.Equals(candidate, slot, StringComparison.OrdinalIgnoreCase));
-            if (slotIndex < 0 || slotIndex >= template.TextureSlotFieldOffsets.Length)
-            {
-                continue;
-            }
-
-            var fieldOffset = template.TextureSlotFieldOffsets[slotIndex];
-            WriteU32(bytes, fieldOffset - template.EntryOffset, -1);
+            ClearTextureSlot(bytes, template, slot);
         }
+    }
+
+    private static bool PrimitiveProvidesSlot(
+        IReadOnlyList<IReadOnlyDictionary<string, string>>? textureSlotsByPrimitive,
+        int primitiveIndex,
+        string slot)
+    {
+        return textureSlotsByPrimitive is not null &&
+               primitiveIndex >= 0 &&
+               primitiveIndex < textureSlotsByPrimitive.Count &&
+               textureSlotsByPrimitive[primitiveIndex].ContainsKey(slot);
+    }
+
+    private static void ClearTextureSlot(byte[] bytes, SubmeshLayout template, string slot)
+    {
+        var slotIndex = Array.FindIndex(TextureSlotsV13, candidate => string.Equals(candidate, slot, StringComparison.OrdinalIgnoreCase));
+        if (slotIndex < 0 || slotIndex >= template.TextureSlotFieldOffsets.Length)
+        {
+            return;
+        }
+
+        var fieldOffset = template.TextureSlotFieldOffsets[slotIndex];
+        WriteU32(bytes, fieldOffset - template.EntryOffset, -1);
     }
 
     private static Dictionary<string, List<TextureGroupEntryPlan>> BuildTextureGroupPlans(
@@ -607,6 +1061,32 @@ public static class MeshReinserter
 
         var result = ms.ToArray();
         BinaryPrimitives.WriteUInt32LittleEndian(result.AsSpan(0, 4), (uint)result.Length);
+        return result;
+    }
+
+    private static byte[] BuildBonePaletteBlock(D3DMeshLayout layout)
+    {
+        using var ms = new MemoryStream();
+        ms.Write(layout.Original, layout.BonePaletteBlockOffset, layout.BonePaletteBlockLength);
+
+        for (var paletteIndex = layout.OriginalBonePaletteCount; paletteIndex < layout.BonePalettes.Count; paletteIndex++)
+        {
+            var palette = layout.BonePalettes[paletteIndex];
+            ms.Write(U32(palette.Length));
+            foreach (var hash in palette)
+            {
+                var entry = layout.BonePaletteEntryTemplate.Length == layout.BonePaletteEntrySize
+                    ? layout.BonePaletteEntryTemplate.ToArray()
+                    : new byte[layout.BonePaletteEntrySize];
+                BinaryPrimitives.WriteUInt32LittleEndian(entry.AsSpan(0, 4), unchecked((uint)hash));
+                BinaryPrimitives.WriteUInt32LittleEndian(entry.AsSpan(4, 4), unchecked((uint)(hash >> 32)));
+                ms.Write(entry, 0, entry.Length);
+            }
+        }
+
+        var result = ms.ToArray();
+        BinaryPrimitives.WriteUInt32LittleEndian(result.AsSpan(0, 4), (uint)result.Length);
+        BinaryPrimitives.WriteUInt32LittleEndian(result.AsSpan(4, 4), (uint)layout.BonePalettes.Count);
         return result;
     }
 

@@ -127,7 +127,7 @@ public static class ExtractionService
         var auxiliaryTextures = BuildAuxiliaryTexturePngsForExport(mesh, inputRoot, asset.MeshPath, baseColorByName.Keys);
 
         SkeletonData? skeleton = asset.SkeletonPath is not null
-            ? SkeletonParser.Parse(File.ReadAllBytes(asset.SkeletonPath), version: 13)
+            ? SkeletonLoader.Load(asset.SkeletonPath, version: 13)
             : null;
 
         if (format == ExportFormat.Glb)
@@ -236,7 +236,7 @@ public static class ExtractionService
         }
 
         SkeletonData? skeleton = File.Exists(group.SkeletonPath)
-            ? SkeletonParser.Parse(File.ReadAllBytes(group.SkeletonPath), version: 13)
+            ? SkeletonLoader.Load(group.SkeletonPath, version: 13)
             : null;
 
         return new CombinedAsset(combinedMesh, skeleton, combinedTextures);

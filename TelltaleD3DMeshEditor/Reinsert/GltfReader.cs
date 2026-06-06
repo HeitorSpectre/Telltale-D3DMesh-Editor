@@ -150,7 +150,6 @@ public static class GltfReader
             {
                 ReadNodePrimitives(rootNode, Matrix4x4.Identity, nodes, meshes, ctx, primitives, nodeWorlds);
             }
-            DropSkinnedExtrasWhenStaticGeometryExists(primitives);
             AutoUprightSkinnedModel(primitives);
         }
         else if (root.TryGetProperty("meshes", out meshes))
@@ -208,6 +207,11 @@ public static class GltfReader
             jointIndexByNode[jointNodeIndices[i]] = i;
         }
 
+        if (!UsesExactLocalTransformBits(nodes, jointNodeIndices))
+        {
+            return ReadBakedSkeletonData(root, nodes, jointNodeIndices);
+        }
+
         var parentNodeByNode = BuildParentNodeMap(nodes);
 
         var skeleton = new SkeletonData();
@@ -223,8 +227,9 @@ public static class GltfReader
             var parentIndex = -1;
             ulong parentHash = 0;
             if (parentNodeByNode.TryGetValue(nodeIndex, out var parentNode) &&
-                jointIndexByNode.TryGetValue(parentNode, out parentIndex))
+                jointIndexByNode.TryGetValue(parentNode, out var resolvedParentIndex))
             {
+                parentIndex = resolvedParentIndex;
                 var parentNodeElem = nodes[parentNode];
                 parentHash = ReadNodeHash(parentNodeElem)
                     ?? (parentNodeElem.TryGetProperty("name", out var pn) && pn.GetString() is { Length: > 0 } pname
@@ -236,6 +241,191 @@ public static class GltfReader
         }
 
         return skeleton;
+    }
+
+    private static bool UsesExactLocalTransformBits(JsonElement nodes, IReadOnlyList<int> jointNodeIndices)
+    {
+        foreach (var nodeIndex in jointNodeIndices)
+        {
+            if (nodeIndex < 0 || nodeIndex >= nodes.GetArrayLength())
+            {
+                return false;
+            }
+
+            var node = nodes[nodeIndex];
+            if (!TryReadFloatBits(node, "translationBits", 3, out _) ||
+                !TryReadFloatBits(node, "rotationBits", 4, out _))
+            {
+                return false;
+            }
+        }
+
+        return true;
+    }
+
+    private static SkeletonData ReadBakedSkeletonData(JsonElement root, JsonElement nodes, IReadOnlyList<int> jointNodeIndices)
+    {
+        var jointNodeSet = jointNodeIndices.ToHashSet();
+        var parentNodeByNode = BuildParentNodeMap(nodes);
+        var orderedJointNodes = BuildJointNodeOrder(nodes, jointNodeIndices, parentNodeByNode, jointNodeSet);
+        var jointIndexByNode = orderedJointNodes
+            .Select((node, index) => (node, index))
+            .ToDictionary(item => item.node, item => item.index);
+        var rootNodes = GetSceneRootNodes(root, nodes).ToArray();
+        var nodeWorlds = BuildNodeWorldTransforms(nodes, rootNodes);
+        var bakedWorlds = new Matrix4x4[orderedJointNodes.Count];
+
+        var skeleton = new SkeletonData();
+        for (var i = 0; i < orderedJointNodes.Count; i++)
+        {
+            var nodeIndex = orderedJointNodes[i];
+            var node = nodes[nodeIndex];
+            var name = node.TryGetProperty("name", out var n) ? n.GetString() ?? "" : "";
+            var hash = ReadNodeHash(node) ?? (string.IsNullOrEmpty(name) ? 0UL : Crc64Ecma.Compute(name));
+
+            var world = nodeWorlds.TryGetValue(nodeIndex, out var foundWorld)
+                ? RemoveScale(foundWorld)
+                : RemoveScale(ReadNodeLocalTransform(node));
+
+            var parentIndex = -1;
+            ulong parentHash = 0;
+            if (parentNodeByNode.TryGetValue(nodeIndex, out var parentNode) &&
+                jointIndexByNode.TryGetValue(parentNode, out var resolvedParentIndex))
+            {
+                parentIndex = resolvedParentIndex;
+                var parentNodeElem = nodes[parentNode];
+                parentHash = ReadNodeHash(parentNodeElem)
+                    ?? (parentNodeElem.TryGetProperty("name", out var pn) && pn.GetString() is { Length: > 0 } pname
+                        ? Crc64Ecma.Compute(pname)
+                        : 0);
+            }
+
+            Matrix4x4 local;
+            if (parentIndex >= 0 && Matrix4x4.Invert(bakedWorlds[parentIndex], out var inverseParent))
+            {
+                local = world * inverseParent;
+            }
+            else
+            {
+                local = world;
+            }
+
+            if (!Matrix4x4.Decompose(local, out _, out var rotation, out var translation))
+            {
+                rotation = Quaternion.Identity;
+                translation = Vector3.Zero;
+            }
+
+            translation *= GetInheritedScale(nodes, parentNodeByNode, nodeIndex);
+            rotation = rotation.LengthSquared() > 0.000001f ? Quaternion.Normalize(rotation) : Quaternion.Identity;
+            bakedWorlds[i] = world;
+            skeleton.Bones.Add(new BoneData(
+                name,
+                hash,
+                parentIndex,
+                translation.X,
+                translation.Y,
+                translation.Z,
+                rotation.X,
+                rotation.Y,
+                rotation.Z,
+                rotation.W,
+                parentHash));
+        }
+
+        return skeleton;
+    }
+
+    private static Vector3 GetInheritedScale(JsonElement nodes, IReadOnlyDictionary<int, int> parentNodeByNode, int nodeIndex)
+    {
+        var scale = Vector3.One;
+        var seen = new HashSet<int>();
+        var current = nodeIndex;
+        while (parentNodeByNode.TryGetValue(current, out var parentNode) &&
+               parentNode >= 0 &&
+               parentNode < nodes.GetArrayLength() &&
+               seen.Add(parentNode))
+        {
+            scale *= ReadVector3(nodes[parentNode], "scale", Vector3.One);
+            current = parentNode;
+        }
+
+        return scale;
+    }
+
+    private static List<int> BuildJointNodeOrder(
+        JsonElement nodes,
+        IReadOnlyList<int> jointNodeIndices,
+        IReadOnlyDictionary<int, int> parentNodeByNode,
+        IReadOnlySet<int> jointNodeSet)
+    {
+        var childrenByJoint = new Dictionary<int, List<int>>();
+        foreach (var nodeIndex in jointNodeIndices)
+        {
+            if (parentNodeByNode.TryGetValue(nodeIndex, out var parentNode) &&
+                jointNodeSet.Contains(parentNode))
+            {
+                if (!childrenByJoint.TryGetValue(parentNode, out var children))
+                {
+                    children = [];
+                    childrenByJoint[parentNode] = children;
+                }
+
+                children.Add(nodeIndex);
+            }
+        }
+
+        var result = new List<int>(jointNodeIndices.Count);
+        var visited = new HashSet<int>();
+        foreach (var nodeIndex in jointNodeIndices)
+        {
+            if (!parentNodeByNode.TryGetValue(nodeIndex, out var parentNode) ||
+                !jointNodeSet.Contains(parentNode))
+            {
+                AddJointDepthFirst(nodeIndex, childrenByJoint, visited, result);
+            }
+        }
+
+        foreach (var nodeIndex in jointNodeIndices)
+        {
+            AddJointDepthFirst(nodeIndex, childrenByJoint, visited, result);
+        }
+
+        return result;
+    }
+
+    private static void AddJointDepthFirst(
+        int nodeIndex,
+        IReadOnlyDictionary<int, List<int>> childrenByJoint,
+        HashSet<int> visited,
+        List<int> result)
+    {
+        if (!visited.Add(nodeIndex))
+        {
+            return;
+        }
+
+        result.Add(nodeIndex);
+        if (!childrenByJoint.TryGetValue(nodeIndex, out var children))
+        {
+            return;
+        }
+
+        foreach (var child in children)
+        {
+            AddJointDepthFirst(child, childrenByJoint, visited, result);
+        }
+    }
+
+    private static Matrix4x4 RemoveScale(Matrix4x4 matrix)
+    {
+        if (!Matrix4x4.Decompose(matrix, out _, out var rotation, out var translation))
+        {
+            return matrix;
+        }
+
+        rotation = rotation.LengthSquared() > 0.000001f ? Quaternion.Normalize(rotation) : Quaternion.Identity;
+        return Matrix4x4.CreateFromQuaternion(rotation) * Matrix4x4.CreateTranslation(translation);
     }
 
     private static Dictionary<int, int> BuildParentNodeMap(JsonElement nodes)
@@ -387,7 +577,8 @@ public static class GltfReader
                         continue;
                     }
 
-                    primitives.Add(ReadPrimitive(prim, ctx, worldTransform, isSkinned: hasSkin));
+                    var primitiveTransform = hasSkin ? worldTransform : Matrix4x4.Identity;
+                    primitives.Add(ReadPrimitive(prim, ctx, primitiveTransform, isSkinned: hasSkin));
                 }
             }
         }
@@ -399,14 +590,6 @@ public static class GltfReader
             {
                 ReadNodePrimitives(child.GetInt32(), worldTransform, nodes, meshes, ctx, primitives, nodeWorlds);
             }
-        }
-    }
-
-    private static void DropSkinnedExtrasWhenStaticGeometryExists(List<GltfPrimitive> primitives)
-    {
-        if (primitives.Any(primitive => !primitive.IsSkinned))
-        {
-            primitives.RemoveAll(primitive => primitive.IsSkinned);
         }
     }
 

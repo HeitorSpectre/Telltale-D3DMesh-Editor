@@ -31,6 +31,7 @@ public static class TextureResolver
         var shadowFiles = textureFiles
             .Where(candidate => candidate.Role == TextureRole.Shadow)
             .ToList();
+        var diffuseReferences = BuildDiffuseReferenceStems(mesh);
         var result = new Dictionary<int, MaterialTextureSet>();
         if (textureFiles.Count == 0)
         {
@@ -51,7 +52,7 @@ public static class TextureResolver
                 Shadow = LoadMatched(FindBestTexture(textureFiles, shadowFiles, mesh.Submeshes[i], TextureRole.Shadow), loaded),
             };
 
-            ApplyCompanionAlpha(set, diffuse, textureFiles, loaded);
+            ApplyCompanionAlpha(set, diffuse, textureFiles, loaded, diffuseReferences);
 
             if (set.Count > 0)
             {
@@ -70,7 +71,8 @@ public static class TextureResolver
         MaterialTextureSet set,
         TextureCandidate? diffuse,
         IReadOnlyList<TextureCandidate> textureFiles,
-        Dictionary<string, TextureImage> loaded)
+        Dictionary<string, TextureImage> loaded,
+        IReadOnlySet<string> diffuseReferences)
     {
         if (!GameConfig.Current.UsesCompanionAlphaTextures || set.Diffuse is null || diffuse is null)
         {
@@ -87,6 +89,7 @@ public static class TextureResolver
         string[] wanted = [stem + "Alpha", stem + "_alpha", stem + "_alp", stem + "Opacity"];
         var companionFile = textureFiles
             .Where(candidate => wanted.Contains(Path.GetFileNameWithoutExtension(candidate.Path), StringComparer.OrdinalIgnoreCase))
+            .Where(candidate => !IsReferencedAsDiffuse(candidate, diffuseReferences))
             .Cast<TextureCandidate?>()
             .FirstOrDefault();
         if (companionFile is null)
@@ -124,6 +127,31 @@ public static class TextureResolver
         }
 
         return new TextureImage(diffuse.Width, diffuse.Height, merged, diffuse.SourcePath);
+    }
+
+    private static HashSet<string> BuildDiffuseReferenceStems(MeshData mesh)
+    {
+        var result = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        foreach (var submesh in mesh.Submeshes)
+        {
+            if (submesh.TextureNames.TryGetValue("diffuse", out var diffuse))
+            {
+                result.Add(NormalizeStem(diffuse));
+            }
+
+            if (!string.IsNullOrWhiteSpace(submesh.MaterialName))
+            {
+                result.Add(NormalizeStem(submesh.MaterialName));
+            }
+        }
+
+        return result;
+    }
+
+    private static bool IsReferencedAsDiffuse(TextureCandidate candidate, IReadOnlySet<string> diffuseReferences)
+    {
+        var stem = NormalizeStem(Path.GetFileNameWithoutExtension(candidate.Path));
+        return diffuseReferences.Contains(stem);
     }
 
     private static TextureImage? LoadMatched(TextureCandidate? match, Dictionary<string, TextureImage> loaded)

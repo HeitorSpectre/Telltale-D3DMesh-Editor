@@ -1,6 +1,7 @@
 using System.Numerics;
 using TelltaleToolKit.T3Types;
 using TtkSkeleton = TelltaleToolKit.T3Types.Skeletons.Skeleton;
+using TtkTransform = TelltaleToolKit.T3Types.Skeletons.Transform;
 
 namespace TelltaleD3DMeshEditor.Formats.Skeleton;
 
@@ -18,25 +19,58 @@ public static class SkeletonMerger
 
     public static TtkSkeleton Merge(TtkSkeleton original, SkeletonData edited)
     {
-        var knownHashes = original.Entries
-            .Where(entry => entry.JointName is not null)
-            .Select(entry => entry.JointName.Crc64)
-            .ToHashSet();
+        var knownHashes = new HashSet<ulong>();
+        var outputIndexByHash = new Dictionary<ulong, int>();
+        for (var i = 0; i < original.Entries.Count; i++)
+        {
+            var name = original.Entries[i].JointName;
+            if (name is null)
+            {
+                continue;
+            }
+
+            knownHashes.Add(name.Crc64);
+            outputIndexByHash.TryAdd(name.Crc64, i);
+        }
 
         var editedByHash = edited.Bones
             .GroupBy(bone => bone.Hash)
             .ToDictionary(group => group.Key, group => group.First());
-
-        // Update transforms of existing joints that actually moved; leave everything else untouched.
-        foreach (var entry in original.Entries)
+        var editedByName = edited.Bones
+            .Where(bone => !string.IsNullOrWhiteSpace(bone.Name))
+            .GroupBy(bone => bone.Name, StringComparer.OrdinalIgnoreCase)
+            .ToDictionary(group => group.Key, group => group.First(), StringComparer.OrdinalIgnoreCase);
+        var editedWorlds = BuildWorldMatrices(edited);
+        var editedWorldByHash = new Dictionary<ulong, Matrix4x4>();
+        for (var i = 0; i < edited.Bones.Count; i++)
         {
-            if (entry.JointName is not null &&
-                editedByHash.TryGetValue(entry.JointName.Crc64, out var bone) &&
-                HasMoved(entry, bone))
+            editedWorldByHash.TryAdd(edited.Bones[i].Hash, editedWorlds[i]);
+        }
+
+        var outputWorlds = new List<Matrix4x4>(original.Entries.Count + edited.Bones.Count);
+        var refreshedEntries = new HashSet<int>();
+
+        // Update existing joints so their final bind-pose world transform matches the edited rig.
+        // This is safer than copying local TRS directly when a GLB has helper nodes or a different
+        // joint parent chain, because the game skeleton keeps its original hierarchy.
+        for (var i = 0; i < original.Entries.Count; i++)
+        {
+            var entry = original.Entries[i];
+            if (TryFindEditedBone(entry, editedByHash, editedByName, out var bone))
             {
-                entry.LocalPosition = new Vector3(bone.X, bone.Y, bone.Z);
-                entry.LocalQuat = new Quaternion(bone.Qx, bone.Qy, bone.Qz, bone.Qw);
+                knownHashes.Add(bone.Hash);
+                outputIndexByHash.TryAdd(bone.Hash, i);
+                if (editedWorldByHash.TryGetValue(bone.Hash, out var targetWorld) &&
+                    TryGetLocalTransform(targetWorld, entry.ParentIndex, outputWorlds, out var position, out var rotation) &&
+                    HasMoved(entry, position, rotation))
+                {
+                    entry.LocalPosition = position;
+                    entry.LocalQuat = rotation;
+                    refreshedEntries.Add(i);
+                }
             }
+
+            outputWorlds.Add(BuildEntryWorld(entry, outputWorlds));
         }
 
         // Append joints that exist in the edit but not in the original (newly added bones).
@@ -44,35 +78,252 @@ public static class SkeletonMerger
         {
             if (knownHashes.Add(bone.Hash))
             {
-                original.Entries.Add(CreateEntry(bone, original));
+                var parentIndex = ResolveOutputParentIndex(bone, edited, outputIndexByHash);
+                var targetWorld = editedWorldByHash.TryGetValue(bone.Hash, out var world)
+                    ? world
+                    : BuildLocalMatrix(new Vector3(bone.X, bone.Y, bone.Z), new Quaternion(bone.Qx, bone.Qy, bone.Qz, bone.Qw));
+                TryGetLocalTransform(targetWorld, parentIndex, outputWorlds, out var position, out var rotation);
+                var entry = CreateEntry(bone, original, parentIndex, position, rotation);
+                original.Entries.Add(entry);
+                var entryIndex = original.Entries.Count - 1;
+                outputIndexByHash.TryAdd(bone.Hash, entryIndex);
+                outputWorlds.Add(BuildEntryWorld(entry, outputWorlds));
+                refreshedEntries.Add(entryIndex);
             }
         }
 
+        RefreshDerivedFields(original, refreshedEntries);
         return original;
     }
 
-    private static bool HasMoved(TtkSkeleton.Entry entry, BoneData bone)
-        => Math.Abs(entry.LocalPosition.X - bone.X) > TransformEpsilon
-        || Math.Abs(entry.LocalPosition.Y - bone.Y) > TransformEpsilon
-        || Math.Abs(entry.LocalPosition.Z - bone.Z) > TransformEpsilon
-        || Math.Abs(entry.LocalQuat.X - bone.Qx) > TransformEpsilon
-        || Math.Abs(entry.LocalQuat.Y - bone.Qy) > TransformEpsilon
-        || Math.Abs(entry.LocalQuat.Z - bone.Qz) > TransformEpsilon
-        || Math.Abs(entry.LocalQuat.W - bone.Qw) > TransformEpsilon;
-
-    private static TtkSkeleton.Entry CreateEntry(BoneData bone, TtkSkeleton original)
+    private static bool TryFindEditedBone(
+        TtkSkeleton.Entry entry,
+        IReadOnlyDictionary<ulong, BoneData> editedByHash,
+        IReadOnlyDictionary<string, BoneData> editedByName,
+        out BoneData bone)
     {
-        var parentIndex = bone.ParentHash != 0
-            ? original.Entries.FindIndex(entry => entry.JointName is not null && entry.JointName.Crc64 == bone.ParentHash)
-            : bone.ParentIndex;
+        if (entry.JointName is not null &&
+            editedByHash.TryGetValue(entry.JointName.Crc64, out bone!))
+        {
+            return true;
+        }
 
+        var name = entry.JointName?.DebugString;
+        if (!string.IsNullOrWhiteSpace(name) &&
+            editedByName.TryGetValue(name, out bone!))
+        {
+            return true;
+        }
+
+        bone = null!;
+        return false;
+    }
+
+    private static bool HasMoved(TtkSkeleton.Entry entry, Vector3 position, Quaternion rotation)
+        => Math.Abs(entry.LocalPosition.X - position.X) > TransformEpsilon
+        || Math.Abs(entry.LocalPosition.Y - position.Y) > TransformEpsilon
+        || Math.Abs(entry.LocalPosition.Z - position.Z) > TransformEpsilon
+        || RotationDelta(entry.LocalQuat, rotation) > TransformEpsilon;
+
+    private static float RotationDelta(Quaternion a, Quaternion b)
+    {
+        a = NormalizeRotation(a);
+        b = NormalizeRotation(b);
+        var direct =
+            Math.Abs(a.X - b.X) +
+            Math.Abs(a.Y - b.Y) +
+            Math.Abs(a.Z - b.Z) +
+            Math.Abs(a.W - b.W);
+        var negated =
+            Math.Abs(a.X + b.X) +
+            Math.Abs(a.Y + b.Y) +
+            Math.Abs(a.Z + b.Z) +
+            Math.Abs(a.W + b.W);
+        return Math.Min(direct, negated);
+    }
+
+    private static TtkSkeleton.Entry CreateEntry(
+        BoneData bone,
+        TtkSkeleton original,
+        int parentIndex,
+        Vector3 position,
+        Quaternion rotation)
+    {
         return new TtkSkeleton.Entry
         {
             JointName = string.IsNullOrEmpty(bone.Name) ? Symbol.FromCrc64(bone.Hash) : Symbol.FromName(bone.Name),
-            ParentName = bone.ParentHash != 0 ? Symbol.FromCrc64(bone.ParentHash) : Symbol.Empty,
+            ParentName = ResolveParentName(bone, original, parentIndex),
             ParentIndex = parentIndex,
-            LocalPosition = new Vector3(bone.X, bone.Y, bone.Z),
-            LocalQuat = new Quaternion(bone.Qx, bone.Qy, bone.Qz, bone.Qw),
+            MirrorBoneName = Symbol.Empty,
+            MirrorBoneIndex = -1,
+            LocalPosition = position,
+            LocalQuat = rotation,
+            BoneRotationAdjustment = Quaternion.Identity,
+            RestXform = new TtkTransform
+            {
+                Translation = position,
+                Rotation = rotation,
+            },
+            GlobalTranslationScale = Vector3.One,
+            LocalTranslationScale = Vector3.One,
+            AnimTranslationScale = Vector3.One,
         };
+    }
+
+    private static void RefreshDerivedFields(TtkSkeleton skeleton, IReadOnlySet<int> entryIndices)
+    {
+        foreach (var index in entryIndices)
+        {
+            if (index < 0 || index >= skeleton.Entries.Count)
+            {
+                continue;
+            }
+
+            var entry = skeleton.Entries[index];
+            var rotation = NormalizeRotation(entry.LocalQuat);
+            entry.LocalQuat = rotation;
+            entry.RestXform ??= new TtkTransform();
+            entry.RestXform.Translation = entry.LocalPosition;
+            entry.RestXform.Rotation = rotation;
+
+            var length = entry.LocalPosition.Length();
+            entry.BoneLength = length;
+            entry.BoneDir = length > 0.000001f
+                ? entry.LocalPosition / length
+                : Vector3.Zero;
+
+            if (entry.GlobalTranslationScale.LengthSquared() < 0.000001f)
+            {
+                entry.GlobalTranslationScale = Vector3.One;
+            }
+
+            if (entry.LocalTranslationScale.LengthSquared() < 0.000001f)
+            {
+                entry.LocalTranslationScale = Vector3.One;
+            }
+
+            if (entry.AnimTranslationScale.LengthSquared() < 0.000001f)
+            {
+                entry.AnimTranslationScale = Vector3.One;
+            }
+        }
+    }
+
+    private static Symbol ResolveParentName(BoneData bone, TtkSkeleton skeleton, int parentIndex)
+    {
+        if (parentIndex >= 0 && parentIndex < skeleton.Entries.Count)
+        {
+            return skeleton.Entries[parentIndex].JointName ?? Symbol.FromCrc64(bone.ParentHash);
+        }
+
+        return bone.ParentHash != 0 ? Symbol.FromCrc64(bone.ParentHash) : Symbol.Empty;
+    }
+
+    private static int ResolveOutputParentIndex(
+        BoneData bone,
+        SkeletonData edited,
+        IReadOnlyDictionary<ulong, int> outputIndexByHash)
+    {
+        if (bone.ParentHash != 0 && outputIndexByHash.TryGetValue(bone.ParentHash, out var byHash))
+        {
+            return byHash;
+        }
+
+        if (bone.ParentIndex >= 0 && bone.ParentIndex < edited.Bones.Count)
+        {
+            var parentHash = edited.Bones[bone.ParentIndex].Hash;
+            if (outputIndexByHash.TryGetValue(parentHash, out var byIndex))
+            {
+                return byIndex;
+            }
+        }
+
+        return -1;
+    }
+
+    private static Matrix4x4[] BuildWorldMatrices(SkeletonData skeleton)
+    {
+        var worlds = new Matrix4x4[skeleton.Bones.Count];
+        var states = new byte[skeleton.Bones.Count];
+        for (var i = 0; i < skeleton.Bones.Count; i++)
+        {
+            BuildWorldMatrix(i, skeleton, worlds, states);
+        }
+
+        return worlds;
+    }
+
+    private static Matrix4x4 BuildWorldMatrix(int index, SkeletonData skeleton, Matrix4x4[] worlds, byte[] states)
+    {
+        if (states[index] == 2)
+        {
+            return worlds[index];
+        }
+
+        if (states[index] == 1)
+        {
+            return Matrix4x4.Identity;
+        }
+
+        states[index] = 1;
+        var bone = skeleton.Bones[index];
+        var local = BuildLocalMatrix(
+            new Vector3(bone.X, bone.Y, bone.Z),
+            new Quaternion(bone.Qx, bone.Qy, bone.Qz, bone.Qw));
+        var parent = bone.ParentIndex;
+        worlds[index] = parent >= 0 && parent < skeleton.Bones.Count && parent != index
+            ? local * BuildWorldMatrix(parent, skeleton, worlds, states)
+            : local;
+        states[index] = 2;
+        return worlds[index];
+    }
+
+    private static Matrix4x4 BuildEntryWorld(TtkSkeleton.Entry entry, IReadOnlyList<Matrix4x4> worlds)
+    {
+        var local = BuildLocalMatrix(entry.LocalPosition, entry.LocalQuat);
+        var parent = entry.ParentIndex;
+        return parent >= 0 && parent < worlds.Count
+            ? local * worlds[parent]
+            : local;
+    }
+
+    private static Matrix4x4 BuildLocalMatrix(Vector3 position, Quaternion rotation)
+        => Matrix4x4.CreateFromQuaternion(NormalizeRotation(rotation)) *
+           Matrix4x4.CreateTranslation(position);
+
+    private static bool TryGetLocalTransform(
+        Matrix4x4 targetWorld,
+        int parentIndex,
+        IReadOnlyList<Matrix4x4> outputWorlds,
+        out Vector3 position,
+        out Quaternion rotation)
+    {
+        var local = targetWorld;
+        if (parentIndex >= 0 &&
+            parentIndex < outputWorlds.Count &&
+            Matrix4x4.Invert(outputWorlds[parentIndex], out var inverseParent))
+        {
+            local = targetWorld * inverseParent;
+        }
+
+        if (!Matrix4x4.Decompose(local, out _, out rotation, out position))
+        {
+            position = new Vector3(local.M41, local.M42, local.M43);
+            rotation = Quaternion.Identity;
+            return false;
+        }
+
+        rotation = NormalizeRotation(rotation);
+        return true;
+    }
+
+    private static Quaternion NormalizeRotation(Quaternion rotation)
+    {
+        if (rotation.LengthSquared() < 0.000001f)
+        {
+            return Quaternion.Identity;
+        }
+
+        return Quaternion.Normalize(rotation);
     }
 }

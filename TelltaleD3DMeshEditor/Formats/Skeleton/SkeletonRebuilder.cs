@@ -1,5 +1,6 @@
 using TelltaleToolKit;
 using TelltaleToolKit.Meta.Serialization;
+using TelltaleD3DMeshEditor.Core;
 using TtkSkeleton = TelltaleToolKit.T3Types.Skeletons.Skeleton;
 
 namespace TelltaleD3DMeshEditor.Formats.Skeleton;
@@ -41,6 +42,64 @@ public static class SkeletonRebuilder
         using var rebuilt = new MemoryStream();
         Toolkit.Instance.Serialize(skeleton, rebuilt, config);
         return File.ReadAllBytes(sklPath).AsSpan().SequenceEqual(rebuilt.ToArray());
+    }
+
+    public static SkeletonData ParseWithToolkit(string sklPath)
+    {
+        var (skeleton, _, _) = Read(sklPath);
+        var result = new SkeletonData();
+        for (var i = 0; i < skeleton.Entries.Count; i++)
+        {
+            var entry = skeleton.Entries[i];
+            var hash = entry.JointName?.Crc64 ?? 0;
+            var parentHash = entry.ParentName?.Crc64 ?? 0;
+            if (parentHash == 0 &&
+                entry.ParentIndex >= 0 &&
+                entry.ParentIndex < skeleton.Entries.Count)
+            {
+                parentHash = skeleton.Entries[entry.ParentIndex].JointName?.Crc64 ?? 0;
+            }
+
+            var name = entry.JointName?.DebugString ??
+                       BoneHashDatabase.Resolve(hash) ??
+                       $"bone_{hash:X16}";
+            result.Bones.Add(new BoneData(
+                name,
+                hash,
+                entry.ParentIndex,
+                entry.LocalPosition.X,
+                entry.LocalPosition.Y,
+                entry.LocalPosition.Z,
+                entry.LocalQuat.X,
+                entry.LocalQuat.Y,
+                entry.LocalQuat.Z,
+                entry.LocalQuat.W,
+                parentHash));
+        }
+
+        return result;
+    }
+
+    public static IReadOnlyList<SkeletonEntryDiagnostics> ReadEntryDiagnostics(string sklPath)
+    {
+        var (skeleton, _, _) = Read(sklPath);
+        return skeleton.Entries
+            .Select((entry, index) => new SkeletonEntryDiagnostics(
+                index,
+                entry.JointName?.DebugString ?? BoneHashDatabase.Resolve(entry.JointName?.Crc64 ?? 0) ?? $"bone_{entry.JointName?.Crc64 ?? 0:X16}",
+                entry.JointName?.Crc64 ?? 0,
+                entry.ParentIndex,
+                entry.LocalPosition,
+                entry.LocalQuat,
+                entry.RestXform?.Translation ?? default,
+                entry.RestXform?.Rotation ?? default,
+                entry.BoneLength,
+                entry.BoneDir,
+                entry.BoneRotationAdjustment,
+                entry.GlobalTranslationScale,
+                entry.LocalTranslationScale,
+                entry.AnimTranslationScale))
+            .ToList();
     }
 
     // Builds a brand-new .skl from a foreign joint set that has no original to merge with (e.g. a rig
@@ -157,3 +216,19 @@ public static class SkeletonRebuilder
         }
     }
 }
+
+public sealed record SkeletonEntryDiagnostics(
+    int Index,
+    string Name,
+    ulong Hash,
+    int ParentIndex,
+    System.Numerics.Vector3 LocalPosition,
+    System.Numerics.Quaternion LocalRotation,
+    System.Numerics.Vector3 RestTranslation,
+    System.Numerics.Quaternion RestRotation,
+    float BoneLength,
+    System.Numerics.Vector3 BoneDir,
+    System.Numerics.Quaternion BoneRotationAdjustment,
+    System.Numerics.Vector3 GlobalTranslationScale,
+    System.Numerics.Vector3 LocalTranslationScale,
+    System.Numerics.Vector3 AnimTranslationScale);
