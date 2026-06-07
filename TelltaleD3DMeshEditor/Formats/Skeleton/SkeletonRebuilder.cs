@@ -51,16 +51,17 @@ public static class SkeletonRebuilder
         for (var i = 0; i < skeleton.Entries.Count; i++)
         {
             var entry = skeleton.Entries[i];
-            var hash = entry.JointName?.Crc64 ?? 0;
-            var parentHash = entry.ParentName?.Crc64 ?? 0;
+            var hash = entry.JointNameS?.Crc64 ?? 0;
+            var parentHash = entry.ParentNameS?.Crc64 ?? 0;
             if (parentHash == 0 &&
                 entry.ParentIndex >= 0 &&
                 entry.ParentIndex < skeleton.Entries.Count)
             {
-                parentHash = skeleton.Entries[entry.ParentIndex].JointName?.Crc64 ?? 0;
+                parentHash = skeleton.Entries[entry.ParentIndex].JointNameS?.Crc64 ?? 0;
             }
 
-            var name = entry.JointName?.DebugString ??
+            var name = entry.JointNameS?.DebugString ??
+                       (string.IsNullOrWhiteSpace(entry.JointName) ? null : entry.JointName) ??
                        BoneHashDatabase.Resolve(hash) ??
                        $"bone_{hash:X16}";
             result.Bones.Add(new BoneData(
@@ -86,8 +87,8 @@ public static class SkeletonRebuilder
         return skeleton.Entries
             .Select((entry, index) => new SkeletonEntryDiagnostics(
                 index,
-                entry.JointName?.DebugString ?? BoneHashDatabase.Resolve(entry.JointName?.Crc64 ?? 0) ?? $"bone_{entry.JointName?.Crc64 ?? 0:X16}",
-                entry.JointName?.Crc64 ?? 0,
+                entry.JointNameS?.DebugString ?? (string.IsNullOrWhiteSpace(entry.JointName) ? null : entry.JointName) ?? BoneHashDatabase.Resolve(entry.JointNameS?.Crc64 ?? 0) ?? $"bone_{entry.JointNameS?.Crc64 ?? 0:X16}",
+                entry.JointNameS?.Crc64 ?? 0,
                 entry.ParentIndex,
                 entry.LocalPosition,
                 entry.LocalQuat,
