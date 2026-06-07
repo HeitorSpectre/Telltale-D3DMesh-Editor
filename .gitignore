@@ -8,6 +8,18 @@
 /Validacao/
 /src/
 
+# Project source belongs under /TelltaleD3DMeshEditor/
+/Core/
+/Export/
+/Formats/
+/Reinsert/
+/Resources/
+/UI/
+/Viewer/
+/Program.cs
+/TelltaleD3DMeshEditor.csproj
+/TelltaleD3DMeshEditor.csproj.user
+
 # --- .NET build artifacts ---
 [Bb]in/
 [Oo]bj/
