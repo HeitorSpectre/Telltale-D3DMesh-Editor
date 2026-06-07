@@ -163,6 +163,25 @@ public static class ReinsertTextureService
                     continue;
                 }
 
+                if (TryWriteBodySkinHeadLineNonInverted(
+                    gameConfig,
+                    primitive,
+                    image,
+                    normalizedSlot,
+                    templateMeshPath,
+                    fallbackTemplateBytes,
+                    textureNamespace,
+                    outputFolder,
+                    existingNames,
+                    reservedNames,
+                    writtenNames,
+                    semanticTemplateNames,
+                    out var bodySkinHeadLineTextureName))
+                {
+                    slots[normalizedSlot] = bodySkinHeadLineTextureName;
+                    continue;
+                }
+
                 var imageKey = ImageKey(image);
                 if (writtenByImage.TryGetValue(imageKey, out var textureName))
                 {
@@ -216,6 +235,58 @@ public static class ReinsertTextureService
                       ?? MakeUniqueTextureName(textureNamespace, baseName, existingNames, reservedNames);
         var outputTexturePath = Path.Combine(outputFolder, textureName + ".d3dtx");
         D3dtxWriter.WriteFromImageBytes(templateBytes, InvertImageAlpha(image), outputTexturePath);
+        if (!writtenNames.Contains(textureName, StringComparer.OrdinalIgnoreCase))
+        {
+            writtenNames.Add(textureName);
+        }
+
+        return true;
+    }
+
+    // The neck/chest skin connector exported from TWAU uses a body (skin) diffuse but borrows the head
+    // ink line texture. The shared head copy is alpha-inverted for the face shader; on this body-shader
+    // skin patch that inverted alpha turns into an opaque black mask under the chin. Give this primitive
+    // its own NON-inverted copy of the line so the skin shows through, without touching the face copy.
+    private static bool TryWriteBodySkinHeadLineNonInverted(
+        GameConfig? gameConfig,
+        GltfPrimitive primitive,
+        GltfImage image,
+        string normalizedSlot,
+        string templateMeshPath,
+        byte[] fallbackTemplateBytes,
+        string textureNamespace,
+        string outputFolder,
+        HashSet<string> existingNames,
+        HashSet<string> reservedNames,
+        List<string> writtenNames,
+        IReadOnlyDictionary<string, string> semanticTemplateNames,
+        out string textureName)
+    {
+        textureName = "";
+        if (gameConfig?.InvertHeadLineAlphaOnReimport != true ||
+            !normalizedSlot.Equals("detail_diffuse", StringComparison.OrdinalIgnoreCase) ||
+            !IsHeadLineTexture(image.Name) ||
+            !IsSourceBodyPrimitive(primitive))
+        {
+            return false;
+        }
+
+        var semanticTemplateName = ResolveSemanticTemplateName(primitive, image.Name, normalizedSlot, semanticTemplateNames, gameConfig);
+        var sourceTexturePath = FindSourceTextureTemplateForMode(
+            templateMeshPath,
+            image.Name,
+            [],
+            semanticTemplateName,
+            ResolvedTextureNameMode.SemanticTemplateNames);
+        var templateBytes = sourceTexturePath is not null
+            ? File.ReadAllBytes(sourceTexturePath)
+            : fallbackTemplateBytes;
+
+        var baseName = (semanticTemplateName ?? image.Name) + "_skin";
+        textureName = TryReservePreservedName(baseName, reservedNames)
+                      ?? MakeUniqueTextureName(textureNamespace, baseName, existingNames, reservedNames);
+        var outputTexturePath = Path.Combine(outputFolder, textureName + ".d3dtx");
+        D3dtxWriter.WriteFromImageBytes(templateBytes, image, outputTexturePath);
         if (!writtenNames.Contains(textureName, StringComparer.OrdinalIgnoreCase))
         {
             writtenNames.Add(textureName);
@@ -306,7 +377,28 @@ public static class ReinsertTextureService
         GltfPrimitive primitive,
         string normalizedSlot,
         string textureName)
-        => false;
+    {
+        // TWAU-style ink line overlays placed onto a TWD S2 head use the opposite alpha convention:
+        // after reimport the face renders as an opaque black mask (what should be invisible is opaque,
+        // the actual lines are transparent). Flip the alpha of the face line texture to fix it.
+        // Detection is by the foreign "ink/line + head" naming, so TWD S2 native "*_head_detail"
+        // round-trips are left untouched.
+        if (gameConfig?.InvertHeadLineAlphaOnReimport != true ||
+            !normalizedSlot.Equals("detail_diffuse", StringComparison.OrdinalIgnoreCase))
+        {
+            return false;
+        }
+
+        return IsHeadLineTexture(textureName);
+    }
+
+    private static bool IsHeadLineTexture(string textureName)
+    {
+        var lower = Path.GetFileNameWithoutExtension(textureName).ToLowerInvariant();
+        return lower.Contains("head", StringComparison.Ordinal) &&
+               (lower.Contains("line", StringComparison.Ordinal) ||
+                lower.Contains("ink", StringComparison.Ordinal));
+    }
 
     private static bool ShouldSkipUnmappedSecondaryTexture(
         GameConfig? gameConfig,

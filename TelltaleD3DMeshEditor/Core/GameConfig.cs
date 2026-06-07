@@ -53,6 +53,12 @@ public sealed class GameConfig
     // lines under the template filename so details stay visible without renaming the texture.
     public bool InvertBodyLineAlphaOnReimport { get; init; }
 
+    // TWAU-style ink line overlays mapped onto a TWD S2 head render as an opaque black face mask
+    // (inverted alpha) after reimport. Flip the alpha of the face line texture so the lines show and
+    // the rest of the face stays transparent. Scoped by foreign ink/line naming, so TWD S2 native
+    // "*_head_detail" textures are not affected.
+    public bool InvertHeadLineAlphaOnReimport { get; init; }
+
     public static readonly GameConfig Generic = new()
     {
         Id = GameId.Generic,
@@ -65,6 +71,7 @@ public sealed class GameConfig
         RemoveEyeHelperPrimitivesOnReimport = false,
         SplitBodyLineAlphaOnReimport = false,
         InvertBodyLineAlphaOnReimport = false,
+        InvertHeadLineAlphaOnReimport = false,
     };
 
     public static readonly GameConfig WolfAmongUs = new()
@@ -79,6 +86,7 @@ public sealed class GameConfig
         RemoveEyeHelperPrimitivesOnReimport = true,
         SplitBodyLineAlphaOnReimport = false,
         InvertBodyLineAlphaOnReimport = true,
+        InvertHeadLineAlphaOnReimport = false,
     };
 
     public static readonly GameConfig WalkingDeadSeason2 = new()
@@ -93,6 +101,7 @@ public sealed class GameConfig
         RemoveEyeHelperPrimitivesOnReimport = true,
         SplitBodyLineAlphaOnReimport = true,
         InvertBodyLineAlphaOnReimport = false,
+        InvertHeadLineAlphaOnReimport = true,
     };
 
     public static readonly IReadOnlyList<GameConfig> All = [Generic, WolfAmongUs, WalkingDeadSeason2];

@@ -326,7 +326,7 @@ public sealed class MainForm : Form
         _btnCombineParts.Enabled = false;
         _btnReload.Enabled = false;
         _searchText.Enabled = false;
-        _statusLabel.Text = "Open a folder containing .d3dmesh and .skl files to begin.";
+        _statusLabel.Text = "Open a folder containing .d3dmesh, .skl and .d3dtx files to begin.";
         _detailLabel.Text = "";
     }
 

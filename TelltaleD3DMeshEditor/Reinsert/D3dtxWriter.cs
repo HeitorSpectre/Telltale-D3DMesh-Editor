@@ -35,7 +35,12 @@ public static class D3dtxWriter
             _ => hasAlpha ? Dxt5Format : Dxt1Format,
         };
         var mipCount = Math.Min(CountTtgBlockMips(width, height), Math.Max(1, tex.Mip));
-        var mipPayloads = BuildMipPayloads(pixels, width, height, mipCount, hasAlpha);
+        // The mip payloads must be encoded with the same codec that the header declares.
+        // When the template is DXT5 we keep DXT5 even for alpha-less images, otherwise the
+        // header (16 bytes/block) would disagree with a DXT1 payload (8 bytes/block) and the
+        // texture would read as garbage / fail to decode ("payload smaller than largest mip").
+        var encodeDxt5 = format == Dxt5Format;
+        var mipPayloads = BuildMipPayloads(pixels, width, height, mipCount, encodeDxt5);
 
         tex.ObjectName = NormalizeD3dtxName(textureFileName);
         tex.Width = width;
@@ -49,7 +54,7 @@ public static class D3dtxWriter
         return tex.Write();
     }
 
-    private static List<byte[]> BuildMipPayloads(int[] pixels, int width, int height, int mipCount, bool hasAlpha)
+    private static List<byte[]> BuildMipPayloads(int[] pixels, int width, int height, int mipCount, bool encodeDxt5)
     {
         var mipPayloads = new List<byte[]>();
         var current = pixels;
@@ -57,7 +62,7 @@ public static class D3dtxWriter
         var currentHeight = height;
         for (var mip = 0; mip < mipCount; mip++)
         {
-            mipPayloads.Add(hasAlpha
+            mipPayloads.Add(encodeDxt5
                 ? EncodeDxt5(current, currentWidth, currentHeight)
                 : EncodeDxt1(current, currentWidth, currentHeight));
             if (mip == mipCount - 1 || (currentWidth == 1 && currentHeight == 1))
