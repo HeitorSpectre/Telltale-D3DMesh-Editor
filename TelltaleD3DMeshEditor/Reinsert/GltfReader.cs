@@ -708,6 +708,11 @@ public static class GltfReader
             return;
         }
 
+        if (primitives.Any(HasTelltaleSourceMetadata))
+        {
+            return;
+        }
+
         var positions = primitives.SelectMany(primitive => primitive.Positions).ToArray();
         if (positions.Length == 0)
         {
@@ -764,6 +769,11 @@ public static class GltfReader
             RotateZUpToYUp(primitive.Binormals, positiveZIsUp, normalize: true);
         }
     }
+
+    private static bool HasTelltaleSourceMetadata(GltfPrimitive primitive)
+        => primitive.BonePaletteIndex is not null ||
+           primitive.SourceSubmeshIndex is not null ||
+           !string.IsNullOrWhiteSpace(primitive.SourceMeshPath);
 
     private static void RotateZUpToYUp(Vector3[] vectors, bool positiveZIsUp, bool normalize = false)
     {

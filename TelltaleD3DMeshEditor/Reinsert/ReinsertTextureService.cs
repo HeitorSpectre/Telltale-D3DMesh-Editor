@@ -49,7 +49,7 @@ public static class ReinsertTextureService
             ? BuildPreferredOriginalNamesByImageKey(model, templateMeshPath)
             : new Dictionary<string, List<string>>(StringComparer.OrdinalIgnoreCase);
         var semanticTemplateNames = nameMode == ResolvedTextureNameMode.SemanticTemplateNames
-            ? BuildSemanticTemplateNames(templateMeshPath)
+            ? BuildSemanticTemplateNames(templateMeshPath, gameConfig)
             : new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
 
         foreach (var primitive in model.Primitives)
@@ -77,10 +77,8 @@ public static class ReinsertTextureService
                 if (!writtenByImage.TryGetValue(imageKey, out var textureName))
                 {
                     var preferredNames = preferredOriginalNamesByImageKey.TryGetValue(imageKey, out var foundPreferredNames) ? foundPreferredNames : [];
-                    var semanticTemplateName = ResolveSemanticTemplateName(primitive, image.Name, normalizedReference, semanticTemplateNames);
-                    if (nameMode == ResolvedTextureNameMode.SemanticTemplateNames &&
-                        !normalizedReference.Equals("diffuse", StringComparison.OrdinalIgnoreCase) &&
-                        semanticTemplateName is null)
+                    var semanticTemplateName = ResolveSemanticTemplateName(primitive, image.Name, normalizedReference, semanticTemplateNames, gameConfig);
+                    if (ShouldSkipUnmappedSecondaryTexture(gameConfig, nameMode, normalizedReference, semanticTemplateName))
                     {
                         continue;
                     }
@@ -100,7 +98,17 @@ public static class ReinsertTextureService
                         nameMode,
                         preserveTemplateName: preserveDiffuseName || sourceImageMatches);
                     var outputTexturePath = Path.Combine(outputFolder, textureName + ".d3dtx");
-                    WriteTexturePreservingTemplate(fallbackTemplateBytes, image, sourceTexturePath, outputTexturePath, sourceImageMatches);
+                    if (ShouldInvertCharacterLineAlpha(gameConfig, primitive, normalizedReference, image.Name))
+                    {
+                        var templateBytes = sourceTexturePath is not null
+                            ? File.ReadAllBytes(sourceTexturePath)
+                            : fallbackTemplateBytes;
+                        D3dtxWriter.WriteFromImageBytes(templateBytes, InvertImageAlpha(image), outputTexturePath);
+                    }
+                    else
+                    {
+                        WriteTexturePreservingTemplate(fallbackTemplateBytes, image, sourceTexturePath, outputTexturePath, sourceImageMatches);
+                    }
                     writtenByImage[imageKey] = textureName;
                     writtenNames.Add(textureName);
                 }
@@ -114,10 +122,25 @@ public static class ReinsertTextureService
                     continue;
                 }
 
-                if (nameMode == ResolvedTextureNameMode.SemanticTemplateNames &&
-                    !normalizedSlot.Equals("diffuse", StringComparison.OrdinalIgnoreCase) &&
-                    ResolveSemanticTemplateName(primitive, image.Name, normalizedSlot, semanticTemplateNames) is null)
+                var semanticSlotName = ResolveSemanticTemplateName(primitive, image.Name, normalizedSlot, semanticTemplateNames, gameConfig);
+                if (ShouldSkipUnmappedSecondaryTexture(gameConfig, nameMode, normalizedSlot, semanticSlotName))
                 {
+                    continue;
+                }
+
+                if (TryWriteHandLineInvertedAlphaTexture(
+                    gameConfig,
+                    primitive,
+                    image,
+                    normalizedSlot,
+                    templateMeshPath,
+                    fallbackTemplateBytes,
+                    outputFolder,
+                    writtenNames,
+                    semanticTemplateNames,
+                    out var handLineTextureName))
+                {
+                    slots[normalizedSlot] = handLineTextureName;
                     continue;
                 }
 
@@ -177,7 +200,7 @@ public static class ReinsertTextureService
             return false;
         }
 
-        var semanticTemplateName = ResolveSemanticTemplateName(primitive, image.Name, normalizedSlot, semanticTemplateNames);
+        var semanticTemplateName = ResolveSemanticTemplateName(primitive, image.Name, normalizedSlot, semanticTemplateNames, gameConfig);
         var sourceTexturePath = FindSourceTextureTemplateForMode(
             templateMeshPath,
             image.Name,
@@ -201,14 +224,104 @@ public static class ReinsertTextureService
         return true;
     }
 
+    private static bool TryWriteHandLineInvertedAlphaTexture(
+        GameConfig? gameConfig,
+        GltfPrimitive primitive,
+        GltfImage image,
+        string normalizedSlot,
+        string templateMeshPath,
+        byte[] fallbackTemplateBytes,
+        string outputFolder,
+        List<string> writtenNames,
+        IReadOnlyDictionary<string, string> semanticTemplateNames,
+        out string textureName)
+    {
+        textureName = "";
+        if (gameConfig?.InvertBodyLineAlphaOnReimport != true ||
+            !normalizedSlot.Equals("detail_diffuse", StringComparison.OrdinalIgnoreCase) ||
+            !IsLineOrDetailTexture(image.Name) ||
+            !IsSourceHandPrimitive(primitive))
+        {
+            return false;
+        }
+
+        var semanticTemplateName = ResolveSemanticTemplateName(primitive, image.Name, normalizedSlot, semanticTemplateNames, gameConfig);
+        var baseName = SanitizeName(StripKnownTextureExtension((semanticTemplateName ?? image.Name) + "_hands"));
+        if (string.IsNullOrWhiteSpace(baseName))
+        {
+            return false;
+        }
+
+        textureName = baseName;
+        if (writtenNames.Contains(textureName, StringComparer.OrdinalIgnoreCase))
+        {
+            return true;
+        }
+
+        var sourceTexturePath = FindSourceTextureTemplateForMode(
+            templateMeshPath,
+            image.Name,
+            [],
+            semanticTemplateName,
+            ResolvedTextureNameMode.SemanticTemplateNames);
+        var outputTexturePath = Path.Combine(outputFolder, textureName + ".d3dtx");
+        var templateBytes = sourceTexturePath is not null
+            ? File.ReadAllBytes(sourceTexturePath)
+            : fallbackTemplateBytes;
+        D3dtxWriter.WriteFromImageBytes(templateBytes, InvertImageAlpha(image), outputTexturePath);
+
+        writtenNames.Add(textureName);
+        return true;
+    }
+
+    private static bool IsLineTexture(string textureName)
+    {
+        var lower = Path.GetFileNameWithoutExtension(textureName).ToLowerInvariant();
+        return lower.EndsWith("_lines", StringComparison.Ordinal) ||
+                lower.EndsWith("_line", StringComparison.Ordinal) ||
+                lower.Contains("_lines_", StringComparison.Ordinal) ||
+                lower.Contains("_line_", StringComparison.Ordinal);
+    }
+
+    private static bool IsLineOrDetailTexture(string textureName)
+    {
+        return IsLineTexture(textureName) || IsDetailTexture(textureName);
+    }
+
+    private static bool IsDetailTexture(string textureName)
+    {
+        var lower = Path.GetFileNameWithoutExtension(textureName).ToLowerInvariant();
+        return lower.EndsWith("_detail", StringComparison.Ordinal) ||
+               lower.Contains("_detail_", StringComparison.Ordinal);
+    }
+
     private static bool IsBodyLineTexture(string textureName)
     {
         var lower = Path.GetFileNameWithoutExtension(textureName).ToLowerInvariant();
-        return lower.Contains("body", StringComparison.Ordinal) &&
-               (lower.EndsWith("_lines", StringComparison.Ordinal) ||
-                lower.EndsWith("_line", StringComparison.Ordinal) ||
-                lower.Contains("_lines_", StringComparison.Ordinal) ||
-                lower.Contains("_line_", StringComparison.Ordinal));
+        return lower.Contains("body", StringComparison.Ordinal) && IsLineTexture(textureName);
+    }
+
+    private static bool ShouldInvertCharacterLineAlpha(
+        GameConfig? gameConfig,
+        GltfPrimitive primitive,
+        string normalizedSlot,
+        string textureName)
+        => false;
+
+    private static bool ShouldSkipUnmappedSecondaryTexture(
+        GameConfig? gameConfig,
+        ResolvedTextureNameMode nameMode,
+        string normalizedSlot,
+        string? semanticTemplateName)
+    {
+        if (nameMode != ResolvedTextureNameMode.SemanticTemplateNames ||
+            normalizedSlot.Equals("diffuse", StringComparison.OrdinalIgnoreCase) ||
+            semanticTemplateName is not null)
+        {
+            return false;
+        }
+
+        return gameConfig?.Id != GameId.WolfAmongUs;
     }
 
     private static bool IsSourceBodyPrimitive(GltfPrimitive primitive)
@@ -223,6 +336,33 @@ public static class ReinsertTextureService
                !lower.Contains("hand", StringComparison.Ordinal) &&
                !lower.Contains("hair", StringComparison.Ordinal) &&
                !lower.Contains("head", StringComparison.Ordinal);
+    }
+
+    private static bool IsBodyOrHandPrimitive(GltfPrimitive primitive)
+    {
+        if (!primitive.TextureSlots.TryGetValue("diffuse", out var diffuse))
+        {
+            return false;
+        }
+
+        var lower = Path.GetFileNameWithoutExtension(diffuse.Name).ToLowerInvariant();
+        return lower.Contains("body", StringComparison.Ordinal) ||
+               lower.Contains("hand", StringComparison.Ordinal);
+    }
+
+    private static bool IsSourceHandPrimitive(GltfPrimitive primitive)
+    {
+        if (!primitive.TextureSlots.TryGetValue("diffuse", out var diffuse))
+        {
+            return false;
+        }
+
+        var diffuseName = Path.GetFileNameWithoutExtension(diffuse.Name).ToLowerInvariant();
+        var sourceMesh = Path.GetFileNameWithoutExtension(primitive.SourceMeshPath ?? "").ToLowerInvariant();
+        // Clementine-style combined exports keep the hand skin inside arm meshes while reusing the
+        // head diffuse/detail pair for the exposed hand. Sleeve submeshes use body diffuse and skip this.
+        return sourceMesh.Contains("arml", StringComparison.Ordinal) &&
+               diffuseName.Contains("head", StringComparison.Ordinal);
     }
 
     private static GltfImage InvertImageAlpha(GltfImage image)
@@ -520,8 +660,8 @@ public static class ReinsertTextureService
     {
         if (nameMode == ResolvedTextureNameMode.SemanticTemplateNames && semanticTemplateName is not null)
         {
-            return FindSourceTextureTemplate(templateMeshPath, semanticTemplateName)
-                   ?? FindSourceTextureTemplate(templateMeshPath, imageName)
+            return FindSourceTextureTemplate(templateMeshPath, imageName)
+                   ?? FindSourceTextureTemplate(templateMeshPath, semanticTemplateName)
                    ?? FindSourceTextureTemplate(templateMeshPath, preferredOriginalNames);
         }
 
@@ -535,7 +675,7 @@ public static class ReinsertTextureService
                ?? FindSourceTextureTemplate(templateMeshPath, preferredOriginalNames);
     }
 
-    private static Dictionary<string, string> BuildSemanticTemplateNames(string templateMeshPath)
+    private static Dictionary<string, string> BuildSemanticTemplateNames(string templateMeshPath, GameConfig? gameConfig)
     {
         var result = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
         MeshData templateMesh;
@@ -558,7 +698,7 @@ public static class ReinsertTextureService
                 }
 
                 var normalizedSlot = NormalizeTextureSlotName(slot);
-                var semantic = ClassifyTemplateTextureSemantic(submesh.Name, textureName);
+                var semantic = ClassifyTemplateTextureSemantic(submesh.Name, textureName, gameConfig);
                 if (semantic is null)
                 {
                     continue;
@@ -579,15 +719,16 @@ public static class ReinsertTextureService
         GltfPrimitive primitive,
         string imageName,
         string slot,
-        IReadOnlyDictionary<string, string> semanticTemplateNames)
+        IReadOnlyDictionary<string, string> semanticTemplateNames,
+        GameConfig? gameConfig)
     {
         if (semanticTemplateNames.Count == 0)
         {
             return null;
         }
 
-        var primitiveSemantic = ResolvePrimitiveSemantic(primitive);
-        var imageSemantic = ClassifySourceTextureSemantic(imageName);
+        var primitiveSemantic = ResolvePrimitiveSemantic(primitive, gameConfig);
+        var imageSemantic = ClassifySourceTextureSemantic(imageName, gameConfig);
         var semantic = slot.Equals("diffuse", StringComparison.OrdinalIgnoreCase)
             ? imageSemantic ?? primitiveSemantic
             : primitiveSemantic ?? imageSemantic;
@@ -601,11 +742,11 @@ public static class ReinsertTextureService
             : null;
     }
 
-    private static string? ResolvePrimitiveSemantic(GltfPrimitive primitive)
+    private static string? ResolvePrimitiveSemantic(GltfPrimitive primitive, GameConfig? gameConfig)
     {
         if (primitive.TextureSlots.TryGetValue("diffuse", out var diffuse))
         {
-            var semantic = ClassifySourceTextureSemantic(diffuse.Name);
+            var semantic = ClassifySourceTextureSemantic(diffuse.Name, gameConfig);
             if (semantic is not null)
             {
                 return semantic;
@@ -614,16 +755,16 @@ public static class ReinsertTextureService
 
         return string.IsNullOrWhiteSpace(primitive.MaterialName)
             ? null
-            : ClassifySourceTextureSemantic(primitive.MaterialName);
+            : ClassifySourceTextureSemantic(primitive.MaterialName, gameConfig);
     }
 
-    private static string? ClassifyTemplateTextureSemantic(string submeshName, string textureName)
-        => ClassifySemantic(submeshName + " " + textureName, template: true);
+    private static string? ClassifyTemplateTextureSemantic(string submeshName, string textureName, GameConfig? gameConfig)
+        => ClassifySemantic(submeshName + " " + textureName, template: true, gameConfig);
 
-    private static string? ClassifySourceTextureSemantic(string name)
-        => ClassifySemantic(name, template: false);
+    private static string? ClassifySourceTextureSemantic(string name, GameConfig? gameConfig)
+        => ClassifySemantic(name, template: false, gameConfig);
 
-    private static string? ClassifySemantic(string text, bool template)
+    private static string? ClassifySemantic(string text, bool template, GameConfig? gameConfig)
     {
         var lower = text.ToLowerInvariant();
         if (lower.Contains("eye"))
@@ -639,6 +780,11 @@ public static class ReinsertTextureService
         if (lower.Contains("alphahair") || lower.Contains("hair"))
         {
             return "hair";
+        }
+
+        if (gameConfig?.Id == GameId.WolfAmongUs && lower.Contains("hand"))
+        {
+            return "hands";
         }
 
         if (!template && (lower.Contains("hand") || lower.Contains("beastb")))

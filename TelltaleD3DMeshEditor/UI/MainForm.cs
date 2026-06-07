@@ -1342,6 +1342,11 @@ public sealed class MainForm : Form
     {
         if (model.Skeleton is null || model.Skeleton.Bones.Count == 0)
         {
+            if (asset.SkeletonPath is not null && File.Exists(asset.SkeletonPath))
+            {
+                return "\nSkeleton: kept the target .skl; imported model has no skin and was bound as static geometry.";
+            }
+
             return "";
         }
 

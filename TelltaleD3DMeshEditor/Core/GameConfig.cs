@@ -45,10 +45,13 @@ public sealed class GameConfig
     // pupil masks). They can become opaque in-game after reinsertion and cover the actual iris.
     public bool RemoveEyeHelperPrimitivesOnReimport { get; init; }
 
-    // In TWD S2, TWAU-style body line overlays need inverted alpha on the body material, while hands
-    // using the same source line texture still need the original alpha. Split only the body line slot
-    // into a separate alpha-inverted texture so shared head/hand lines remain unchanged.
+    // In TWD S2, TWAU-style body line overlays need inverted alpha on the body material. Split only the
+    // body line slot into a separate alpha-inverted texture so shared head/hand lines remain unchanged.
     public bool SplitBodyLineAlphaOnReimport { get; init; }
+
+    // TWAU body line overlays use the opposite alpha convention after GLB reimport. Rewrite the body
+    // lines under the template filename so details stay visible without renaming the texture.
+    public bool InvertBodyLineAlphaOnReimport { get; init; }
 
     public static readonly GameConfig Generic = new()
     {
@@ -61,6 +64,7 @@ public sealed class GameConfig
         PreferSemanticTemplateTextureNamesOnReimport = false,
         RemoveEyeHelperPrimitivesOnReimport = false,
         SplitBodyLineAlphaOnReimport = false,
+        InvertBodyLineAlphaOnReimport = false,
     };
 
     public static readonly GameConfig WolfAmongUs = new()
@@ -71,9 +75,10 @@ public sealed class GameConfig
         ClearInheritedBakeOnReimport = false,
         ClearInheritedSecondaryTexturesOnReimport = false,
         PreferGltfTextureNamesOnReimport = false,
-        PreferSemanticTemplateTextureNamesOnReimport = false,
-        RemoveEyeHelperPrimitivesOnReimport = false,
+        PreferSemanticTemplateTextureNamesOnReimport = true,
+        RemoveEyeHelperPrimitivesOnReimport = true,
         SplitBodyLineAlphaOnReimport = false,
+        InvertBodyLineAlphaOnReimport = true,
     };
 
     public static readonly GameConfig WalkingDeadSeason2 = new()
@@ -87,6 +92,7 @@ public sealed class GameConfig
         PreferSemanticTemplateTextureNamesOnReimport = true,
         RemoveEyeHelperPrimitivesOnReimport = true,
         SplitBodyLineAlphaOnReimport = true,
+        InvertBodyLineAlphaOnReimport = false,
     };
 
     public static readonly IReadOnlyList<GameConfig> All = [Generic, WolfAmongUs, WalkingDeadSeason2];

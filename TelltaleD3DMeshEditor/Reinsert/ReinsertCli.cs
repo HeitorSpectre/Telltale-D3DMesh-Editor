@@ -378,7 +378,7 @@ public static class ReinsertCli
         }
         else
         {
-            skeletonLine = "GLB has no skin skeleton";
+            skeletonLine = "target skeleton kept; GLB has no skin and was bound as static geometry";
         }
 
         var check = D3DMeshLayout.Build(result);

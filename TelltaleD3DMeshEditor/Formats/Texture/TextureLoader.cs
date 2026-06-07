@@ -158,22 +158,30 @@ public static class TextureLoader
             return value;
         }
 
-        _ = ReadI32(); // SomeValue
+        var someValue = ReadI32();
         var unknownFlagsBlockSize = ReadI32();
         p += Math.Max(0, unknownFlagsBlockSize - 4);
         var platformBlockSize = ReadI32();
         p += Math.Max(0, platformBlockSize - 4);
-        _ = ReadI32();
-        var objNameLen = ReadI32();
-        p += objNameLen;
-        _ = ReadI32();
-        var subNameLen = ReadI32();
-        p += subNameLen;
+        SkipNameBlock();
+        SkipNameBlock();
         _ = ReadU32();
         p += 1;
+        if (p <= data.Length && data[p - 1] == 0x31)
+        {
+            p += 8;
+            var extraLength = ReadI32();
+            p += Math.Max(0, extraLength);
+        }
+
         var mipCount = ReadI32();
         var width = ReadI32();
         var height = ReadI32();
+        if ((magic is "5VSM" or "6VSM") && someValue >= 8)
+        {
+            p += 8;
+        }
+
         var format = ReadU32();
         var blockBytes = format switch
         {
@@ -184,6 +192,18 @@ public static class TextureLoader
         };
 
         return new D3dtxInfo(width, height, mipCount, format, blockBytes, pixelStart, pixelSize);
+
+        void SkipNameBlock()
+        {
+            var total = ReadI32();
+            var length = ReadI32();
+            if (length < 0 || total < length + 8)
+            {
+                throw new InvalidDataException("Invalid D3DTX name block.");
+            }
+
+            p += total - 8;
+        }
     }
 
     private static int[] DecodeDxt1(byte[] data, int offset, int width, int height)

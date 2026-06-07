@@ -171,7 +171,7 @@ public static class MeshReinserter
         var patches = new List<RegionPatch>
         {
             new(layout.BoundsOffset, 24, BuildBoundsBytes(verts)),
-            new(layout.SubmeshBlockSizeFieldOffset, 4, U32(layout.SubmeshBlockSize + BuildSubmeshTableSizeDelta(layout, subInfo.Length))),
+            new(layout.SubmeshBlockSizeFieldOffset, 4, U32(layout.SubmeshBlockSize + BuildSubmeshTableSizeDelta(layout, subInfo.Length, preparedTextureSlotsByPrimitive))),
             new(layout.SubmeshCountFieldOffset, 4, U32(subInfo.Length)),
             new(layout.SubmeshTableOffset, layout.SubmeshTableLength, BuildSubmeshTable(layout, subInfo, preparedTextureSlotsByPrimitive, gameConfig ?? GameConfig.Current)),
             new(layout.UvScalesOffset, 32, BuildUvScaleBytes(mults)),
@@ -253,6 +253,7 @@ public static class MeshReinserter
         SkeletonData? referenceSkeleton)
     {
         var result = new List<PreparedPrimitive>();
+        int? staticImportPaletteIndex = null;
         for (var primitiveIndex = 0; primitiveIndex < model.Primitives.Count; primitiveIndex++)
         {
             var primitive = model.Primitives[primitiveIndex];
@@ -262,7 +263,10 @@ public static class MeshReinserter
 
             if (!HasUsableSkin(primitive) || layout.BonePalettes.Count == 0)
             {
-                result.Add(new PreparedPrimitive(primitive, textureSlots, primitive.BonePaletteIndex));
+                var paletteIndex = layout.BonePalettes.Count > 0
+                    ? (staticImportPaletteIndex ??= ResolveStaticImportPaletteIndex(layout, referenceSkeleton))
+                    : primitive.BonePaletteIndex;
+                result.Add(new PreparedPrimitive(primitive, textureSlots, paletteIndex));
                 continue;
             }
 
@@ -277,7 +281,8 @@ public static class MeshReinserter
 
             if (usage.AllHashes.Count == 0)
             {
-                result.Add(new PreparedPrimitive(primitive, textureSlots, primitive.BonePaletteIndex));
+                var paletteIndex = staticImportPaletteIndex ??= ResolveStaticImportPaletteIndex(layout, referenceSkeleton);
+                result.Add(new PreparedPrimitive(primitive, textureSlots, paletteIndex));
                 continue;
             }
 
@@ -465,6 +470,51 @@ public static class MeshReinserter
 
         layout.BonePalettes.Add(palette);
         return layout.BonePalettes.Count - 1;
+    }
+
+    private static int? ResolveStaticImportPaletteIndex(D3DMeshLayout layout, SkeletonData? referenceSkeleton)
+    {
+        if (layout.BonePalettes.Count == 0)
+        {
+            return null;
+        }
+
+        if (TryGetRootBoneHash(referenceSkeleton, out var rootHash))
+        {
+            for (var i = 0; i < layout.BonePalettes.Count; i++)
+            {
+                var palette = layout.BonePalettes[i];
+                if (palette.Length > 0 && palette[0] == rootHash)
+                {
+                    return i;
+                }
+            }
+
+            return AddCustomBonePalette(layout, [rootHash]);
+        }
+
+        for (var i = 0; i < layout.BonePalettes.Count; i++)
+        {
+            if (layout.BonePalettes[i].Length > 0)
+            {
+                return i;
+            }
+        }
+
+        return 0;
+    }
+
+    private static bool TryGetRootBoneHash(SkeletonData? skeleton, out ulong hash)
+    {
+        hash = 0;
+        if (skeleton is null || skeleton.Bones.Count == 0)
+        {
+            return false;
+        }
+
+        var root = skeleton.Bones.FirstOrDefault(bone => bone.ParentIndex < 0) ?? skeleton.Bones[0];
+        hash = root.Hash;
+        return hash != 0;
     }
 
     private static List<PreparedPrimitive> SplitPrimitiveByBonePalette(
@@ -806,15 +856,21 @@ public static class MeshReinserter
         return b;
     }
 
-    private static int BuildSubmeshTableSizeDelta(D3DMeshLayout layout, int newCount)
-        => BuildSubmeshTableLength(layout, newCount) - layout.SubmeshTableLength;
+    private static int BuildSubmeshTableSizeDelta(
+        D3DMeshLayout layout,
+        int newCount,
+        IReadOnlyList<IReadOnlyDictionary<string, string>>? textureSlotsByPrimitive)
+        => BuildSubmeshTableLength(layout, newCount, textureSlotsByPrimitive) - layout.SubmeshTableLength;
 
-    private static int BuildSubmeshTableLength(D3DMeshLayout layout, int newCount)
+    private static int BuildSubmeshTableLength(
+        D3DMeshLayout layout,
+        int newCount,
+        IReadOnlyList<IReadOnlyDictionary<string, string>>? textureSlotsByPrimitive)
     {
         var total = 0;
         for (var i = 0; i < newCount; i++)
         {
-            total += GetSubmeshTemplate(layout, i).EntryLength;
+            total += GetSubmeshTemplate(layout, i, TextureSlotsForPrimitive(textureSlotsByPrimitive, i)).EntryLength;
         }
 
         return total;
@@ -826,8 +882,10 @@ public static class MeshReinserter
         IReadOnlyList<IReadOnlyDictionary<string, string>>? textureSlotsByPrimitive,
         GameConfig gameConfig)
     {
-        using var ms = new MemoryStream(BuildSubmeshTableLength(layout, subInfo.Count));
-        var textureIndexBySlot = BuildTextureGroupPlans(layout, textureSlotsByPrimitive)
+        using var ms = new MemoryStream(BuildSubmeshTableLength(layout, subInfo.Count, textureSlotsByPrimitive));
+        var texturePlansBySlot = BuildTextureGroupPlans(layout, textureSlotsByPrimitive);
+        var rewrittenTextureSlots = texturePlansBySlot.Keys.ToHashSet(StringComparer.OrdinalIgnoreCase);
+        var textureIndexBySlot = texturePlansBySlot
             .ToDictionary(
                 pair => pair.Key,
                 pair => pair.Value
@@ -836,7 +894,7 @@ public static class MeshReinserter
                 StringComparer.OrdinalIgnoreCase);
         for (var i = 0; i < subInfo.Count; i++)
         {
-            var template = GetSubmeshTemplate(layout, i);
+            var template = GetSubmeshTemplate(layout, i, TextureSlotsForPrimitive(textureSlotsByPrimitive, i));
             var bytes = layout.Original.AsSpan(template.EntryOffset, template.EntryLength).ToArray();
             var info = subInfo[i];
 
@@ -857,6 +915,7 @@ public static class MeshReinserter
             }
 
             ClearStaleTemplateTextureSlots(gameConfig, bytes, template, textureSlotsByPrimitive, i);
+            ClearSlotsRewrittenByGltf(bytes, template, textureSlotsByPrimitive, i, rewrittenTextureSlots);
 
             if (textureSlotsByPrimitive is not null && i < textureSlotsByPrimitive.Count)
             {
@@ -918,6 +977,22 @@ public static class MeshReinserter
         }
     }
 
+    private static void ClearSlotsRewrittenByGltf(
+        byte[] bytes,
+        SubmeshLayout template,
+        IReadOnlyList<IReadOnlyDictionary<string, string>>? textureSlotsByPrimitive,
+        int primitiveIndex,
+        IReadOnlySet<string> rewrittenTextureSlots)
+    {
+        foreach (var slot in rewrittenTextureSlots)
+        {
+            if (!PrimitiveProvidesSlot(textureSlotsByPrimitive, primitiveIndex, slot))
+            {
+                ClearTextureSlot(bytes, template, slot);
+            }
+        }
+    }
+
     private static void ClearAccessoryLineTextureSlots(byte[] bytes, SubmeshLayout template)
     {
         foreach (var slot in new[] { "detail_diffuse", "detail_bump", "tex8" })
@@ -966,7 +1041,7 @@ public static class MeshReinserter
         for (var primitiveIndex = 0; primitiveIndex < textureSlotsByPrimitive.Count; primitiveIndex++)
         {
             var primitiveSlots = textureSlotsByPrimitive[primitiveIndex];
-            var template = GetSubmeshTemplate(layout, primitiveIndex);
+            var template = GetSubmeshTemplate(layout, primitiveIndex, primitiveSlots);
             foreach (var (slot, textureName) in primitiveSlots)
             {
                 if (string.IsNullOrWhiteSpace(slot) || string.IsNullOrWhiteSpace(textureName))
@@ -1090,8 +1165,66 @@ public static class MeshReinserter
         return result;
     }
 
-    private static SubmeshLayout GetSubmeshTemplate(D3DMeshLayout layout, int index)
-        => layout.Submeshes[Math.Min(index, layout.Submeshes.Count - 1)];
+    private static IReadOnlyDictionary<string, string>? TextureSlotsForPrimitive(
+        IReadOnlyList<IReadOnlyDictionary<string, string>>? textureSlotsByPrimitive,
+        int primitiveIndex)
+        => textureSlotsByPrimitive is not null &&
+           primitiveIndex >= 0 &&
+           primitiveIndex < textureSlotsByPrimitive.Count
+            ? textureSlotsByPrimitive[primitiveIndex]
+            : null;
+
+    private static SubmeshLayout GetSubmeshTemplate(
+        D3DMeshLayout layout,
+        int index,
+        IReadOnlyDictionary<string, string>? primitiveSlots = null)
+    {
+        var byIndex = layout.Submeshes[Math.Min(index, layout.Submeshes.Count - 1)];
+        if (primitiveSlots is null ||
+            !primitiveSlots.ContainsKey("detail_diffuse") ||
+            !ShouldUseDetailCapableTemplate(index, primitiveSlots) ||
+            TemplateProvidesSlot(layout, byIndex, "detail_diffuse"))
+        {
+            return byIndex;
+        }
+
+        return layout.Submeshes
+            .Where(template => TemplateProvidesSlot(layout, template, "detail_diffuse"))
+            .OrderByDescending(template => template.PolygonCount)
+            .FirstOrDefault()
+            ?? byIndex;
+    }
+
+    private static bool ShouldUseDetailCapableTemplate(int primitiveIndex, IReadOnlyDictionary<string, string> primitiveSlots)
+    {
+        if ((primitiveIndex == 1 || primitiveIndex == 2) &&
+            primitiveSlots.ContainsKey("detail_diffuse"))
+        {
+            return true;
+        }
+
+        if (primitiveSlots.TryGetValue("detail_diffuse", out var detailName) &&
+            IsArmOrSleeveTextureName(detailName))
+        {
+            return true;
+        }
+
+        return primitiveSlots.TryGetValue("diffuse", out var diffuseName) &&
+               IsArmOrSleeveTextureName(diffuseName);
+    }
+
+    private static bool IsArmOrSleeveTextureName(string textureName)
+    {
+        var lower = Path.GetFileNameWithoutExtension(textureName).ToLowerInvariant();
+        return lower.Contains("sleeve", StringComparison.Ordinal) ||
+               lower.Contains("arm", StringComparison.Ordinal);
+    }
+
+    private static bool TemplateProvidesSlot(D3DMeshLayout layout, SubmeshLayout template, string slot)
+    {
+        var slotIndex = Array.FindIndex(TextureSlotsV13, candidate => string.Equals(candidate, slot, StringComparison.OrdinalIgnoreCase));
+        return ReadTemplateTextureSlotIndex(layout, template, slotIndex) >= 0;
+    }
 
     private static void WriteU32(byte[] bytes, int offset, int value)
         => BinaryPrimitives.WriteUInt32LittleEndian(bytes.AsSpan(offset, 4), (uint)value);
