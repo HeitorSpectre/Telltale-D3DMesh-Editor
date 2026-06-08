@@ -47,6 +47,7 @@ If you already have the files extracted, or want to load custom assets:
 |----------|------|--------|
 | PC | The Walking Dead: Season 2 | ✅ Working |
 | PC | The Wolf Among Us | ✅ Working |
+| PC | Minecraft Story Mode | 🚧 In Progress |
 
 ## Help with testing
 
