@@ -1,3 +1,4 @@
+using System.Numerics;
 using TelltaleToolKit;
 using TelltaleToolKit.Meta.Serialization;
 using TelltaleD3DMeshEditor.Core;
@@ -64,6 +65,7 @@ public static class SkeletonRebuilder
             var name = GetSymbolName(entry.JointName) ??
                        BoneHashDatabase.Resolve(hash) ??
                        $"bone_{hash:X16}";
+            var mirrorHash = entry.MirrorBoneName?.Crc64 ?? 0;
             result.Bones.Add(new BoneData(
                 name,
                 hash,
@@ -75,11 +77,29 @@ public static class SkeletonRebuilder
                 entry.LocalQuat.Y,
                 entry.LocalQuat.Z,
                 entry.LocalQuat.W,
-                parentHash));
+                parentHash)
+            {
+                MirrorBoneHash = mirrorHash,
+                MirrorBoneIndex = mirrorHash != 0 ? entry.MirrorBoneIndex : -1,
+                BoneLength = entry.BoneLength,
+                BoneDir = entry.BoneDir,
+                BoneRotationAdjustment = NormalizeRotationOrIdentity(entry.BoneRotationAdjustment),
+                RestTranslation = entry.RestXform?.Translation ?? default,
+                RestRotation = NormalizeRotationOrIdentity(entry.RestXform?.Rotation ?? default),
+                GlobalTranslationScale = NonZeroOrOne(entry.GlobalTranslationScale),
+                LocalTranslationScale = NonZeroOrOne(entry.LocalTranslationScale),
+                AnimTranslationScale = NonZeroOrOne(entry.AnimTranslationScale),
+            });
         }
 
         return result;
     }
+
+    private static Vector3 NonZeroOrOne(Vector3 value)
+        => value.LengthSquared() > 0.000001f ? value : Vector3.One;
+
+    private static Quaternion NormalizeRotationOrIdentity(Quaternion rotation)
+        => rotation.LengthSquared() > 0.000001f ? Quaternion.Normalize(rotation) : Quaternion.Identity;
 
     public static IReadOnlyList<SkeletonEntryDiagnostics> ReadEntryDiagnostics(string sklPath)
     {

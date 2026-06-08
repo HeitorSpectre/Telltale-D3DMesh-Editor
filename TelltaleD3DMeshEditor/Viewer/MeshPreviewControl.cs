@@ -2,6 +2,7 @@ using System.Drawing.Drawing2D;
 using System.Drawing.Imaging;
 using System.Globalization;
 using System.Numerics;
+using System.Reflection;
 using System.Runtime.InteropServices;
 using TelltaleD3DMeshEditor.Formats.Mesh;
 using TelltaleD3DMeshEditor.Formats.Skeleton;
@@ -20,6 +21,7 @@ public sealed class MeshPreviewControl : Control
     private const float DefaultPitch = 0.25f;
     private const float DefaultZoom = 1.0f;
     private const float DepthTieEpsilon = 0.00005f;
+    private const string EmptyPreviewText = "Select a .d3dmesh, .d3dtx and .skl file to preview";
 
     private MeshData? _mesh;
     private SkeletonData? _skeleton;
@@ -40,6 +42,8 @@ public sealed class MeshPreviewControl : Control
     private bool _showPolygons;
     private bool _panMode;
     private bool _poseMode;
+    private bool _showDragDropHint;
+    private Image? _dragDropImage;
     private int _selectedBone = -1;
     private readonly Dictionary<int, Vector3> _boneOffsets = new();
     private readonly Dictionary<int, Quaternion> _boneRotations = new();
@@ -76,6 +80,7 @@ public sealed class MeshPreviewControl : Control
         if (disposing)
         {
             _meshBitmap?.Dispose();
+            _dragDropImage?.Dispose();
         }
 
         base.Dispose(disposing);
@@ -118,6 +123,17 @@ public sealed class MeshPreviewControl : Control
         }
 
         Cursor = enabled ? Cursors.Cross : _panMode ? Cursors.SizeAll : Cursors.Default;
+        Invalidate();
+    }
+
+    public void SetDragDropHintVisible(bool visible)
+    {
+        if (_showDragDropHint == visible)
+        {
+            return;
+        }
+
+        _showDragDropHint = visible;
         Invalidate();
     }
 
@@ -281,7 +297,7 @@ public sealed class MeshPreviewControl : Control
 
         if (_mesh is null)
         {
-            DrawCentered(g, "Select a .d3dmesh file to preview");
+            DrawEmptyPreview(g);
             return;
         }
 
@@ -585,7 +601,8 @@ public sealed class MeshPreviewControl : Control
 
     private void DrawSkeleton(Graphics g, Matrix4x4 transform, float scale, PointF center)
     {
-        var world = BuildBoneWorldPositions(_skeleton!, _boneOffsets, _boneRotations);
+        var worldMatrices = BuildBoneWorldMatrices(_skeleton!, _boneOffsets, _boneRotations);
+        var world = ExtractBoneWorldPositions(worldMatrices);
         var visibleBones = BuildVisibleSkeletonBones();
         using var bonePen = new Pen(Color.FromArgb(240, 255, 196, 72), 2f);
         using var jointBrush = new SolidBrush(Color.FromArgb(245, 255, 235, 145));
@@ -610,7 +627,63 @@ public sealed class MeshPreviewControl : Control
                 var pp = Project(world[parent], transform, scale, center);
                 g.DrawLine(isSelected ? selectedPen : bonePen, pp, p);
             }
+
+            if (!HasVisibleChild(i, visibleBones) &&
+                TryGetRichTerminalBoneEnd(_skeleton.Bones[i], worldMatrices[i], out var terminalEnd))
+            {
+                var ep = Project(terminalEnd, transform, scale, center);
+                g.DrawLine(isSelected ? selectedPen : bonePen, p, ep);
+            }
         }
+    }
+
+    private static Vector3[] ExtractBoneWorldPositions(IReadOnlyList<Matrix4x4> worldMatrices)
+    {
+        var result = new Vector3[worldMatrices.Count];
+        for (var i = 0; i < result.Length; i++)
+        {
+            result[i] = Vector3.Transform(Vector3.Zero, worldMatrices[i]);
+        }
+
+        return result;
+    }
+
+    private bool HasVisibleChild(int boneIndex, IReadOnlySet<int>? visibleBones)
+    {
+        if (_skeleton is null)
+        {
+            return false;
+        }
+
+        for (var i = 0; i < _skeleton.Bones.Count; i++)
+        {
+            if (_skeleton.Bones[i].ParentIndex == boneIndex &&
+                (visibleBones is null || visibleBones.Contains(i)))
+            {
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+    private static bool TryGetRichTerminalBoneEnd(BoneData bone, Matrix4x4 worldMatrix, out Vector3 end)
+    {
+        end = default;
+        if (bone.BoneLength <= 0.000001f || bone.BoneDir.LengthSquared() <= 0.000001f)
+        {
+            return false;
+        }
+
+        var start = Vector3.Transform(Vector3.Zero, worldMatrix);
+        var direction = Vector3.TransformNormal(Vector3.Normalize(bone.BoneDir) * bone.BoneLength, worldMatrix);
+        if (direction.LengthSquared() <= 0.000001f)
+        {
+            return false;
+        }
+
+        end = start + direction;
+        return true;
     }
 
     private static Vector3[] BuildBoneWorldPositions(
@@ -634,37 +707,62 @@ public sealed class MeshPreviewControl : Control
         IReadOnlyDictionary<int, Quaternion>? rotations)
     {
         var worldMatrices = new Matrix4x4[skeleton.Bones.Count];
+        var state = new byte[skeleton.Bones.Count];
         for (var i = 0; i < skeleton.Bones.Count; i++)
         {
-            var bone = skeleton.Bones[i];
-            var rotation = new Quaternion(bone.Qx, bone.Qy, bone.Qz, bone.Qw);
-            if (rotation.LengthSquared() < 0.000001f)
-            {
-                rotation = Quaternion.Identity;
-            }
-            else
-            {
-                rotation = Quaternion.Normalize(rotation);
-            }
-
-            var offset = Vector3.Zero;
-            offsets?.TryGetValue(i, out offset);
-            if (rotations is not null && rotations.TryGetValue(i, out var extraRotation))
-            {
-                rotation = Quaternion.Normalize(extraRotation * rotation);
-            }
-
-            var local =
-                Matrix4x4.CreateFromQuaternion(rotation) *
-                Matrix4x4.CreateTranslation(bone.X + offset.X, bone.Y + offset.Y, bone.Z + offset.Z);
-
-            var parent = bone.ParentIndex;
-            worldMatrices[i] = parent >= 0 && parent < i
-                ? local * worldMatrices[parent]
-                : local;
+            BuildBoneWorldMatrix(skeleton, i, offsets, rotations, worldMatrices, state);
         }
 
         return worldMatrices;
+    }
+
+    private static Matrix4x4 BuildBoneWorldMatrix(
+        SkeletonData skeleton,
+        int index,
+        IReadOnlyDictionary<int, Vector3>? offsets,
+        IReadOnlyDictionary<int, Quaternion>? rotations,
+        Matrix4x4[] worldMatrices,
+        byte[] state)
+    {
+        if (state[index] == 2)
+        {
+            return worldMatrices[index];
+        }
+
+        if (state[index] == 1)
+        {
+            return Matrix4x4.Identity;
+        }
+
+        state[index] = 1;
+        var bone = skeleton.Bones[index];
+        var rotation = new Quaternion(bone.Qx, bone.Qy, bone.Qz, bone.Qw);
+        if (rotation.LengthSquared() < 0.000001f)
+        {
+            rotation = Quaternion.Identity;
+        }
+        else
+        {
+            rotation = Quaternion.Normalize(rotation);
+        }
+
+        var offset = Vector3.Zero;
+        offsets?.TryGetValue(index, out offset);
+        if (rotations is not null && rotations.TryGetValue(index, out var extraRotation))
+        {
+            rotation = Quaternion.Normalize(extraRotation * rotation);
+        }
+
+        var local =
+            Matrix4x4.CreateFromQuaternion(rotation) *
+            Matrix4x4.CreateTranslation(bone.X + offset.X, bone.Y + offset.Y, bone.Z + offset.Z);
+
+        var parent = bone.ParentIndex;
+        worldMatrices[index] = parent >= 0 && parent < skeleton.Bones.Count
+            ? local * BuildBoneWorldMatrix(skeleton, parent, offsets, rotations, worldMatrices, state)
+            : local;
+        state[index] = 2;
+        return worldMatrices[index];
     }
 
     private int[]? BuildBoneMap(SubmeshData submesh)
@@ -926,7 +1024,7 @@ public sealed class MeshPreviewControl : Control
 
         var parent = _skeleton.Bones[boneIndex].ParentIndex;
         var localDelta = worldDelta;
-        if (parent >= 0 && parent < boneIndex)
+        if (parent >= 0 && parent < _skeleton.Bones.Count)
         {
             var parentWorld = BuildBoneWorldMatrices(_skeleton, _boneOffsets, _boneRotations)[parent];
             parentWorld.M41 = 0f;
@@ -1015,9 +1113,30 @@ public sealed class MeshPreviewControl : Control
             }
         }
 
+        AddVisibleAncestors(visible);
+
         return visible.Count > 0 && visible.Count < _skeleton.Bones.Count
             ? visible
             : null;
+    }
+
+    private void AddVisibleAncestors(HashSet<int> visible)
+    {
+        if (_skeleton is null || visible.Count == 0)
+        {
+            return;
+        }
+
+        foreach (var seed in visible.ToArray())
+        {
+            var current = seed;
+            var guard = 0;
+            while (current >= 0 && current < _skeleton.Bones.Count && guard++ < _skeleton.Bones.Count)
+            {
+                visible.Add(current);
+                current = _skeleton.Bones[current].ParentIndex;
+            }
+        }
     }
 
     private static void AddInfluencedBone(int rawBone, float weight, int[] map, HashSet<int> influenced)
@@ -1141,6 +1260,60 @@ public sealed class MeshPreviewControl : Control
         using var brush = new SolidBrush(Color.FromArgb(235, 245, 245, 245));
         var size = g.MeasureString(text, Font);
         g.DrawString(text, Font, brush, (Width - size.Width) * 0.5f, (Height - size.Height) * 0.5f);
+    }
+
+    private void DrawEmptyPreview(Graphics g)
+    {
+        using var brush = new SolidBrush(Color.FromArgb(235, 245, 245, 245));
+        var textSize = g.MeasureString(EmptyPreviewText, Font);
+        var textX = (Width - textSize.Width) * 0.5f;
+        var textY = (Height - textSize.Height) * 0.5f;
+
+        if (_showDragDropHint && TryGetDragDropImage() is { } image)
+        {
+            var maxImageWidth = Math.Min(220f, Width * 0.42f);
+            var maxImageHeight = Math.Min(150f, Height * 0.28f);
+            var scale = Math.Min(maxImageWidth / image.Width, maxImageHeight / image.Height);
+            scale = Math.Min(scale, 1f);
+
+            var imageWidth = image.Width * scale;
+            var imageHeight = image.Height * scale;
+            var gap = 18f;
+            var groupHeight = imageHeight + gap + textSize.Height;
+            var imageX = (Width - imageWidth) * 0.5f;
+            var imageY = (Height - groupHeight) * 0.5f;
+
+            g.DrawImage(image, imageX, imageY, imageWidth, imageHeight);
+            textY = imageY + imageHeight + gap;
+        }
+
+        g.DrawString(EmptyPreviewText, Font, brush, textX, textY);
+    }
+
+    private Image? TryGetDragDropImage()
+    {
+        if (_dragDropImage is not null)
+        {
+            return _dragDropImage;
+        }
+
+        var assembly = Assembly.GetExecutingAssembly();
+        using var stream = assembly.GetManifestResourceStream("TelltaleD3DMeshEditor.Resources.Images.DragDrop.png");
+        if (stream is null)
+        {
+            return null;
+        }
+
+        try
+        {
+            using var loaded = Image.FromStream(stream);
+            _dragDropImage = new Bitmap(loaded);
+            return _dragDropImage;
+        }
+        catch
+        {
+            return null;
+        }
     }
 
     private static Vector3 ToVector(VertexData v) => new(v.X, v.Y, v.Z);

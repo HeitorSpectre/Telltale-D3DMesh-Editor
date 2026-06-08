@@ -372,15 +372,7 @@ internal static class AssetGltfBuilder
                 if (p >= 0 && p < skeleton.Bones.Count) childrenByBone[p].Add(boneNodeBase + i);
             }
 
-            var world = new Matrix4x4[skeleton.Bones.Count];
-            for (var i = 0; i < skeleton.Bones.Count; i++)
-            {
-                var b = skeleton.Bones[i];
-                var local = Matrix4x4.CreateFromQuaternion(new Quaternion(b.Qx, b.Qy, b.Qz, b.Qw)) *
-                            Matrix4x4.CreateTranslation(b.X, b.Y, b.Z);
-                var p = b.ParentIndex;
-                world[i] = p >= 0 && p < i ? local * world[p] : local;
-            }
+            var world = BuildBoneWorldMatrices(skeleton);
 
             var ibmBytes = new List<byte>();
             for (var i = 0; i < skeleton.Bones.Count; i++)
@@ -394,18 +386,24 @@ internal static class AssetGltfBuilder
             for (var i = 0; i < skeleton.Bones.Count; i++)
             {
                 var b = skeleton.Bones[i];
+                var extras = new Dictionary<string, object>
+                {
+                    ["hash"] = $"0x{b.Hash:X16}",
+                    ["parentHash"] = $"0x{b.ParentHash:X16}",
+                    ["translationBits"] = GltfCommon.FloatBits(b.X, b.Y, b.Z),
+                    ["rotationBits"] = GltfCommon.FloatBits(b.Qx, b.Qy, b.Qz, b.Qw),
+                };
+                if (b.HasRichSkeletonData)
+                {
+                    extras["telltaleSkeleton"] = BuildRichSkeletonExtras(b);
+                }
+
                 var node = new Dictionary<string, object>
                 {
                     ["name"] = b.Name,
                     ["translation"] = new[] { b.X, b.Y, b.Z },
                     ["rotation"] = new[] { b.Qx, b.Qy, b.Qz, b.Qw },
-                    ["extras"] = new Dictionary<string, object>
-                    {
-                        ["hash"] = $"0x{b.Hash:X16}",
-                        ["parentHash"] = $"0x{b.ParentHash:X16}",
-                        ["translationBits"] = GltfCommon.FloatBits(b.X, b.Y, b.Z),
-                        ["rotationBits"] = GltfCommon.FloatBits(b.Qx, b.Qy, b.Qz, b.Qw),
-                    },
+                    ["extras"] = extras,
                 };
                 if (childrenByBone[i].Count > 0) node["children"] = childrenByBone[i];
                 nodes.Add(node);
@@ -449,6 +447,64 @@ internal static class AssetGltfBuilder
         if (skin is not null) gltf["skins"] = new[] { skin };
 
         return new BuiltAsset { Gltf = gltf, Bin = bin, Images = images };
+    }
+
+    private static Dictionary<string, object> BuildRichSkeletonExtras(BoneData bone)
+        => new()
+        {
+            ["mirrorHash"] = $"0x{bone.MirrorBoneHash:X16}",
+            ["mirrorBoneIndex"] = bone.MirrorBoneIndex,
+            ["boneLength"] = bone.BoneLength,
+            ["boneDir"] = new[] { bone.BoneDir.X, bone.BoneDir.Y, bone.BoneDir.Z },
+            ["boneRotationAdjustment"] = new[]
+            {
+                bone.BoneRotationAdjustment.X,
+                bone.BoneRotationAdjustment.Y,
+                bone.BoneRotationAdjustment.Z,
+                bone.BoneRotationAdjustment.W,
+            },
+            ["restTranslation"] = new[] { bone.RestTranslation.X, bone.RestTranslation.Y, bone.RestTranslation.Z },
+            ["restRotation"] = new[] { bone.RestRotation.X, bone.RestRotation.Y, bone.RestRotation.Z, bone.RestRotation.W },
+            ["globalTranslationScale"] = new[] { bone.GlobalTranslationScale.X, bone.GlobalTranslationScale.Y, bone.GlobalTranslationScale.Z },
+            ["localTranslationScale"] = new[] { bone.LocalTranslationScale.X, bone.LocalTranslationScale.Y, bone.LocalTranslationScale.Z },
+            ["animTranslationScale"] = new[] { bone.AnimTranslationScale.X, bone.AnimTranslationScale.Y, bone.AnimTranslationScale.Z },
+        };
+
+    private static Matrix4x4[] BuildBoneWorldMatrices(SkeletonData skeleton)
+    {
+        var world = new Matrix4x4[skeleton.Bones.Count];
+        var state = new byte[skeleton.Bones.Count];
+        for (var i = 0; i < skeleton.Bones.Count; i++)
+        {
+            BuildBoneWorldMatrix(skeleton, i, world, state);
+        }
+
+        return world;
+    }
+
+    private static Matrix4x4 BuildBoneWorldMatrix(SkeletonData skeleton, int index, Matrix4x4[] world, byte[] state)
+    {
+        if (state[index] == 2)
+        {
+            return world[index];
+        }
+
+        if (state[index] == 1)
+        {
+            return Matrix4x4.Identity;
+        }
+
+        state[index] = 1;
+        var bone = skeleton.Bones[index];
+        var rotation = new Quaternion(bone.Qx, bone.Qy, bone.Qz, bone.Qw);
+        rotation = rotation.LengthSquared() > 0.000001f ? Quaternion.Normalize(rotation) : Quaternion.Identity;
+        var local = Matrix4x4.CreateFromQuaternion(rotation) *
+                    Matrix4x4.CreateTranslation(bone.X, bone.Y, bone.Z);
+        world[index] = bone.ParentIndex >= 0 && bone.ParentIndex < skeleton.Bones.Count
+            ? local * BuildBoneWorldMatrix(skeleton, bone.ParentIndex, world, state)
+            : local;
+        state[index] = 2;
+        return world[index];
     }
 
     private static Dictionary<string, object> BuildSampler()

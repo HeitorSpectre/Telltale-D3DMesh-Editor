@@ -4,6 +4,8 @@ namespace TelltaleD3DMeshEditor.UI;
 // This lets character parts such as body/head be exported as one editable GLB/GLTF.
 public sealed class ModelAssetGroup
 {
+    private readonly string _searchText;
+
     private static readonly string[] KnownSlots =
     [
         "sharedParts",
@@ -71,6 +73,7 @@ public sealed class ModelAssetGroup
         RelativeDirectory = relativeDirectory;
         Assets = assets;
         DecalOffsetMeshPaths = decalOffsetMeshPaths ?? new HashSet<string>();
+        _searchText = BuildSearchText(Name, SkeletonPath, RelativeDirectory, Assets);
     }
 
     public string Name { get; }
@@ -154,11 +157,51 @@ public sealed class ModelAssetGroup
 
     public bool Matches(string inputRoot, string query)
     {
-        return ToString().Contains(query, StringComparison.OrdinalIgnoreCase) ||
-               RelativeDirectory.Contains(query, StringComparison.OrdinalIgnoreCase) ||
-               Name.Contains(query, StringComparison.OrdinalIgnoreCase) ||
-               Path.GetFileNameWithoutExtension(SkeletonPath).Contains(query, StringComparison.OrdinalIgnoreCase) ||
-               Assets.Any(asset => asset.Matches(inputRoot, query));
+        _ = inputRoot;
+        return _searchText.Contains(query, StringComparison.OrdinalIgnoreCase);
+    }
+
+    private static string BuildSearchText(
+        string name,
+        string skeletonPath,
+        string relativeDirectory,
+        IReadOnlyList<ModelAsset> assets)
+    {
+        var parts = new List<string>
+        {
+            $"Combined: {name}",
+            name,
+            relativeDirectory,
+            Path.GetFileNameWithoutExtension(skeletonPath),
+            Path.GetFileName(skeletonPath),
+        };
+
+        foreach (var asset in assets)
+        {
+            parts.Add(Path.GetFileNameWithoutExtension(asset.MeshPath));
+            parts.Add(Path.GetFileName(asset.MeshPath));
+            if (!string.IsNullOrWhiteSpace(relativeDirectory))
+            {
+                parts.Add(Path.Combine(relativeDirectory, Path.GetFileName(asset.MeshPath)));
+            }
+
+            var directory = Path.GetDirectoryName(asset.MeshPath);
+            if (!string.IsNullOrWhiteSpace(directory))
+            {
+                parts.Add(Path.GetFileName(directory));
+            }
+
+            if (!string.IsNullOrWhiteSpace(asset.SkeletonPath))
+            {
+                parts.Add(Path.GetFileNameWithoutExtension(asset.SkeletonPath));
+                parts.Add(Path.GetFileName(asset.SkeletonPath));
+            }
+        }
+
+        return string.Join(
+            '\n',
+            parts.Where(part => !string.IsNullOrWhiteSpace(part))
+                 .Distinct(StringComparer.OrdinalIgnoreCase));
     }
 
     // Held props that the character can appear with or without (e.g. Nerissa's lily flower). Each is

@@ -6,6 +6,9 @@ namespace TelltaleD3DMeshEditor.Reinsert;
 
 public static class D3dtxWriter
 {
+    private const uint Argb8Format = 0x0;
+    private const uint Rgba8Format = 0xA;
+    private const uint A8Format = 0x10;
     private const uint Dxt1Format = 0x40;
     private const uint Dxt5Format = 0x42;
 
@@ -30,17 +33,17 @@ public static class D3dtxWriter
         var hasAlpha = HasMeaningfulAlpha(pixels);
         var format = tex.TextureFormat switch
         {
+            Argb8Format or Rgba8Format or A8Format => tex.TextureFormat,
             Dxt5Format => Dxt5Format,
             Dxt1Format => hasAlpha ? Dxt5Format : Dxt1Format,
             _ => hasAlpha ? Dxt5Format : Dxt1Format,
         };
-        var mipCount = Math.Min(CountTtgBlockMips(width, height), Math.Max(1, tex.Mip));
+        var mipCount = Math.Min(CountTtgMips(width, height, format), Math.Max(1, tex.Mip));
         // The mip payloads must be encoded with the same codec that the header declares.
         // When the template is DXT5 we keep DXT5 even for alpha-less images, otherwise the
         // header (16 bytes/block) would disagree with a DXT1 payload (8 bytes/block) and the
         // texture would read as garbage / fail to decode ("payload smaller than largest mip").
-        var encodeDxt5 = format == Dxt5Format;
-        var mipPayloads = BuildMipPayloads(pixels, width, height, mipCount, encodeDxt5);
+        var mipPayloads = BuildMipPayloads(pixels, width, height, mipCount, format);
 
         tex.ObjectName = NormalizeD3dtxName(textureFileName);
         tex.Width = width;
@@ -54,7 +57,7 @@ public static class D3dtxWriter
         return tex.Write();
     }
 
-    private static List<byte[]> BuildMipPayloads(int[] pixels, int width, int height, int mipCount, bool encodeDxt5)
+    private static List<byte[]> BuildMipPayloads(int[] pixels, int width, int height, int mipCount, uint format)
     {
         var mipPayloads = new List<byte[]>();
         var current = pixels;
@@ -62,9 +65,14 @@ public static class D3dtxWriter
         var currentHeight = height;
         for (var mip = 0; mip < mipCount; mip++)
         {
-            mipPayloads.Add(encodeDxt5
-                ? EncodeDxt5(current, currentWidth, currentHeight)
-                : EncodeDxt1(current, currentWidth, currentHeight));
+            mipPayloads.Add(format switch
+            {
+                Argb8Format => EncodeBgra32(current, currentWidth, currentHeight),
+                Rgba8Format => EncodeRgba32(current, currentWidth, currentHeight),
+                A8Format => EncodeA8(current, currentWidth, currentHeight),
+                Dxt5Format => EncodeDxt5(current, currentWidth, currentHeight),
+                _ => EncodeDxt1(current, currentWidth, currentHeight),
+            });
             if (mip == mipCount - 1 || (currentWidth == 1 && currentHeight == 1))
             {
                 break;
@@ -74,6 +82,53 @@ public static class D3dtxWriter
         }
 
         return mipPayloads;
+    }
+
+    private static byte[] EncodeBgra32(int[] pixels, int width, int height)
+    {
+        var data = new byte[checked(width * height * 4)];
+        for (var i = 0; i < width * height; i++)
+        {
+            var color = Color.FromArgb(pixels[i]);
+            var p = i * 4;
+            data[p] = color.B;
+            data[p + 1] = color.G;
+            data[p + 2] = color.R;
+            data[p + 3] = color.A;
+        }
+
+        return data;
+    }
+
+    private static byte[] EncodeRgba32(int[] pixels, int width, int height)
+    {
+        var data = new byte[checked(width * height * 4)];
+        for (var i = 0; i < width * height; i++)
+        {
+            var color = Color.FromArgb(pixels[i]);
+            var p = i * 4;
+            data[p] = color.R;
+            data[p + 1] = color.G;
+            data[p + 2] = color.B;
+            data[p + 3] = color.A;
+        }
+
+        return data;
+    }
+
+    private static byte[] EncodeA8(int[] pixels, int width, int height)
+    {
+        var useAlpha = HasMeaningfulAlpha(pixels);
+        var data = new byte[checked(width * height)];
+        for (var i = 0; i < data.Length; i++)
+        {
+            var color = Color.FromArgb(pixels[i]);
+            data[i] = useAlpha
+                ? color.A
+                : (byte)((color.R * 30 + color.G * 59 + color.B * 11) / 100);
+        }
+
+        return data;
     }
 
     private static bool HasMeaningfulAlpha(int[] pixels)
@@ -407,10 +462,27 @@ public static class D3dtxWriter
         return count;
     }
 
-    private static int CountTtgBlockMips(int width, int height) => CountBlockMips(width, height);
+    private static int CountFullMips(int width, int height)
+    {
+        var count = 1;
+        while (width > 1 || height > 1)
+        {
+            width = Math.Max(1, width / 2);
+            height = Math.Max(1, height / 2);
+            count++;
+        }
+
+        return count;
+    }
+
+    private static int CountTtgMips(int width, int height, uint format)
+        => IsBlockCompressedFormat(format) ? CountBlockMips(width, height) : CountFullMips(width, height);
 
     private static int MipSizeOf(int width, int height, int blockBytes) =>
         Math.Max(1, (width + 3) / 4) * Math.Max(1, (height + 3) / 4) * blockBytes;
+
+    private static bool IsBlockCompressedFormat(uint format)
+        => format is Dxt1Format or Dxt5Format or 0x41 or 0x43 or 0x44 or 0x45 or 0x46 or 0x47;
 
     private static string NormalizeD3dtxName(string textureFileName) =>
         textureFileName.EndsWith(".d3dtx", StringComparison.OrdinalIgnoreCase)
@@ -423,6 +495,15 @@ public static class D3dtxWriter
         var h = Math.Max(1, height);
         switch (format)
         {
+            case 0x0:
+            case 0xA:
+                mipSize = checked(w * h * 4);
+                pitch = checked(w * 4);
+                break;
+            case 0x10:
+                mipSize = checked(w * h);
+                pitch = w;
+                break;
             case 0x40:
             case 0x43:
             case 0x70:

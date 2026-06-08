@@ -16,6 +16,9 @@ namespace TelltaleD3DMeshEditor.UI;
 // (GLB or GLTF + files), reimporting edited geometry, and controlling camera/skeleton.
 public sealed class MainForm : Form
 {
+    private const int PreferredTreePanelWidth = 360;
+    private const int MinimumTreePanelWidth = 300;
+
     private readonly ToolStrip _toolStrip = new();
     private readonly ToolStrip _viewerOverlay = new();
     private readonly ToolStripButton _btnOpen = new("Open Folder...");
@@ -23,10 +26,10 @@ public sealed class MainForm : Form
     private readonly ToolStripButton _btnExtractSelected = new("Extract Selected...");
     private readonly ToolStripButton _btnExtractAll = new("Extract All...");
     private readonly ToolStripButton _btnReimportSelected = new("Reimport Selected...");
-    private readonly ToolStripButton _btnFormat = new();
+    private readonly ToolStripButton _btnDiffuseAtlas = new("Texture Atlas");
     private readonly ToolStripButton _btnCombineParts = new("Combine Parts");
     private readonly ToolStripDropDownButton _gameSelector = new();
-    private readonly ToolStripButton _btnReload = new("Reload");
+    private readonly Button _btnReload = new() { Text = "Reload" };
     private readonly ToolStripButton _btnPan = new("Pan");
     private readonly ToolStripButton _btnPose = new("Pose");
     private readonly ToolStripDropDownButton _btnView = new("View");
@@ -38,9 +41,11 @@ public sealed class MainForm : Form
     private readonly ToolStripMenuItem _miPolygons = new("Polygons");
     private readonly ToolStripMenuItem _miSkeleton = new("Skeleton");
     private readonly ToolStripButton _btnCheckUpdates = new("Check for Updates");
+    private readonly ToolStripButton _btnSettings = new("Settings");
     private readonly SplitContainer _split = new();
     private readonly TreeView _tree = new();
     private readonly TextBox _searchText = new();
+    private readonly System.Windows.Forms.Timer _searchDebounceTimer = new();
     private readonly MeshPreviewControl _preview = new();
     private readonly StatusStrip _statusStrip = new();
     private readonly ToolStripStatusLabel _statusLabel = new();
@@ -69,7 +74,12 @@ public sealed class MainForm : Form
         Font = new Font("Segoe UI", 9F);
         Icon = Icon.ExtractAssociatedIcon(Application.ExecutablePath) ?? Icon;
 
-        GameConfig.Current = AppPreferences.LoadGameConfig();
+        var preferences = AppPreferences.Load();
+        GameConfig.Current = GameConfig.FromId(preferences.LastGame);
+        _exportFormat = preferences.OutputFormat.Equals("GltfSeparate", StringComparison.OrdinalIgnoreCase)
+            ? ExportFormat.GltfSeparate
+            : ExportFormat.Glb;
+        _btnDiffuseAtlas.Checked = preferences.TextureAtlas;
 
         BuildUi();
         WireEvents();
@@ -78,6 +88,7 @@ public sealed class MainForm : Form
 
         // Quietly check GitHub for a newer release once the window is up. It only notifies when an
         // update exists and never installs anything by itself; failures (offline, etc.) are ignored.
+        Shown += (_, _) => EnsureTreePanelWidth();
         Shown += async (_, _) => await CheckForUpdatesAsync(silent: true);
     }
 
@@ -92,13 +103,11 @@ public sealed class MainForm : Form
             _btnExtractSelected,
             _btnExtractAll,
             _btnReimportSelected,
-            _btnFormat,
-            _btnCombineParts,
             new ToolStripSeparator(),
             _gameSelector,
             new ToolStripSeparator(),
-            _btnReload,
             _btnCredits,
+            _btnSettings,
             _btnCheckUpdates
         });
 
@@ -112,6 +121,8 @@ public sealed class MainForm : Form
         _viewerOverlay.ForeColor = SystemColors.ControlText;
         _viewerOverlay.Items.AddRange(new ToolStripItem[]
         {
+            _btnCombineParts,
+            new ToolStripSeparator(),
             _btnPan,
             _btnPose,
             new ToolStripSeparator(),
@@ -121,17 +132,20 @@ public sealed class MainForm : Form
         _btnView.DropDownDirection = ToolStripDropDownDirection.AboveLeft;
 
         _btnCredits.Alignment = ToolStripItemAlignment.Right;
+        _btnSettings.Alignment = ToolStripItemAlignment.Right;
         _btnCheckUpdates.Alignment = ToolStripItemAlignment.Right;
         _btnCheckUpdates.ToolTipText = "Checks GitHub for a newer version and shows the changelog. Nothing is installed automatically.";
+        _btnSettings.ToolTipText = "Open tool settings.";
         _btnPan.CheckOnClick = true;
         _btnPose.CheckOnClick = true;
+        _btnDiffuseAtlas.CheckOnClick = true;
         _btnCombineParts.CheckOnClick = true;
         _btnOpenArchive.ToolTipText = "Opens one or more Telltale .ttarch/.ttarch2 game containers and extracts their .d3dmesh, .d3dtx and .skl files automatically, then loads them. Select a mesh + texture archive together to see models with their textures.";
         _btnPan.ToolTipText = "Left-drag pans. Middle/Shift+drag also pans; mouse wheel zooms; F centers.";
         _btnPose.ToolTipText = "Select and drag skeleton joints; weighted mesh vertices deform in the preview.";
-        _btnFormat.ToolTipText = "Toggles the extraction output format between GLB (single file) and GLTF + files.";
         _btnCombineParts.ToolTipText = "Shows detected combined model parts. Turn off to list every .d3dmesh separately.";
         _btnReimportSelected.ToolTipText = "Reimports an edited GLB/GLTF into the selected .d3dmesh, or splits a selected Combined model back into its original parts.";
+        _btnDiffuseAtlas.ToolTipText = "When reimporting, packs diffuse/baseColor textures into one texture atlas and rewrites UV0 so the target can keep a single original diffuse texture name.";
         _btnCredits.ToolTipText = "Show credits.";
 
         _miFaces.Checked = true;
@@ -157,7 +171,13 @@ public sealed class MainForm : Form
         UpdateGameSelector();
 
         _split.Dock = DockStyle.Fill;
-        _split.SplitterDistance = 330;
+        // Give the splitter a width wide enough to hold both min sizes before applying
+        // the panel constraints; otherwise setting Panel2MinSize re-validates SplitterDistance
+        // against the default 150px width and throws (Width - Panel2MinSize < Panel1MinSize).
+        _split.Size = new Size(PreferredTreePanelWidth + 420 + 200, 700);
+        _split.Panel1MinSize = MinimumTreePanelWidth;
+        _split.Panel2MinSize = 420;
+        _split.SplitterDistance = PreferredTreePanelWidth;
         _split.FixedPanel = FixedPanel.Panel1;
         _split.Panel1.Padding = new Padding(8, 8, 4, 8);
         _split.Panel2.Padding = new Padding(4, 8, 8, 8);
@@ -200,17 +220,24 @@ public sealed class MainForm : Form
         var panel = new TableLayoutPanel
         {
             Dock = DockStyle.Fill,
-            ColumnCount = 1,
+            ColumnCount = 2,
             RowCount = 2,
         };
+        panel.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100));
+        panel.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 76));
         panel.RowStyles.Add(new RowStyle(SizeType.AutoSize));
         panel.RowStyles.Add(new RowStyle(SizeType.Percent, 100));
 
         _searchText.Dock = DockStyle.Top;
         _searchText.PlaceholderText = "Search files...";
-        _searchText.Margin = new Padding(0, 0, 0, 6);
+        _searchText.Margin = new Padding(0, 0, 6, 6);
+        _btnReload.Dock = DockStyle.Top;
+        _btnReload.Height = _searchText.PreferredHeight;
+        _btnReload.Margin = new Padding(0, 0, 0, 6);
         panel.Controls.Add(_searchText, 0, 0);
+        panel.Controls.Add(_btnReload, 1, 0);
         panel.Controls.Add(_tree, 0, 1);
+        panel.SetColumnSpan(_tree, 2);
         return panel;
     }
 
@@ -230,12 +257,12 @@ public sealed class MainForm : Form
         _btnReimportSelected.Click += async (_, _) => await ReimportSelectedAsync();
         _btnCredits.Click += (_, _) => ShowCreditsDialog();
         _btnCheckUpdates.Click += async (_, _) => await CheckForUpdatesAsync(silent: false);
-        _btnFormat.Click += (_, _) =>
+        _btnSettings.Click += (_, _) => ShowSettingsDialog();
+        _btnCombineParts.CheckedChanged += (_, _) =>
         {
-            _exportFormat = _exportFormat == ExportFormat.Glb ? ExportFormat.GltfSeparate : ExportFormat.Glb;
-            UpdateFormatButton();
+            _searchDebounceTimer.Stop();
+            RebuildAssetTree();
         };
-        _btnCombineParts.CheckedChanged += (_, _) => RebuildAssetTree();
         _btnPan.CheckedChanged += (_, _) => _preview.SetPanMode(_btnPan.Checked);
         _btnPose.CheckedChanged += (_, _) =>
         {
@@ -276,46 +303,167 @@ public sealed class MainForm : Form
         _tree.NodeMouseClick += (_, e) => HandleTreeNodeMouseClick(e);
         _tree.AfterExpand += (_, _) => AutoFitTreeWidth();
         _tree.AfterCollapse += (_, _) => AutoFitTreeWidth();
-        _searchText.TextChanged += (_, _) => RebuildAssetTree();
+        _searchDebounceTimer.Interval = 220;
+        _searchDebounceTimer.Tick += (_, _) =>
+        {
+            _searchDebounceTimer.Stop();
+            RebuildAssetTree();
+        };
+        _searchText.TextChanged += (_, _) => ScheduleSearchRebuild();
 
         AllowDrop = true;
-        DragEnter += (_, e) =>
-        {
-            if (e.Data?.GetDataPresent(DataFormats.FileDrop) == true)
-            {
-                e.Effect = DragDropEffects.Copy;
-            }
-        };
-        DragDrop += async (_, e) =>
-        {
-            var paths = (string[]?)e.Data?.GetData(DataFormats.FileDrop);
-            if (paths is null || paths.Length == 0)
-            {
-                return;
-            }
+        _preview.AllowDrop = true;
+        DragEnter += (_, e) => HandleDragEnter(e);
+        DragOver += (_, e) => HandleDragEnter(e);
+        DragLeave += (_, _) => _preview.SetDragDropHintVisible(false);
+        DragDrop += async (_, e) => await HandleDragDropAsync(e);
+        _preview.DragEnter += (_, e) => HandleDragEnter(e);
+        _preview.DragOver += (_, e) => HandleDragEnter(e);
+        _preview.DragLeave += (_, _) => _preview.SetDragDropHintVisible(false);
+        _preview.DragDrop += async (_, e) => await HandleDragDropAsync(e);
+    }
 
-            if (!EnsureGameSelectedForOpen())
-            {
-                return;
-            }
+    private void HandleDragEnter(DragEventArgs e)
+    {
+        if (e.Data?.GetDataPresent(DataFormats.FileDrop) == true)
+        {
+            e.Effect = DragDropEffects.Copy;
+            _preview.SetDragDropHintVisible(true);
+        }
+        else
+        {
+            e.Effect = DragDropEffects.None;
+            _preview.SetDragDropHintVisible(false);
+        }
+    }
 
-            var path = paths[0];
-            if (Directory.Exists(path))
-            {
-                await LoadFolderAsync(path);
-            }
-            else if (File.Exists(path))
-            {
-                await LoadFolderAsync(Path.GetDirectoryName(path)!);
-            }
-        };
+    private async Task HandleDragDropAsync(DragEventArgs e)
+    {
+        _preview.SetDragDropHintVisible(false);
+
+        var paths = (string[]?)e.Data?.GetData(DataFormats.FileDrop);
+        if (paths is null || paths.Length == 0)
+        {
+            return;
+        }
+
+        if (!EnsureGameSelectedForOpen())
+        {
+            return;
+        }
+
+        var path = paths[0];
+        if (Directory.Exists(path))
+        {
+            await LoadFolderAsync(path);
+        }
+        else if (File.Exists(path))
+        {
+            await LoadFolderAsync(Path.GetDirectoryName(path)!);
+        }
     }
 
     private void UpdateFormatButton()
     {
-        _btnFormat.Text = _exportFormat == ExportFormat.Glb
-            ? "Output: GLB (single file)"
-            : "Output: GLTF + files";
+        var format = _exportFormat == ExportFormat.Glb ? "GLB" : "GLTF";
+        var atlas = _btnDiffuseAtlas.Checked ? "on" : "off";
+        _btnSettings.ToolTipText = $"Open tool settings. Output Format: {format}; Texture Atlas: {atlas}.";
+    }
+
+    private void ShowSettingsDialog()
+    {
+        using var dialog = new Form
+        {
+            Text = "Settings",
+            StartPosition = FormStartPosition.CenterParent,
+            FormBorderStyle = FormBorderStyle.FixedDialog,
+            MinimizeBox = false,
+            MaximizeBox = false,
+            ShowIcon = false,
+            ShowInTaskbar = false,
+            ClientSize = new Size(360, 156),
+            Font = Font,
+        };
+
+        var layout = new TableLayoutPanel
+        {
+            Dock = DockStyle.Fill,
+            Padding = new Padding(12),
+            ColumnCount = 2,
+            RowCount = 3,
+        };
+        layout.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 110));
+        layout.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100));
+        layout.RowStyles.Add(new RowStyle(SizeType.AutoSize));
+        layout.RowStyles.Add(new RowStyle(SizeType.AutoSize));
+        layout.RowStyles.Add(new RowStyle(SizeType.Percent, 100));
+
+        var formatLabel = new Label
+        {
+            Text = "Output Format:",
+            AutoSize = true,
+            Anchor = AnchorStyles.Left,
+            Margin = new Padding(0, 3, 8, 10),
+        };
+        var formatCombo = new ComboBox
+        {
+            DropDownStyle = ComboBoxStyle.DropDownList,
+            Anchor = AnchorStyles.Left | AnchorStyles.Right,
+            Margin = new Padding(0, 0, 0, 10),
+        };
+        formatCombo.Items.Add("GLB");
+        formatCombo.Items.Add("GLTF");
+        formatCombo.SelectedIndex = _exportFormat == ExportFormat.Glb ? 0 : 1;
+
+        var atlasLabel = new Label
+        {
+            Text = "Texture Atlas:",
+            AutoSize = true,
+            Anchor = AnchorStyles.Left,
+            Margin = new Padding(0, 3, 8, 10),
+        };
+        var atlasCheck = new CheckBox
+        {
+            Text = "Generate texture atlas",
+            Checked = _btnDiffuseAtlas.Checked,
+            AutoSize = true,
+            Anchor = AnchorStyles.Left,
+            Margin = new Padding(0, 0, 0, 10),
+        };
+
+        var buttons = new FlowLayoutPanel
+        {
+            FlowDirection = FlowDirection.RightToLeft,
+            Dock = DockStyle.Bottom,
+            AutoSize = true,
+            Margin = new Padding(0),
+        };
+        var ok = new Button { Text = "OK", DialogResult = DialogResult.OK, Width = 86 };
+        var cancel = new Button { Text = "Cancel", DialogResult = DialogResult.Cancel, Width = 86 };
+        buttons.Controls.Add(ok);
+        buttons.Controls.Add(cancel);
+
+        layout.Controls.Add(formatLabel, 0, 0);
+        layout.Controls.Add(formatCombo, 1, 0);
+        layout.Controls.Add(atlasLabel, 0, 1);
+        layout.Controls.Add(atlasCheck, 1, 1);
+        layout.Controls.Add(buttons, 0, 2);
+        layout.SetColumnSpan(buttons, 2);
+        dialog.Controls.Add(layout);
+        dialog.AcceptButton = ok;
+        dialog.CancelButton = cancel;
+
+        if (dialog.ShowDialog(this) != DialogResult.OK)
+        {
+            return;
+        }
+
+        _exportFormat = formatCombo.SelectedIndex == 0 ? ExportFormat.Glb : ExportFormat.GltfSeparate;
+        _btnDiffuseAtlas.Checked = atlasCheck.Checked;
+        UpdateFormatButton();
+        AppPreferences.SaveToolSettings(
+            _exportFormat == ExportFormat.Glb ? "Glb" : "GltfSeparate",
+            _btnDiffuseAtlas.Checked);
     }
 
     private void SetReadyState()
@@ -542,14 +690,14 @@ public sealed class MainForm : Form
         _assets = assets;
         _assetGroups = groups;
         _searchText.Enabled = true;
+        _searchDebounceTimer.Stop();
         if (_searchText.TextLength > 0)
         {
             _searchText.Clear();
+            _searchDebounceTimer.Stop();
         }
-        else
-        {
-            RebuildAssetTree();
-        }
+
+        RebuildAssetTree();
 
         _btnReload.Enabled = true;
         _btnExtractAll.Enabled = _assets.Count > 0;
@@ -641,6 +789,17 @@ public sealed class MainForm : Form
         }
 
         AutoFitTreeWidth();
+    }
+
+    private void ScheduleSearchRebuild()
+    {
+        if (_rootFolder is null)
+        {
+            return;
+        }
+
+        _searchDebounceTimer.Stop();
+        _searchDebounceTimer.Start();
     }
 
     private static IEnumerable<ModelAsset> FilterLooseAssetsForTree(
@@ -1061,9 +1220,9 @@ public sealed class MainForm : Form
                 ? new Dictionary<int, MaterialTextureSet>()
                 : TextureResolver.ResolveForMesh(_rootFolder, asset.MeshPath, mesh);
             _preview.SetScene(mesh, skeleton, textures);
-            _statusLabel.Text = Path.GetFileName(asset.MeshPath);
+            _statusLabel.Text = "Preview ready.";
             var textureCount = textures.Values.Sum(set => set.Count);
-            _detailLabel.Text = $"vertices: {mesh.VertexCount} | polygons: {mesh.FaceCount} | bones: {skeleton?.Bones.Count ?? 0} | textures: {textureCount}";
+            _detailLabel.Text = $"textures: {textureCount}";
         }
         catch (Exception ex)
         {
@@ -1084,10 +1243,9 @@ public sealed class MainForm : Form
 
             var previewAsset = ExtractionService.BuildPreviewAsset(group, _rootFolder);
             _preview.SetScene(previewAsset.Mesh, previewAsset.Skeleton, previewAsset.Textures);
-            _statusLabel.Text = group.ToString();
+            _statusLabel.Text = "Combined preview ready.";
             var textureCount = previewAsset.Textures.Values.Sum(set => set.Count);
-            _detailLabel.Text =
-                $"parts: {group.Assets.Count} | submeshes: {previewAsset.Mesh.Submeshes.Count} | vertices: {previewAsset.Mesh.VertexCount} | polygons: {previewAsset.Mesh.FaceCount} | bones: {previewAsset.Skeleton?.Bones.Count ?? 0} | textures: {textureCount}";
+            _detailLabel.Text = $"parts: {group.Assets.Count} | textures: {textureCount}";
         }
         catch (Exception ex)
         {
@@ -1262,7 +1420,8 @@ public sealed class MainForm : Form
 
         await RunWithUiLockAsync(async () =>
         {
-            var result = await Task.Run(() => ReimportSingleAsset(asset, input, output));
+            var useDiffuseAtlas = _btnDiffuseAtlas.Checked;
+            var result = await Task.Run(() => ReimportSingleAsset(asset, input, output, useDiffuseAtlas));
             return result;
         });
 
@@ -1292,13 +1451,14 @@ public sealed class MainForm : Form
         }
 
         var root = _rootFolder;
+        var useDiffuseAtlas = _btnDiffuseAtlas.Checked;
 
         await RunWithUiLockAsync(async () =>
         {
             var result = await Task.Run(() =>
             {
                 var model = GltfReader.Load(input);
-                return ReimportCombinedGroup(group, root, model, input, outputFolder);
+                return ReimportCombinedGroup(group, root, model, input, outputFolder, useDiffuseAtlas);
             });
 
             return result;
@@ -1310,13 +1470,16 @@ public sealed class MainForm : Form
         }
     }
 
-    private static string ReimportSingleAsset(ModelAsset asset, string input, string output)
+    private static string ReimportSingleAsset(ModelAsset asset, string input, string output, bool useDiffuseAtlas)
     {
         var gameConfig = GameConfig.Current;
         var layout = D3DMeshLayout.Build(File.ReadAllBytes(asset.MeshPath));
         var model = GltfModelPreprocessor.ApplyGameReinsertRules(GltfReader.Load(input), gameConfig);
+        var atlas = ApplyDiffuseAtlasIfRequested(model, useDiffuseAtlas);
+        model = atlas.Model;
         var skeleton = LoadSkeletonOrNull(asset.SkeletonPath, layout.Version);
-        var textures = ReinsertTextureService.WriteAllReferencedTextures(model, asset.MeshPath, output, gameConfig);
+        var textureOptions = BuildReinsertTextureOptions(useDiffuseAtlas);
+        var textures = ReinsertTextureService.WriteAllReferencedTextures(model, asset.MeshPath, output, gameConfig, textureOptions);
         var bytes = MeshReinserter.ReinsertGeometry(layout, model, textures, skeleton, gameConfig);
         File.WriteAllBytes(output, bytes);
 
@@ -1329,8 +1492,9 @@ public sealed class MainForm : Form
             ? $"\nTextures: {textureCount} .d3dtx file(s) written next to the output mesh."
             : "";
         var skeletonLine = RebuildSkeletonForReimport(asset, model, output);
+        var atlasLine = BuildAtlasStatusLine(atlas);
 
-        return $"Reimported: {Path.GetFileName(asset.MeshPath)}\nInput: {input}\nOutput: {output}{textureLine}{skeletonLine}\n{status}";
+        return $"Reimported: {Path.GetFileName(asset.MeshPath)}\nInput: {input}\nOutput: {output}{textureLine}{atlasLine}{skeletonLine}\n{status}";
     }
 
     // Rebuilds the .skl next to the reimported mesh from the skeleton inside the GLB. When the model
@@ -1376,7 +1540,8 @@ public sealed class MainForm : Form
         string inputRoot,
         GltfModel combinedModel,
         string input,
-        string outputFolder)
+        string outputFolder,
+        bool useDiffuseAtlas)
     {
         Directory.CreateDirectory(outputFolder);
         var gameConfig = GameConfig.Current;
@@ -1405,11 +1570,15 @@ public sealed class MainForm : Form
             {
                 Primitives = primitives,
                 Joints = combinedModel.Joints,
+                Skeleton = combinedModel.Skeleton,
             };
+            var atlas = ApplyDiffuseAtlasIfRequested(partModel, useDiffuseAtlas);
+            partModel = atlas.Model;
             var output = Path.Combine(outputFolder, Path.GetFileName(asset.MeshPath));
             var layout = D3DMeshLayout.Build(File.ReadAllBytes(asset.MeshPath));
             var skeleton = LoadSkeletonOrNull(asset.SkeletonPath, layout.Version);
-            var textures = ReinsertTextureService.WriteAllReferencedTextures(partModel, asset.MeshPath, output, gameConfig);
+            var textureOptions = BuildReinsertTextureOptions(useDiffuseAtlas);
+            var textures = ReinsertTextureService.WriteAllReferencedTextures(partModel, asset.MeshPath, output, gameConfig, textureOptions);
             var bytes = MeshReinserter.ReinsertGeometry(layout, partModel, textures, skeleton, gameConfig);
             File.WriteAllBytes(output, bytes);
 
@@ -1417,7 +1586,10 @@ public sealed class MainForm : Form
             var status = check.TailOffset + check.TailLength == bytes.Length ? "verified" : "layout warning";
             totalTextures += textures.WrittenNames.Count;
             ok++;
-            lines.Add($"OK {Path.GetFileName(asset.MeshPath)}: {primitives.Count} primitive(s), {textures.WrittenNames.Count} texture(s), {status}.");
+            var atlasSummary = atlas.Applied
+                ? $", atlas {atlas.SourceTextureCount}->{atlas.AtlasWidth}x{atlas.AtlasHeight}"
+                : "";
+            lines.Add($"OK {Path.GetFileName(asset.MeshPath)}: {primitives.Count} primitive(s), {textures.WrittenNames.Count} texture(s){atlasSummary}, {status}.");
         }
 
         if (ok == 0)
@@ -1434,6 +1606,43 @@ public sealed class MainForm : Form
             $"Output folder: {outputFolder}",
             $"Parts OK: {ok}/{group.Assets.Count}, skipped: {skipped}, textures written: {totalTextures}",
             string.Join(Environment.NewLine, lines));
+    }
+
+    private static ReinsertTextureOptions BuildReinsertTextureOptions(bool useDiffuseAtlas)
+        => useDiffuseAtlas
+            ? new ReinsertTextureOptions
+            {
+                IncludedSlots = new HashSet<string>(StringComparer.OrdinalIgnoreCase)
+                {
+                    "diffuse",
+                    "detail_diffuse",
+                    "tex7",
+                    "tex8",
+                },
+            }
+            : ReinsertTextureOptions.Default;
+
+    private static GltfDiffuseAtlasResult ApplyDiffuseAtlasIfRequested(GltfModel model, bool useDiffuseAtlas)
+        => useDiffuseAtlas
+            ? GltfDiffuseAtlasPacker.Pack(model)
+            : new GltfDiffuseAtlasResult(model, Applied: false, SourceTextureCount: 0, AtlasWidth: 0, AtlasHeight: 0, AtlasName: "", Warnings: []);
+
+    private static string BuildAtlasStatusLine(GltfDiffuseAtlasResult atlas)
+    {
+        if (!atlas.Applied)
+        {
+            return atlas.SourceTextureCount == 1
+                ? "\nTexture Atlas: skipped because the model already uses one diffuse texture."
+                : "";
+        }
+
+        var line = $"\nTexture Atlas: packed {atlas.SourceTextureCount} texture region(s) into one {atlas.AtlasWidth}x{atlas.AtlasHeight} atlas.";
+        if (atlas.Warnings.Count > 0)
+        {
+            line += "\nAtlas warnings: " + string.Join(" ", atlas.Warnings.Take(3));
+        }
+
+        return line;
     }
 
     private static Dictionary<string, List<GltfPrimitive>> BuildCombinedSourcePrimitiveMap(GltfModel model, string inputRoot)
@@ -1573,6 +1782,11 @@ public sealed class MainForm : Form
 
     private void SetBusy(bool busy)
     {
+        if (busy)
+        {
+            _searchDebounceTimer.Stop();
+        }
+
         _isBusy = busy;
         UseWaitCursor = busy;
         _btnOpen.Enabled = !busy;
@@ -1583,13 +1797,13 @@ public sealed class MainForm : Form
         _btnReimportSelected.Enabled = !busy &&
                                       (GetSingleSelectedAssetForReimport() is not null ||
                                        GetSingleSelectedGroupForReimport() is not null);
-        _btnFormat.Enabled = !busy;
         _btnCombineParts.Enabled = !busy && _rootFolder is not null && _assets.Count > 0;
         _btnPan.Enabled = !busy;
         _btnPose.Enabled = !busy;
         _btnView.Enabled = !busy;
         _btnCredits.Enabled = !busy;
         _btnCheckUpdates.Enabled = !busy;
+        _btnSettings.Enabled = !busy;
         _gameSelector.Enabled = !busy;
         _searchText.Enabled = !busy && _rootFolder is not null;
 
@@ -1893,6 +2107,7 @@ public sealed class MainForm : Form
     {
         if (_tree.Nodes.Count == 0)
         {
+            EnsureTreePanelWidth();
             return;
         }
 
@@ -1903,10 +2118,25 @@ public sealed class MainForm : Form
         }
 
         var target = max + SystemInformation.VerticalScrollBarWidth + 42;
-        var minWidth = 220;
+        var minWidth = MinimumTreePanelWidth;
         var maxWidth = Math.Max(minWidth, ClientSize.Width / 2);
         target = Math.Clamp(target, minWidth, maxWidth);
         if (Math.Abs(_split.SplitterDistance - target) > 4)
+        {
+            _split.SplitterDistance = target;
+        }
+    }
+
+    private void EnsureTreePanelWidth()
+    {
+        if (_split.Width <= 0)
+        {
+            return;
+        }
+
+        var maxWidth = Math.Max(MinimumTreePanelWidth, _split.Width - _split.Panel2MinSize - _split.SplitterWidth);
+        var target = Math.Clamp(PreferredTreePanelWidth, MinimumTreePanelWidth, maxWidth);
+        if (_split.SplitterDistance < target)
         {
             _split.SplitterDistance = target;
         }

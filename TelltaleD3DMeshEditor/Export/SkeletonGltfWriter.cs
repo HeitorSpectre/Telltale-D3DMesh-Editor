@@ -16,18 +16,24 @@ public static class SkeletonGltfWriter
         for (var i = 0; i < skeleton.Bones.Count; i++)
         {
             var bone = skeleton.Bones[i];
+            var extras = new Dictionary<string, object>
+            {
+                ["hash"] = $"0x{bone.Hash:X16}",
+                ["parentHash"] = $"0x{bone.ParentHash:X16}",
+                ["translationBits"] = GltfCommon.FloatBits(bone.X, bone.Y, bone.Z),
+                ["rotationBits"] = GltfCommon.FloatBits(bone.Qx, bone.Qy, bone.Qz, bone.Qw),
+            };
+            if (bone.HasRichSkeletonData)
+            {
+                extras["telltaleSkeleton"] = BuildRichSkeletonExtras(bone);
+            }
+
             var node = new Dictionary<string, object>
             {
                 ["name"] = bone.Name,
                 ["translation"] = new[] { bone.X, bone.Y, bone.Z },
                 ["rotation"] = new[] { bone.Qx, bone.Qy, bone.Qz, bone.Qw },
-                ["extras"] = new Dictionary<string, object>
-                {
-                    ["hash"] = $"0x{bone.Hash:X16}",
-                    ["parentHash"] = $"0x{bone.ParentHash:X16}",
-                    ["translationBits"] = GltfCommon.FloatBits(bone.X, bone.Y, bone.Z),
-                    ["rotationBits"] = GltfCommon.FloatBits(bone.Qx, bone.Qy, bone.Qz, bone.Qw),
-                },
+                ["extras"] = extras,
             };
 
             var children = skeleton.Bones
@@ -66,4 +72,25 @@ public static class SkeletonGltfWriter
 
         File.WriteAllBytes(path, JsonSerializer.SerializeToUtf8Bytes(gltf, GltfCommon.JsonOptions));
     }
+
+    private static Dictionary<string, object> BuildRichSkeletonExtras(BoneData bone)
+        => new()
+        {
+            ["mirrorHash"] = $"0x{bone.MirrorBoneHash:X16}",
+            ["mirrorBoneIndex"] = bone.MirrorBoneIndex,
+            ["boneLength"] = bone.BoneLength,
+            ["boneDir"] = new[] { bone.BoneDir.X, bone.BoneDir.Y, bone.BoneDir.Z },
+            ["boneRotationAdjustment"] = new[]
+            {
+                bone.BoneRotationAdjustment.X,
+                bone.BoneRotationAdjustment.Y,
+                bone.BoneRotationAdjustment.Z,
+                bone.BoneRotationAdjustment.W,
+            },
+            ["restTranslation"] = new[] { bone.RestTranslation.X, bone.RestTranslation.Y, bone.RestTranslation.Z },
+            ["restRotation"] = new[] { bone.RestRotation.X, bone.RestRotation.Y, bone.RestRotation.Z, bone.RestRotation.W },
+            ["globalTranslationScale"] = new[] { bone.GlobalTranslationScale.X, bone.GlobalTranslationScale.Y, bone.GlobalTranslationScale.Z },
+            ["localTranslationScale"] = new[] { bone.LocalTranslationScale.X, bone.LocalTranslationScale.Y, bone.LocalTranslationScale.Z },
+            ["animTranslationScale"] = new[] { bone.AnimTranslationScale.X, bone.AnimTranslationScale.Y, bone.AnimTranslationScale.Z },
+        };
 }

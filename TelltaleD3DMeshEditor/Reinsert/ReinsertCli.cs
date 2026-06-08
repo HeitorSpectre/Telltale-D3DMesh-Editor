@@ -6,6 +6,7 @@ using System.Numerics;
 using TelltaleD3DMeshEditor.Core;
 using TelltaleD3DMeshEditor.Formats.Mesh;
 using TelltaleD3DMeshEditor.Formats.Skeleton;
+using TelltaleD3DMeshEditor.Formats.Texture;
 
 namespace TelltaleD3DMeshEditor.Reinsert;
 
@@ -67,13 +68,25 @@ public static class ReinsertCli
                 Require(args, 2);
                 DumpSkeleton(args[1], args.Length >= 3 ? args[2] : null);
                 return;
+            case "--dump-skeleton-summary":
+                Require(args, 2);
+                DumpSkeletonSummary(args[1], HasFlag(args, "--recursive"));
+                return;
+            case "--dump-texture-formats":
+                Require(args, 2);
+                DumpTextureFormats(args[1], HasFlag(args, "--recursive"));
+                return;
+            case "--rewrite-texture":
+                Require(args, 4);
+                RewriteTexture(args[1], args[2], args[3]);
+                return;
             case "--reinsert-prop":
                 Require(args, 4);
-                ReinsertProp(args[1], args[2], args[3]);
+                ReinsertProp(args[1], args[2], args[3], HasFlag(args, "--diffuse-atlas"));
                 return;
             case "--reinsert-character":
                 Require(args, 5);
-                ReinsertCharacter(args[1], args[2], args[3], args[4]);
+                ReinsertCharacter(args[1], args[2], args[3], args[4], HasFlag(args, "--diffuse-atlas"));
                 return;
             case "--reinsert-character-texture-tests":
                 Require(args, 5);
@@ -87,12 +100,18 @@ public static class ReinsertCli
                 Console.WriteLine("  --dump-materials <mesh.d3dmesh>");
                 Console.WriteLine("  --dump-bone-palettes <mesh.d3dmesh> [skeleton.skl]");
                 Console.WriteLine("  --dump-skeleton <model.glb|model.gltf|skeleton.skl> [mesh.d3dmesh]");
-                Console.WriteLine("  --reinsert-prop <template.d3dmesh> <model.glb|model.gltf> <output.d3dmesh>");
-                Console.WriteLine("  --reinsert-character <template.d3dmesh> <template.skl> <model.glb|model.gltf> <output.d3dmesh>");
+                Console.WriteLine("  --dump-skeleton-summary <folder> [--recursive]");
+                Console.WriteLine("  --dump-texture-formats <texture.d3dtx|texture.dds|folder> [--recursive]");
+                Console.WriteLine("  --rewrite-texture <template.d3dtx> <image.png> <output.d3dtx>");
+                Console.WriteLine("  --reinsert-prop <template.d3dmesh> <model.glb|model.gltf> <output.d3dmesh> [--diffuse-atlas]");
+                Console.WriteLine("  --reinsert-character <template.d3dmesh> <template.skl> <model.glb|model.gltf> <output.d3dmesh> [--diffuse-atlas]");
                 Console.WriteLine("  --reinsert-character-texture-tests <template.d3dmesh> <template.skl> <model.glb|model.gltf> <output-folder>");
                 return;
         }
     }
+
+    private static bool HasFlag(string[] args, string flag)
+        => args.Any(arg => arg.Equals(flag, StringComparison.OrdinalIgnoreCase));
 
     private static void Require(string[] args, int count)
     {
@@ -320,11 +339,16 @@ public static class ReinsertCli
 
         Console.WriteLine($"file       : {Path.GetFileName(input)}");
         Console.WriteLine($"bones      : {skeleton.Bones.Count}");
+        Console.WriteLine($"rich data  : {skeleton.Bones.Count(bone => bone.HasRichSkeletonData)} bone(s)");
+        Console.WriteLine($"late parent: {CountLateParentBones(skeleton)} bone(s)");
         PrintBounds("bounds     ", GetSkeletonBounds(skeleton));
         for (var i = 0; i < Math.Min(16, skeleton.Bones.Count); i++)
         {
             var bone = skeleton.Bones[i];
-            Console.WriteLine($"  {i,3}: parent={bone.ParentIndex,3} pos=({F(bone.X)}, {F(bone.Y)}, {F(bone.Z)}) {bone.Name}");
+            var rich = bone.HasRichSkeletonData
+                ? $" len={F(bone.BoneLength)} dir=({F(bone.BoneDir.X)}, {F(bone.BoneDir.Y)}, {F(bone.BoneDir.Z)}) rest=({F(bone.RestTranslation.X)}, {F(bone.RestTranslation.Y)}, {F(bone.RestTranslation.Z)})"
+                : "";
+            Console.WriteLine($"  {i,3}: parent={bone.ParentIndex,3} pos=({F(bone.X)}, {F(bone.Y)}, {F(bone.Z)}){rich} {bone.Name}");
         }
         if (skeleton.Bones.Count > 16)
         {
@@ -332,14 +356,184 @@ public static class ReinsertCli
         }
     }
 
-    private static void ReinsertProp(string template, string glb, string output)
+    private static int CountLateParentBones(SkeletonData skeleton)
+    {
+        var count = 0;
+        for (var i = 0; i < skeleton.Bones.Count; i++)
+        {
+            var parent = skeleton.Bones[i].ParentIndex;
+            if (parent >= i && parent < skeleton.Bones.Count)
+            {
+                count++;
+            }
+        }
+
+        return count;
+    }
+
+    private static void DumpSkeletonSummary(string input, bool recursive)
+    {
+        if (!Directory.Exists(input))
+        {
+            throw new DirectoryNotFoundException(input);
+        }
+
+        var files = Directory.EnumerateFiles(
+                input,
+                "*.skl",
+                recursive ? SearchOption.AllDirectories : SearchOption.TopDirectoryOnly)
+            .OrderBy(path => path, StringComparer.OrdinalIgnoreCase)
+            .ToArray();
+        var rows = new List<(string Path, SkeletonData Skeleton, int RichBones, int LateParents)>();
+        var failures = new List<(string Path, string Error)>();
+        foreach (var file in files)
+        {
+            try
+            {
+                var skeleton = SkeletonLoader.Load(file, 13);
+                rows.Add((file, skeleton, skeleton.Bones.Count(bone => bone.HasRichSkeletonData), CountLateParentBones(skeleton)));
+            }
+            catch (Exception ex)
+            {
+                failures.Add((file, ex.Message));
+            }
+        }
+
+        Console.WriteLine($"skeletons  : {rows.Count} readable, {failures.Count} failed");
+        if (rows.Count > 0)
+        {
+            Console.WriteLine($"bones      : min={rows.Min(row => row.Skeleton.Bones.Count)} max={rows.Max(row => row.Skeleton.Bones.Count)} avg={rows.Average(row => row.Skeleton.Bones.Count):0.##}");
+            Console.WriteLine($"rich files : {rows.Count(row => row.RichBones > 0)}");
+            Console.WriteLine($"late parent: {rows.Count(row => row.LateParents > 0)} file(s)");
+            foreach (var row in rows.OrderByDescending(row => row.Skeleton.Bones.Count).Take(8))
+            {
+                Console.WriteLine($"  {Path.GetFileName(row.Path),-48} bones={row.Skeleton.Bones.Count,3} rich={row.RichBones,3} lateParent={row.LateParents,2}");
+            }
+        }
+
+        foreach (var row in rows.Where(row => row.LateParents > 0).Take(8))
+        {
+            Console.WriteLine($"  late-parent: {Path.GetFileName(row.Path)} ({row.LateParents})");
+        }
+
+        foreach (var failure in failures.Take(12))
+        {
+            Console.WriteLine($"  failed: {Path.GetFileName(failure.Path)} - {failure.Error}");
+        }
+    }
+
+    private static void DumpTextureFormats(string input, bool recursive)
+    {
+        string[] files;
+        if (File.Exists(input))
+        {
+            files = [Path.GetFullPath(input)];
+        }
+        else if (Directory.Exists(input))
+        {
+            files = Directory.EnumerateFiles(
+                    input,
+                    "*.*",
+                    recursive ? SearchOption.AllDirectories : SearchOption.TopDirectoryOnly)
+                .Where(path =>
+                    Path.GetExtension(path).Equals(".d3dtx", StringComparison.OrdinalIgnoreCase) ||
+                    Path.GetExtension(path).Equals(".dds", StringComparison.OrdinalIgnoreCase))
+                .OrderBy(path => path, StringComparer.OrdinalIgnoreCase)
+                .ToArray();
+        }
+        else
+        {
+            throw new FileNotFoundException("Texture input not found.", input);
+        }
+
+        var rows = new List<(string Path, TextureFormatInfo Info)>();
+        var failures = new List<(string Path, string Error)>();
+        foreach (var file in files)
+        {
+            try
+            {
+                rows.Add((file, TextureLoader.InspectFormat(file)));
+            }
+            catch (Exception ex)
+            {
+                failures.Add((file, ex.Message));
+            }
+        }
+
+        Console.WriteLine($"textures   : {rows.Count} readable, {failures.Count} failed");
+        if (rows.Count == 1)
+        {
+            var row = rows[0];
+            PrintTextureFormatRow(row.Path, row.Info);
+        }
+        else
+        {
+            foreach (var group in rows
+                         .GroupBy(row => (row.Info.Container, row.Info.FormatName, row.Info.FormatValue, row.Info.GammaName))
+                         .OrderByDescending(group => group.Count())
+                         .ThenBy(group => group.Key.FormatName, StringComparer.OrdinalIgnoreCase))
+            {
+                var examples = string.Join(", ", group.Take(5).Select(row => Path.GetFileName(row.Path)));
+                Console.WriteLine(
+                    $"  {group.Key.FormatName,-12} 0x{group.Key.FormatValue:X2} gamma={group.Key.GammaName,-7} count={group.Count(),4} examples={examples}");
+            }
+        }
+
+        foreach (var failure in failures.Take(12))
+        {
+            Console.WriteLine($"  failed: {Path.GetFileName(failure.Path)} - {failure.Error}");
+        }
+    }
+
+    private static void PrintTextureFormatRow(string path, TextureFormatInfo info)
+    {
+        Console.WriteLine($"file       : {Path.GetFileName(path)}");
+        Console.WriteLine($"container  : {info.Container}");
+        Console.WriteLine($"format     : {info.FormatName} (0x{info.FormatValue:X})");
+        Console.WriteLine($"gamma      : {info.GammaName}");
+        Console.WriteLine($"size       : {info.Width}x{info.Height}");
+        Console.WriteLine($"regions    : {info.RegionCount}");
+        foreach (var region in info.Regions.Take(16))
+        {
+            Console.WriteLine(
+                $"  face={region.FaceIndex} mip={region.MipIndex} count={region.MipCount} size={region.Width}x{region.Height} bytes={region.DataSize} pitch={region.Pitch} slice={region.SlicePitch}");
+        }
+    }
+
+    private static void RewriteTexture(string templateTexture, string imagePath, string outputTexture)
+    {
+        Directory.CreateDirectory(Path.GetDirectoryName(Path.GetFullPath(outputTexture)) ?? ".");
+        var image = new GltfImage
+        {
+            Name = Path.GetFileNameWithoutExtension(outputTexture),
+            Data = File.ReadAllBytes(imagePath),
+            MimeType = MimeTypeFromExtension(imagePath),
+        };
+        D3dtxWriter.WriteFromImageBytes(File.ReadAllBytes(templateTexture), image, outputTexture);
+        var info = TextureLoader.InspectFormat(outputTexture);
+        Console.WriteLine($"rewritten  : {outputTexture}");
+        PrintTextureFormatRow(outputTexture, info);
+    }
+
+    private static string MimeTypeFromExtension(string path)
+        => Path.GetExtension(path).ToLowerInvariant() switch
+        {
+            ".jpg" or ".jpeg" => "image/jpeg",
+            ".bmp" => "image/bmp",
+            _ => "image/png",
+        };
+
+    private static void ReinsertProp(string template, string glb, string output, bool useDiffuseAtlas)
     {
         Directory.CreateDirectory(Path.GetDirectoryName(Path.GetFullPath(output)) ?? ".");
 
         var layout = D3DMeshLayout.Build(File.ReadAllBytes(template));
         var gameConfig = InferGameConfig(template);
         var model = GltfModelPreprocessor.ApplyGameReinsertRules(GltfReader.Load(glb), gameConfig);
-        var textures = ReinsertTextureService.WriteAllReferencedTextures(model, template, output, gameConfig);
+        var atlas = ApplyDiffuseAtlasIfRequested(model, useDiffuseAtlas);
+        model = atlas.Model;
+        var textureOptions = BuildReinsertTextureOptions(useDiffuseAtlas);
+        var textures = ReinsertTextureService.WriteAllReferencedTextures(model, template, output, gameConfig, textureOptions);
         var result = MeshReinserter.ReinsertGeometry(layout, model, textures, gameConfig: gameConfig);
         File.WriteAllBytes(output, result);
 
@@ -357,13 +551,14 @@ public static class ReinsertCli
         {
             Console.WriteLine($"  {name}.d3dtx");
         }
+        PrintAtlasSummary(atlas);
 
         Console.WriteLine(check.TailOffset + check.TailLength == result.Length
             ? "layout      : closes at EOF"
             : "layout      : warning, does not close at EOF");
     }
 
-    private static void ReinsertCharacter(string template, string skeletonPath, string glb, string output)
+    private static void ReinsertCharacter(string template, string skeletonPath, string glb, string output, bool useDiffuseAtlas)
     {
         Directory.CreateDirectory(Path.GetDirectoryName(Path.GetFullPath(output)) ?? ".");
 
@@ -371,7 +566,10 @@ public static class ReinsertCli
         var skeleton = SkeletonLoader.Load(skeletonPath, layout.Version);
         var gameConfig = InferGameConfig(template);
         var model = GltfModelPreprocessor.ApplyGameReinsertRules(GltfReader.Load(glb), gameConfig);
-        var textures = ReinsertTextureService.WriteAllReferencedTextures(model, template, output, gameConfig);
+        var atlas = ApplyDiffuseAtlasIfRequested(model, useDiffuseAtlas);
+        model = atlas.Model;
+        var textureOptions = BuildReinsertTextureOptions(useDiffuseAtlas);
+        var textures = ReinsertTextureService.WriteAllReferencedTextures(model, template, output, gameConfig, textureOptions);
         var result = MeshReinserter.ReinsertGeometry(layout, model, textures, skeleton, gameConfig);
         File.WriteAllBytes(output, result);
 
@@ -404,10 +602,49 @@ public static class ReinsertCli
         {
             Console.WriteLine($"  {name}.d3dtx");
         }
+        PrintAtlasSummary(atlas);
 
         Console.WriteLine(check.TailOffset + check.TailLength == result.Length
             ? "layout      : closes at EOF"
             : "layout      : warning, does not close at EOF");
+    }
+
+    private static ReinsertTextureOptions BuildReinsertTextureOptions(bool useDiffuseAtlas)
+        => useDiffuseAtlas
+            ? new ReinsertTextureOptions
+            {
+                IncludedSlots = new HashSet<string>(StringComparer.OrdinalIgnoreCase)
+                {
+                    "diffuse",
+                    "detail_diffuse",
+                    "tex7",
+                    "tex8",
+                },
+            }
+            : ReinsertTextureOptions.Default;
+
+    private static GltfDiffuseAtlasResult ApplyDiffuseAtlasIfRequested(GltfModel model, bool useDiffuseAtlas)
+        => useDiffuseAtlas
+            ? GltfDiffuseAtlasPacker.Pack(model)
+            : new GltfDiffuseAtlasResult(model, Applied: false, SourceTextureCount: 0, AtlasWidth: 0, AtlasHeight: 0, AtlasName: "", Warnings: []);
+
+    private static void PrintAtlasSummary(GltfDiffuseAtlasResult atlas)
+    {
+        if (!atlas.Applied)
+        {
+            if (atlas.SourceTextureCount == 1)
+            {
+                Console.WriteLine("diffuseAtlas: skipped because the model already uses one diffuse texture");
+            }
+
+            return;
+        }
+
+        Console.WriteLine($"diffuseAtlas: packed {atlas.SourceTextureCount} texture region(s) into one {atlas.AtlasWidth}x{atlas.AtlasHeight} atlas");
+        foreach (var warning in atlas.Warnings.Take(3))
+        {
+            Console.WriteLine("diffuseAtlas warning: " + warning);
+        }
     }
 
     private sealed record TextureTestVariant(

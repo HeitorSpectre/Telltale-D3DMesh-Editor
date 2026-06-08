@@ -19,6 +19,31 @@ public static class TextureLoader
     private static readonly object ToolkitGate = new();
     private static Workspace? _minecraftStoryModeWorkspace;
 
+    public static TextureFormatInfo InspectFormat(string path)
+    {
+        var ext = Path.GetExtension(path);
+        if (ext.Equals(".d3dtx", StringComparison.OrdinalIgnoreCase))
+        {
+            return InspectD3dtx(path);
+        }
+
+        if (ext.Equals(".dds", StringComparison.OrdinalIgnoreCase))
+        {
+            return InspectDds(path);
+        }
+
+        using var source = new Bitmap(path);
+        return new TextureFormatInfo(
+            Path.GetExtension(path).TrimStart('.').ToUpperInvariant(),
+            source.PixelFormat.ToString(),
+            0,
+            "Unknown",
+            source.Width,
+            source.Height,
+            1,
+            [new TextureRegionInfo(0, 0, 1, 0, 0, 0, source.Width, source.Height)]);
+    }
+
     public static TextureImage Load(string path)
     {
         var ext = Path.GetExtension(path);
@@ -98,6 +123,34 @@ public static class TextureLoader
         return new TextureImage(width, height, pixels, path);
     }
 
+    private static TextureFormatInfo InspectDds(string path)
+    {
+        var data = File.ReadAllBytes(path);
+        if (data.Length < 128 ||
+            data[0] != 'D' || data[1] != 'D' || data[2] != 'S' || data[3] != ' ')
+        {
+            throw new InvalidDataException("Invalid DDS texture.");
+        }
+
+        var height = ReadInt(data, 12);
+        var width = ReadInt(data, 16);
+        var fourCc = ReadFourCc(data, 84).TrimEnd('\0');
+        var rgbBitCount = ReadInt(data, 88);
+        var pixelFlags = ReadUInt(data, 80);
+        var formatName = !string.IsNullOrWhiteSpace(fourCc)
+            ? fourCc
+            : ((pixelFlags & 0x2) != 0 ? $"A{rgbBitCount}" : $"RGB{rgbBitCount}");
+        return new TextureFormatInfo(
+            "DDS",
+            formatName,
+            0,
+            "Unknown",
+            width,
+            height,
+            1,
+            [new TextureRegionInfo(0, 0, 1, data.Length - 128, 0, data.Length - 128, width, height)]);
+    }
+
     private static TextureImage LoadD3dtx(string path)
     {
         if (GameConfig.Current.Id == GameId.MinecraftStoryMode &&
@@ -129,6 +182,26 @@ public static class TextureLoader
             _ => throw new NotSupportedException($"Unsupported D3DTX texture format 0x{info.Format:X}."),
         };
         return new TextureImage(info.Width, info.Height, pixels, path);
+    }
+
+    private static TextureFormatInfo InspectD3dtx(string path)
+    {
+        if (TryInspectModernD3dtx(path) is { } modernInfo)
+        {
+            return modernInfo;
+        }
+
+        var data = File.ReadAllBytes(path);
+        var info = ReadD3dtxInfo(data);
+        return new TextureFormatInfo(
+            "D3DTX",
+            D3dtxFormatName(info.Format),
+            info.Format,
+            "Unknown",
+            info.Width,
+            info.Height,
+            1,
+            [new TextureRegionInfo(0, 0, info.MipCount, info.PixelLength, 0, info.PixelLength, info.Width, info.Height)]);
     }
 
     private static TextureImage? TryLoadModernD3dtx(string path)
@@ -170,6 +243,51 @@ public static class TextureLoader
             };
 
             return pixels is null ? null : new TextureImage(width, height, pixels, path);
+        }
+        catch
+        {
+            return null;
+        }
+    }
+
+    private static TextureFormatInfo? TryInspectModernD3dtx(string path)
+    {
+        try
+        {
+            var workspace = GetMinecraftStoryModeWorkspace();
+            var texture = Toolkit.Instance.Deserialize<T3Texture>(path, workspace);
+            if (texture is null || texture.RegionHeaders.Count == 0)
+            {
+                return null;
+            }
+
+            var regions = texture.RegionHeaders
+                .Select(region =>
+                {
+                    var dimensions = GetModernRegionDimensions(texture, region);
+                    return new TextureRegionInfo(
+                        region.FaceIndex,
+                        region.MipIndex,
+                        Math.Max(region.MipCount, 1),
+                        region.RegionData.Length > 0 ? region.RegionData.Length : region.DataSize,
+                        region.Pitch,
+                        region.SlicePitch,
+                        dimensions.Width,
+                        dimensions.Height);
+                })
+                .OrderBy(region => region.FaceIndex)
+                .ThenBy(region => region.MipIndex)
+                .ToList();
+
+            return new TextureFormatInfo(
+                "D3DTX",
+                texture.SurfaceFormat.ToString(),
+                unchecked((uint)texture.SurfaceFormat),
+                texture.SurfaceGamma.ToString(),
+                Math.Max(1, checked((int)texture.Width)),
+                Math.Max(1, checked((int)texture.Height)),
+                texture.RegionHeaders.Count,
+                regions);
         }
         catch
         {
@@ -589,6 +707,22 @@ public static class TextureLoader
     private static int MipSizeOf(int width, int height, int blockBytes) =>
         Math.Max(1, (width + 3) / 4) * Math.Max(1, (height + 3) / 4) * blockBytes;
 
+    private static string D3dtxFormatName(uint format) => format switch
+    {
+        0x0 => "ARGB8",
+        0xA => "RGBA8",
+        0x10 => "A8",
+        0x40 => "BC1/DXT1",
+        0x41 => "BC2/DXT3",
+        0x42 => "BC3/DXT5",
+        0x43 => "BC4",
+        0x44 => "BC5",
+        0x45 => "CTX1",
+        0x46 => "BC6",
+        0x47 => "BC7",
+        _ => $"0x{format:X}",
+    };
+
     private readonly record struct D3dtxInfo(
         int Width,
         int Height,
@@ -598,3 +732,23 @@ public static class TextureLoader
         int PixelStart,
         int PixelLength);
 }
+
+public sealed record TextureFormatInfo(
+    string Container,
+    string FormatName,
+    uint FormatValue,
+    string GammaName,
+    int Width,
+    int Height,
+    int RegionCount,
+    IReadOnlyList<TextureRegionInfo> Regions);
+
+public sealed record TextureRegionInfo(
+    int FaceIndex,
+    int MipIndex,
+    int MipCount,
+    int DataSize,
+    int Pitch,
+    int SlicePitch,
+    int Width,
+    int Height);

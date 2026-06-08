@@ -2,9 +2,11 @@ using System.Text.Json;
 
 namespace TelltaleD3DMeshEditor.Core;
 
-public sealed class AppPreferences
+public sealed record AppPreferences
 {
     public GameId LastGame { get; init; } = GameId.Generic;
+    public string OutputFormat { get; init; } = "Glb";
+    public bool TextureAtlas { get; init; }
 
     private static readonly JsonSerializerOptions JsonOptions = new()
     {
@@ -16,30 +18,50 @@ public sealed class AppPreferences
         "TelltaleD3DMeshEditor",
         "settings.json");
 
-    public static GameConfig LoadGameConfig()
+    public static AppPreferences Load()
     {
         try
         {
             if (!File.Exists(PreferencesPath))
             {
-                return GameConfig.Generic;
+                return new AppPreferences();
             }
 
             var prefs = JsonSerializer.Deserialize<AppPreferences>(File.ReadAllText(PreferencesPath), JsonOptions);
-            return prefs is null ? GameConfig.Generic : GameConfig.FromId(prefs.LastGame);
+            return prefs ?? new AppPreferences();
         }
         catch
         {
-            return GameConfig.Generic;
+            return new AppPreferences();
         }
+    }
+
+    public static GameConfig LoadGameConfig()
+    {
+        return GameConfig.FromId(Load().LastGame);
     }
 
     public static void SaveGameConfig(GameConfig game)
     {
+        var current = Load();
+        Save(current with { LastGame = game.Id });
+    }
+
+    public static void SaveToolSettings(string outputFormat, bool textureAtlas)
+    {
+        var current = Load();
+        Save(current with
+        {
+            OutputFormat = outputFormat,
+            TextureAtlas = textureAtlas,
+        });
+    }
+
+    private static void Save(AppPreferences prefs)
+    {
         try
         {
             Directory.CreateDirectory(Path.GetDirectoryName(PreferencesPath)!);
-            var prefs = new AppPreferences { LastGame = game.Id };
             File.WriteAllText(PreferencesPath, JsonSerializer.Serialize(prefs, JsonOptions));
         }
         catch
