@@ -2,9 +2,6 @@
 
 ![Version](https://img.shields.io/github/v/release/HeitorSpectre/Telltale-D3DMesh-Editor?style=for-the-badge&label=Version)
 ![Downloads](https://img.shields.io/github/downloads/HeitorSpectre/Telltale-D3DMesh-Editor/total?style=for-the-badge&label=Downloads)
-![Latest Downloads](https://img.shields.io/github/downloads/HeitorSpectre/Telltale-D3DMesh-Editor/latest/total?style=for-the-badge&label=Latest%20Downloads)
-![Stars](https://img.shields.io/github/stars/HeitorSpectre/Telltale-D3DMesh-Editor?style=for-the-badge&label=Stars)
-
 ![Engine](https://img.shields.io/badge/Engine-Telltale%20Tool-darkgreen?style=for-the-badge)
 ![Status](https://img.shields.io/badge/Status-Active-success?style=for-the-badge)
 
