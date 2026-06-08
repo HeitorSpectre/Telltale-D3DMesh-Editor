@@ -2044,6 +2044,7 @@ public sealed class MainForm : Form
         AddCreditLink(links, "Gamma_02", "https://github.com/gamma-02");
         AddCreditLink(links, "David Matos", "https://github.com/frostbone25");
         AddCreditLink(links, "RandomTBush", "https://github.com/RandomTBush");
+        AddCreditLink(links, "Aabii / Arizzble", "https://github.com/Arizzble");
 
         var paragraph = new TextBox
         {
