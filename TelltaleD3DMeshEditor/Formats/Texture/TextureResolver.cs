@@ -407,7 +407,8 @@ public static class TextureResolver
                 return TextureRole.Shadow;
             }
 
-            if (lower.EndsWith("_000") &&
+            if (GameConfig.Current.TreatAdvObj000TexturesAsBake &&
+                lower.EndsWith("_000") &&
                 (lower.StartsWith("obj_", StringComparison.OrdinalIgnoreCase) ||
                  lower.StartsWith("adv_", StringComparison.OrdinalIgnoreCase)))
             {

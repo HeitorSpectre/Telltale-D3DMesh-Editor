@@ -2,6 +2,10 @@ using System.Buffers.Binary;
 using System.Drawing;
 using System.Drawing.Imaging;
 using System.Runtime.InteropServices;
+using TelltaleD3DMeshEditor.Core;
+using TelltaleToolKit;
+using TelltaleToolKit.T3Types.Textures;
+using TelltaleToolKit.T3Types.Textures.T3Types;
 
 namespace TelltaleD3DMeshEditor.Formats.Texture;
 
@@ -12,6 +16,9 @@ namespace TelltaleD3DMeshEditor.Formats.Texture;
 // Fully offline, with no external dependencies.
 public static class TextureLoader
 {
+    private static readonly object ToolkitGate = new();
+    private static Workspace? _minecraftStoryModeWorkspace;
+
     public static TextureImage Load(string path)
     {
         var ext = Path.GetExtension(path);
@@ -93,6 +100,12 @@ public static class TextureLoader
 
     private static TextureImage LoadD3dtx(string path)
     {
+        if (GameConfig.Current.Id == GameId.MinecraftStoryMode &&
+            TryLoadModernD3dtx(path) is { } modernTexture)
+        {
+            return modernTexture;
+        }
+
         var data = File.ReadAllBytes(path);
         var info = ReadD3dtxInfo(data);
         // 0x10 = A8 (1 byte/pixel, uncompressed); the others are block-compressed (DXT).
@@ -116,6 +129,129 @@ public static class TextureLoader
             _ => throw new NotSupportedException($"Unsupported D3DTX texture format 0x{info.Format:X}."),
         };
         return new TextureImage(info.Width, info.Height, pixels, path);
+    }
+
+    private static TextureImage? TryLoadModernD3dtx(string path)
+    {
+        try
+        {
+            var workspace = GetMinecraftStoryModeWorkspace();
+            var texture = Toolkit.Instance.Deserialize<T3Texture>(path, workspace);
+            if (texture is null || texture.RegionHeaders.Count == 0)
+            {
+                return null;
+            }
+
+            var region = texture.RegionHeaders
+                .Where(region => region.FaceIndex == 0 && region.RegionData.Length > 0)
+                .Select(region => new
+                {
+                    Header = region,
+                    Dimensions = GetModernRegionDimensions(texture, region),
+                })
+                .OrderByDescending(region => region.Dimensions.Width * region.Dimensions.Height)
+                .ThenByDescending(region => region.Header.DataSize)
+                .FirstOrDefault();
+            if (region is null || region.Header.RegionData.Length == 0)
+            {
+                return null;
+            }
+
+            var width = region.Dimensions.Width;
+            var height = region.Dimensions.Height;
+            var pixels = texture.SurfaceFormat switch
+            {
+                T3SurfaceFormat.ARGB8 => DecodeBgra32(region.Header.RegionData, 0, width, height),
+                T3SurfaceFormat.RGBA8 => DecodeRgba32(region.Header.RegionData, 0, width, height),
+                T3SurfaceFormat.BC1 => DecodeDxt1(region.Header.RegionData, 0, width, height),
+                T3SurfaceFormat.BC3 => DecodeDxt5(region.Header.RegionData, 0, width, height),
+                T3SurfaceFormat.A8 => DecodeA8Mask(region.Header.RegionData, 0, width, height),
+                _ => null,
+            };
+
+            return pixels is null ? null : new TextureImage(width, height, pixels, path);
+        }
+        catch
+        {
+            return null;
+        }
+    }
+
+    private static (int Width, int Height) GetModernRegionDimensions(T3Texture texture, T3Texture.RegionStreamHeader region)
+    {
+        var baseWidth = Math.Max(1, checked((int)texture.Width));
+        var baseHeight = Math.Max(1, checked((int)texture.Height));
+        var mipIndex = Math.Max(0, region.MipIndex);
+        var expectedWidth = Math.Max(1, baseWidth >> mipIndex);
+        var expectedHeight = Math.Max(1, baseHeight >> mipIndex);
+        var dataSize = region.RegionData.Length > 0 ? region.RegionData.Length : region.DataSize;
+        if (ModernTextureDataSize(texture.SurfaceFormat, expectedWidth, expectedHeight) == dataSize)
+        {
+            return (expectedWidth, expectedHeight);
+        }
+
+        var mipCount = Math.Max(region.MipCount, 1);
+        var maxMip = Math.Max(16, mipIndex + mipCount + 1);
+        for (var mip = 0; mip <= maxMip; mip++)
+        {
+            var width = Math.Max(1, baseWidth >> mip);
+            var height = Math.Max(1, baseHeight >> mip);
+            if (ModernTextureDataSize(texture.SurfaceFormat, width, height) == dataSize)
+            {
+                return (width, height);
+            }
+
+            if (width == 1 && height == 1)
+            {
+                break;
+            }
+        }
+
+        return (expectedWidth, expectedHeight);
+    }
+
+    private static int ModernTextureDataSize(T3SurfaceFormat format, int width, int height)
+    {
+        return format switch
+        {
+            T3SurfaceFormat.ARGB8 or T3SurfaceFormat.RGBA8 => checked(width * height * 4),
+            T3SurfaceFormat.A8 => checked(width * height),
+            T3SurfaceFormat.BC1 => checked(Math.Max(1, (width + 3) / 4) * Math.Max(1, (height + 3) / 4) * 8),
+            T3SurfaceFormat.BC3 => checked(Math.Max(1, (width + 3) / 4) * Math.Max(1, (height + 3) / 4) * 16),
+            _ => -1,
+        };
+    }
+
+    private static Workspace GetMinecraftStoryModeWorkspace()
+    {
+        lock (ToolkitGate)
+        {
+            if (!Toolkit.IsInitialized)
+            {
+                Toolkit.Initialize(new Toolkit.Configuration
+                {
+                    DataFolder = ResolveToolkitDataFolder(),
+                });
+            }
+
+            return _minecraftStoryModeWorkspace ??=
+                Toolkit.Instance.CreateWorkspace("texture::Minecraft Story Mode", "Minecraft: Story Mode");
+        }
+    }
+
+    private static string ResolveToolkitDataFolder()
+    {
+        var assemblyFolder = Path.GetDirectoryName(typeof(TextureLoader).Assembly.Location);
+        if (!string.IsNullOrWhiteSpace(assemblyFolder))
+        {
+            var assemblyData = Path.Combine(assemblyFolder, "ttk-data");
+            if (Directory.Exists(assemblyData))
+            {
+                return assemblyData;
+            }
+        }
+
+        return Path.Combine(AppContext.BaseDirectory, "ttk-data");
     }
 
     private static D3dtxInfo ReadD3dtxInfo(byte[] data)
@@ -306,6 +442,28 @@ public static class TextureLoader
             var b = ExtractMaskedByte(value, blueMask);
             var a = alphaMask == 0 ? 255 : ExtractMaskedByte(value, alphaMask);
             pixels[i] = Color.FromArgb(a, r, g, b).ToArgb();
+        }
+        return pixels;
+    }
+
+    private static int[] DecodeBgra32(byte[] data, int offset, int width, int height)
+    {
+        var pixels = new int[width * height];
+        for (var i = 0; i < pixels.Length && offset + i * 4 + 3 < data.Length; i++)
+        {
+            var p = offset + i * 4;
+            pixels[i] = Color.FromArgb(data[p + 3], data[p + 2], data[p + 1], data[p]).ToArgb();
+        }
+        return pixels;
+    }
+
+    private static int[] DecodeRgba32(byte[] data, int offset, int width, int height)
+    {
+        var pixels = new int[width * height];
+        for (var i = 0; i < pixels.Length && offset + i * 4 + 3 < data.Length; i++)
+        {
+            var p = offset + i * 4;
+            pixels[i] = Color.FromArgb(data[p + 3], data[p], data[p + 1], data[p + 2]).ToArgb();
         }
         return pixels;
     }

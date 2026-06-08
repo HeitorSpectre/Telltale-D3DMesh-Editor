@@ -1,6 +1,7 @@
 using TelltaleToolKit;
 using TelltaleToolKit.Meta.Serialization;
 using TelltaleD3DMeshEditor.Core;
+using TelltaleToolKit.T3Types;
 using TtkSkeleton = TelltaleToolKit.T3Types.Skeletons.Skeleton;
 
 namespace TelltaleD3DMeshEditor.Formats.Skeleton;
@@ -51,17 +52,16 @@ public static class SkeletonRebuilder
         for (var i = 0; i < skeleton.Entries.Count; i++)
         {
             var entry = skeleton.Entries[i];
-            var hash = entry.JointNameS?.Crc64 ?? 0;
-            var parentHash = entry.ParentNameS?.Crc64 ?? 0;
+            var hash = entry.JointName?.Crc64 ?? 0;
+            var parentHash = entry.ParentName?.Crc64 ?? 0;
             if (parentHash == 0 &&
                 entry.ParentIndex >= 0 &&
                 entry.ParentIndex < skeleton.Entries.Count)
             {
-                parentHash = skeleton.Entries[entry.ParentIndex].JointNameS?.Crc64 ?? 0;
+                parentHash = skeleton.Entries[entry.ParentIndex].JointName?.Crc64 ?? 0;
             }
 
-            var name = entry.JointNameS?.DebugString ??
-                       (string.IsNullOrWhiteSpace(entry.JointName) ? null : entry.JointName) ??
+            var name = GetSymbolName(entry.JointName) ??
                        BoneHashDatabase.Resolve(hash) ??
                        $"bone_{hash:X16}";
             result.Bones.Add(new BoneData(
@@ -87,8 +87,8 @@ public static class SkeletonRebuilder
         return skeleton.Entries
             .Select((entry, index) => new SkeletonEntryDiagnostics(
                 index,
-                entry.JointNameS?.DebugString ?? (string.IsNullOrWhiteSpace(entry.JointName) ? null : entry.JointName) ?? BoneHashDatabase.Resolve(entry.JointNameS?.Crc64 ?? 0) ?? $"bone_{entry.JointNameS?.Crc64 ?? 0:X16}",
-                entry.JointNameS?.Crc64 ?? 0,
+                GetSymbolName(entry.JointName) ?? BoneHashDatabase.Resolve(entry.JointName?.Crc64 ?? 0) ?? $"bone_{entry.JointName?.Crc64 ?? 0:X16}",
+                entry.JointName?.Crc64 ?? 0,
                 entry.ParentIndex,
                 entry.LocalPosition,
                 entry.LocalQuat,
@@ -101,6 +101,16 @@ public static class SkeletonRebuilder
                 entry.LocalTranslationScale,
                 entry.AnimTranslationScale))
             .ToList();
+    }
+
+    private static string? GetSymbolName(Symbol? symbol)
+    {
+        if (symbol is null || string.IsNullOrWhiteSpace(symbol.DebugString))
+        {
+            return null;
+        }
+
+        return symbol.DebugString;
     }
 
     // Builds a brand-new .skl from a foreign joint set that has no original to merge with (e.g. a rig

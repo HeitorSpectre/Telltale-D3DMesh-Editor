@@ -14,12 +14,6 @@ namespace TelltaleD3DMeshEditor.Reinsert;
 // the last original submesh; if it has fewer, the table shrinks to the GLB count.
 public static class MeshReinserter
 {
-    private static readonly string[] TextureSlotsV13 =
-    [
-        "diffuse", "bake", "bump", "environment", "detail_diffuse", "detail_bump",
-        "specular", "tex8", "gradient", "tex10", "shadow"
-    ];
-
     public static byte[] ReinsertGeometry(
         D3DMeshLayout layout,
         GltfModel model,
@@ -152,21 +146,9 @@ public static class MeshReinserter
         }
 
         var mults = ChooseUvMults(layout, verts);
-        var encoder = new VertexEncoder(layout.Attributes, mults);
 
-        // Vertex buffer.
-        var vertexBytes = new byte[verts.Count * encoder.Stride];
-        for (var i = 0; i < verts.Count; i++)
-        {
-            encoder.Write(vertexBytes.AsSpan(i * encoder.Stride, encoder.Stride), verts[i]);
-        }
-
-        // Face buffer (global 0-based uint16).
-        var faceBytes = new byte[faceIndices.Count * 2];
-        for (var i = 0; i < faceIndices.Count; i++)
-        {
-            BinaryPrimitives.WriteUInt16LittleEndian(faceBytes.AsSpan(i * 2, 2), (ushort)faceIndices[i]);
-        }
+        // Face buffer (global 0-based uint16; MCSM can store the indices big-endian).
+        var faceBytes = BuildFaceBytes(layout, faceIndices);
 
         var patches = new List<RegionPatch>
         {
@@ -174,12 +156,17 @@ public static class MeshReinserter
             new(layout.SubmeshBlockSizeFieldOffset, 4, U32(layout.SubmeshBlockSize + BuildSubmeshTableSizeDelta(layout, subInfo.Length, preparedTextureSlotsByPrimitive))),
             new(layout.SubmeshCountFieldOffset, 4, U32(subInfo.Length)),
             new(layout.SubmeshTableOffset, layout.SubmeshTableLength, BuildSubmeshTable(layout, subInfo, preparedTextureSlotsByPrimitive, gameConfig ?? GameConfig.Current)),
-            new(layout.UvScalesOffset, 32, BuildUvScaleBytes(mults)),
+            new(layout.UvScalesOffset, layout.UvScalesLength, BuildUvScaleBytes(layout, mults)),
             new(layout.FaceCountFieldOffset, 4, U32(faceIndices.Count)),
             new(layout.FaceDataOffset, layout.FaceDataLength, faceBytes),
-            new(layout.VertexCountFieldOffset, 4, U32(verts.Count)),
-            new(layout.VertexDataOffset, layout.VertexDataLength, vertexBytes),
         };
+
+        foreach (var vertexBuffer in layout.VertexBuffers)
+        {
+            var vertexBytes = BuildVertexBufferBytes(layout, vertexBuffer, verts, mults);
+            patches.Add(new RegionPatch(vertexBuffer.CountFieldOffset, 4, U32(verts.Count)));
+            patches.Add(new RegionPatch(vertexBuffer.DataOffset, vertexBuffer.DataLength, vertexBytes));
+        }
 
         var texturePlansBySlot = BuildTextureGroupPlans(layout, preparedTextureSlotsByPrimitive);
         if (texturePlansBySlot.Count > 0)
@@ -308,9 +295,10 @@ public static class MeshReinserter
                 continue;
             }
 
-            if (usage.AllHashes.Count <= MaxPaletteBonesForByteEncoding)
+            var maxPaletteBones = MaxPaletteBonesForLayout(layout);
+            if (usage.AllHashes.Count <= maxPaletteBones)
             {
-                var customPalette = AddCustomBonePalette(layout, usage.AllHashes);
+                var customPalette = AddCustomBonePalette(layout, usage.AllHashes, maxPaletteBones);
                 result.Add(new PreparedPrimitive(primitive, textureSlots, customPalette));
                 continue;
             }
@@ -445,17 +433,17 @@ public static class MeshReinserter
         return hashes.All(paletteHashes.Contains);
     }
 
-    private static int AddCustomBonePalette(D3DMeshLayout layout, IEnumerable<ulong> hashes)
+    private static int AddCustomBonePalette(D3DMeshLayout layout, IEnumerable<ulong> hashes, int maxPaletteBones)
     {
         var palette = hashes
             .Where(hash => hash != 0)
             .Distinct()
             .OrderBy(hash => hash)
             .ToArray();
-        if (palette.Length > MaxPaletteBonesForByteEncoding)
+        if (palette.Length > maxPaletteBones)
         {
             throw new InvalidOperationException(
-                $"The GLB skin uses {palette.Length} weighted bones in one primitive; this template can encode at most {MaxPaletteBonesForByteEncoding} bones per palette.");
+                $"The GLB skin uses {palette.Length} weighted bones in one primitive; this template can encode at most {maxPaletteBones} bones per palette.");
         }
 
         var paletteSet = palette.ToHashSet();
@@ -470,6 +458,28 @@ public static class MeshReinserter
 
         layout.BonePalettes.Add(palette);
         return layout.BonePalettes.Count - 1;
+    }
+
+    private static int MaxPaletteBonesForLayout(D3DMeshLayout layout)
+    {
+        var maxIndex = MaxPaletteBonesForByteEncoding - 1;
+        foreach (var vertexBuffer in layout.VertexBuffers)
+        {
+            var format = vertexBuffer.Attributes.Bones.Format;
+            if (format == 0 || layout.Version is not (17 or 18))
+            {
+                continue;
+            }
+
+            maxIndex = Math.Min(maxIndex, format switch
+            {
+                3 => 63,
+                8 => 85,
+                _ => maxIndex,
+            });
+        }
+
+        return maxIndex + 1;
     }
 
     private static int? ResolveStaticImportPaletteIndex(D3DMeshLayout layout, SkeletonData? referenceSkeleton)
@@ -490,7 +500,7 @@ public static class MeshReinserter
                 }
             }
 
-            return AddCustomBonePalette(layout, [rootHash]);
+            return AddCustomBonePalette(layout, [rootHash], MaxPaletteBonesForLayout(layout));
         }
 
         for (var i = 0; i < layout.BonePalettes.Count; i++)
@@ -911,17 +921,17 @@ public static class MeshReinserter
 
             if (i >= layout.Submeshes.Count)
             {
-                ClearAccessoryLineTextureSlots(bytes, template);
-            }
+            ClearAccessoryLineTextureSlots(layout, bytes, template);
+        }
 
-            ClearStaleTemplateTextureSlots(gameConfig, bytes, template, textureSlotsByPrimitive, i);
-            ClearSlotsRewrittenByGltf(bytes, template, textureSlotsByPrimitive, i, rewrittenTextureSlots);
+            ClearStaleTemplateTextureSlots(layout, gameConfig, bytes, template, textureSlotsByPrimitive, i);
+            ClearSlotsRewrittenByGltf(layout, bytes, template, textureSlotsByPrimitive, i, rewrittenTextureSlots);
 
             if (textureSlotsByPrimitive is not null && i < textureSlotsByPrimitive.Count)
             {
                 foreach (var (slot, textureName) in textureSlotsByPrimitive[i])
                 {
-                    var slotIndex = Array.FindIndex(TextureSlotsV13, candidate => string.Equals(candidate, slot, StringComparison.OrdinalIgnoreCase));
+                    var slotIndex = Array.FindIndex(layout.TextureSlots, candidate => string.Equals(candidate, slot, StringComparison.OrdinalIgnoreCase));
                     if (slotIndex < 0 ||
                         slotIndex >= template.TextureSlotFieldOffsets.Length ||
                         !textureIndexBySlot.TryGetValue(slot, out var indexByName) ||
@@ -940,6 +950,7 @@ public static class MeshReinserter
     }
 
     private static void ClearStaleTemplateTextureSlots(
+        D3DMeshLayout layout,
         GameConfig gameConfig,
         byte[] bytes,
         SubmeshLayout template,
@@ -949,7 +960,7 @@ public static class MeshReinserter
         if (gameConfig.ClearInheritedBakeOnReimport &&
             !PrimitiveProvidesSlot(textureSlotsByPrimitive, primitiveIndex, "bake"))
         {
-            ClearTextureSlot(bytes, template, "bake");
+            ClearTextureSlot(layout, bytes, template, "bake");
         }
 
         if (!gameConfig.ClearInheritedSecondaryTexturesOnReimport)
@@ -972,12 +983,13 @@ public static class MeshReinserter
         {
             if (!PrimitiveProvidesSlot(textureSlotsByPrimitive, primitiveIndex, slot))
             {
-                ClearTextureSlot(bytes, template, slot);
+                ClearTextureSlot(layout, bytes, template, slot);
             }
         }
     }
 
     private static void ClearSlotsRewrittenByGltf(
+        D3DMeshLayout layout,
         byte[] bytes,
         SubmeshLayout template,
         IReadOnlyList<IReadOnlyDictionary<string, string>>? textureSlotsByPrimitive,
@@ -988,16 +1000,16 @@ public static class MeshReinserter
         {
             if (!PrimitiveProvidesSlot(textureSlotsByPrimitive, primitiveIndex, slot))
             {
-                ClearTextureSlot(bytes, template, slot);
+                ClearTextureSlot(layout, bytes, template, slot);
             }
         }
     }
 
-    private static void ClearAccessoryLineTextureSlots(byte[] bytes, SubmeshLayout template)
+    private static void ClearAccessoryLineTextureSlots(D3DMeshLayout layout, byte[] bytes, SubmeshLayout template)
     {
         foreach (var slot in new[] { "detail_diffuse", "detail_bump", "tex8" })
         {
-            ClearTextureSlot(bytes, template, slot);
+            ClearTextureSlot(layout, bytes, template, slot);
         }
     }
 
@@ -1012,9 +1024,9 @@ public static class MeshReinserter
                textureSlotsByPrimitive[primitiveIndex].ContainsKey(slot);
     }
 
-    private static void ClearTextureSlot(byte[] bytes, SubmeshLayout template, string slot)
+    private static void ClearTextureSlot(D3DMeshLayout layout, byte[] bytes, SubmeshLayout template, string slot)
     {
-        var slotIndex = Array.FindIndex(TextureSlotsV13, candidate => string.Equals(candidate, slot, StringComparison.OrdinalIgnoreCase));
+        var slotIndex = Array.FindIndex(layout.TextureSlots, candidate => string.Equals(candidate, slot, StringComparison.OrdinalIgnoreCase));
         if (slotIndex < 0 || slotIndex >= template.TextureSlotFieldOffsets.Length)
         {
             return;
@@ -1049,7 +1061,7 @@ public static class MeshReinserter
                     continue;
                 }
 
-                var slotIndex = Array.FindIndex(TextureSlotsV13, candidate => string.Equals(candidate, slot, StringComparison.OrdinalIgnoreCase));
+                var slotIndex = Array.FindIndex(layout.TextureSlots, candidate => string.Equals(candidate, slot, StringComparison.OrdinalIgnoreCase));
                 if (slotIndex < 0)
                 {
                     continue;
@@ -1107,7 +1119,7 @@ public static class MeshReinserter
         var countBytes = new byte[4];
         for (var groupIndex = 0; groupIndex < layout.TextureGroups.Count; groupIndex++)
         {
-            var slot = groupIndex < TextureSlotsV13.Length ? TextureSlotsV13[groupIndex] : "";
+            var slot = groupIndex < layout.TextureSlots.Length ? layout.TextureSlots[groupIndex] : "";
             if (!string.IsNullOrWhiteSpace(slot) &&
                 textureNamesBySlot.TryGetValue(slot, out var texturePlans) &&
                 texturePlans.Count > 0)
@@ -1222,12 +1234,47 @@ public static class MeshReinserter
 
     private static bool TemplateProvidesSlot(D3DMeshLayout layout, SubmeshLayout template, string slot)
     {
-        var slotIndex = Array.FindIndex(TextureSlotsV13, candidate => string.Equals(candidate, slot, StringComparison.OrdinalIgnoreCase));
+        var slotIndex = Array.FindIndex(layout.TextureSlots, candidate => string.Equals(candidate, slot, StringComparison.OrdinalIgnoreCase));
         return ReadTemplateTextureSlotIndex(layout, template, slotIndex) >= 0;
     }
 
     private static void WriteU32(byte[] bytes, int offset, int value)
         => BinaryPrimitives.WriteUInt32LittleEndian(bytes.AsSpan(offset, 4), (uint)value);
+
+    private static byte[] BuildFaceBytes(D3DMeshLayout layout, IReadOnlyList<int> faceIndices)
+    {
+        var faceBytes = new byte[faceIndices.Count * 2];
+        for (var i = 0; i < faceIndices.Count; i++)
+        {
+            var span = faceBytes.AsSpan(i * 2, 2);
+            if (layout.FaceIndexFormat == 2)
+            {
+                BinaryPrimitives.WriteUInt16BigEndian(span, (ushort)faceIndices[i]);
+            }
+            else
+            {
+                BinaryPrimitives.WriteUInt16LittleEndian(span, (ushort)faceIndices[i]);
+            }
+        }
+
+        return faceBytes;
+    }
+
+    private static byte[] BuildVertexBufferBytes(
+        D3DMeshLayout layout,
+        VertexBufferLayout vertexBuffer,
+        IReadOnlyList<EncVertex> verts,
+        UvMults mults)
+    {
+        var encoder = new VertexEncoder(vertexBuffer.Attributes, mults, layout.Version, vertexBuffer.VertexStride);
+        var vertexBytes = new byte[checked(verts.Count * encoder.Stride)];
+        for (var i = 0; i < verts.Count; i++)
+        {
+            encoder.Write(vertexBytes.AsSpan(i * encoder.Stride, encoder.Stride), verts[i]);
+        }
+
+        return vertexBytes;
+    }
 
     private static byte[] BuildBoundsBytes(List<EncVertex> verts)
     {
@@ -1249,12 +1296,13 @@ public static class MeshReinserter
         return b;
     }
 
-    // uvScales block: 8 floats in uv1X,uv1Y,uv4X,uv4Y,uv2X,uv2Y,uv3X,uv3Y order.
-    private static byte[] BuildUvScaleBytes(UvMults m)
+    private static byte[] BuildUvScaleBytes(D3DMeshLayout layout, UvMults m)
     {
-        var b = new byte[32];
-        var values = new[] { m.Uv1X, m.Uv1Y, m.Uv4X, m.Uv4Y, m.Uv2X, m.Uv2Y, m.Uv3X, m.Uv3Y };
-        for (var i = 0; i < 8; i++)
+        var b = new byte[layout.UvScalesLength];
+        var values = layout.UvScalesLength >= 40
+            ? BuildV18UvScaleValues(layout, m)
+            : [m.Uv1X, m.Uv1Y, m.Uv4X, m.Uv4Y, m.Uv2X, m.Uv2Y, m.Uv3X, m.Uv3Y];
+        for (var i = 0; i < values.Length; i++)
         {
             BinaryPrimitives.WriteSingleLittleEndian(b.AsSpan(i * 4), values[i]);
         }
@@ -1262,38 +1310,54 @@ public static class MeshReinserter
         return b;
     }
 
+    private static float[] BuildV18UvScaleValues(D3DMeshLayout layout, UvMults m)
+    {
+        var span = layout.Original.AsSpan(layout.UvScalesOffset, layout.UvScalesLength);
+        var extraX = BinaryPrimitives.ReadSingleLittleEndian(span[8..]);
+        var extraY = BinaryPrimitives.ReadSingleLittleEndian(span[12..]);
+        return [m.Uv1X, m.Uv1Y, extraX, extraY, m.Uv2X, m.Uv2Y, m.Uv3X, m.Uv3Y, m.Uv4X, m.Uv4Y];
+    }
+
     private static UvMults ChooseUvMults(D3DMeshLayout layout, List<EncVertex> verts)
     {
         var original = ReadOriginalUvMults(layout);
-        return CanEncodeUvs(layout.Attributes, original, verts)
+        return CanEncodeUvs(layout, original, verts)
             ? original
-            : ComputeUvMults(layout.Attributes, verts);
+            : ComputeUvMults(verts);
     }
 
     private static UvMults ReadOriginalUvMults(D3DMeshLayout layout)
     {
-        var span = layout.Original.AsSpan(layout.UvScalesOffset, 32);
+        var span = layout.Original.AsSpan(layout.UvScalesOffset, layout.UvScalesLength);
         var uv1X = BinaryPrimitives.ReadSingleLittleEndian(span[0..]);
         var uv1Y = BinaryPrimitives.ReadSingleLittleEndian(span[4..]);
-        var uv4X = BinaryPrimitives.ReadSingleLittleEndian(span[8..]);
-        var uv4Y = BinaryPrimitives.ReadSingleLittleEndian(span[12..]);
-        var uv2X = BinaryPrimitives.ReadSingleLittleEndian(span[16..]);
-        var uv2Y = BinaryPrimitives.ReadSingleLittleEndian(span[20..]);
-        var uv3X = BinaryPrimitives.ReadSingleLittleEndian(span[24..]);
-        var uv3Y = BinaryPrimitives.ReadSingleLittleEndian(span[28..]);
+        const int uv2Offset = 16;
+        const int uv3Offset = 24;
+        var uv4Offset = layout.UvScalesLength >= 40 ? 32 : 8;
+        var uv2X = BinaryPrimitives.ReadSingleLittleEndian(span[uv2Offset..]);
+        var uv2Y = BinaryPrimitives.ReadSingleLittleEndian(span[(uv2Offset + 4)..]);
+        var uv3X = BinaryPrimitives.ReadSingleLittleEndian(span[uv3Offset..]);
+        var uv3Y = BinaryPrimitives.ReadSingleLittleEndian(span[(uv3Offset + 4)..]);
+        var uv4X = BinaryPrimitives.ReadSingleLittleEndian(span[uv4Offset..]);
+        var uv4Y = BinaryPrimitives.ReadSingleLittleEndian(span[(uv4Offset + 4)..]);
         return new UvMults(uv1X, uv1Y, uv2X, uv2Y, uv3X, uv3Y, uv4X, uv4Y);
     }
 
-    private static bool CanEncodeUvs(VertexAttrLayout attrs, UvMults mults, IReadOnlyList<EncVertex> verts)
+    private static bool CanEncodeUvs(D3DMeshLayout layout, UvMults mults, IReadOnlyList<EncVertex> verts)
     {
-        foreach (var v in verts)
+        foreach (var vertexBuffer in layout.VertexBuffers)
         {
-            if (!CanEncodeUv(attrs.Uv1.Format, v.U0, v.V0, mults.Uv1X, mults.Uv1Y) ||
-                !CanEncodeUv(attrs.Uv2.Format, v.U1, v.V1, mults.Uv2X, mults.Uv2Y) ||
-                !CanEncodeUv(attrs.Uv3.Format, v.U2, v.V2, mults.Uv3X, mults.Uv3Y) ||
-                !CanEncodeUv(attrs.Uv4.Format, v.U3, v.V3, mults.Uv4X, mults.Uv4Y))
+            var attrs = vertexBuffer.Attributes;
+            foreach (var v in verts)
             {
-                return false;
+                if (!CanEncodeUv(attrs.Uv1.Format, v.U0, v.V0, mults.Uv1X, mults.Uv1Y) ||
+                    !CanEncodeUv(attrs.Uv2.Format, v.U1, v.V1, mults.Uv2X, mults.Uv2Y) ||
+                    !CanEncodeUv(attrs.Uv3.Format, v.U2, v.V2, mults.Uv3X, mults.Uv3Y) ||
+                    !CanEncodeUv(attrs.Uv4.Format, v.U3, v.V3, mults.Uv4X, mults.Uv4Y) ||
+                    !CanEncodeUv(attrs.Uv5.Format, v.U3, v.V3, mults.Uv4X, mults.Uv4Y))
+                {
+                    return false;
+                }
             }
         }
 
@@ -1335,7 +1399,7 @@ public static class MeshReinserter
 
     // Recomputes UV multipliers for the model's real range (only relevant for integer formats;
     // float formats ignore the multiplier). max(|coord|) per channel, with a 1.0 floor.
-    private static UvMults ComputeUvMults(VertexAttrLayout attrs, List<EncVertex> verts)
+    private static UvMults ComputeUvMults(List<EncVertex> verts)
     {
         float u1 = 1, v1 = 1, u2 = 1, v2 = 1, u3 = 1, v3 = 1, u4 = 1, v4 = 1;
         foreach (var v in verts)

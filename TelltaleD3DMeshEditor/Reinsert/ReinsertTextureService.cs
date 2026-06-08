@@ -15,6 +15,11 @@ public static class ReinsertTextureService
         "diffuse", "bake", "bump", "environment", "detail_diffuse", "detail_bump",
         "specular", "tex8", "gradient", "tex10", "shadow"
     };
+    private static readonly HashSet<string> SharedOriginalReplacementTextureNames = new(StringComparer.OrdinalIgnoreCase)
+    {
+        "map_1px_alpha",
+        "color_000",
+    };
 
     public static ReinsertedTextures WriteAllReferencedTextures(
         GltfModel model,
@@ -45,9 +50,13 @@ public static class ReinsertTextureService
         var reservedNames = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
         var writtenNames = new List<string>();
         var primitiveSlots = new List<IReadOnlyDictionary<string, string>>(model.Primitives.Count);
-        var preferredOriginalNamesByImageKey = nameMode == ResolvedTextureNameMode.PreferTemplateNames
+        var useOriginalNameTickets = ShouldUseOriginalNameTickets(model, options, nameMode);
+        var preferredOriginalNamesByImageKey = nameMode == ResolvedTextureNameMode.PreferTemplateNames || useOriginalNameTickets
             ? BuildPreferredOriginalNamesByImageKey(model, templateMeshPath)
             : new Dictionary<string, List<string>>(StringComparer.OrdinalIgnoreCase);
+        var originalTextureNamePool = useOriginalNameTickets
+            ? BuildOriginalTextureNamePool(templateMeshPath)
+            : OriginalTextureNamePool.Empty;
         var semanticTemplateNames = nameMode == ResolvedTextureNameMode.SemanticTemplateNames
             ? BuildSemanticTemplateNames(templateMeshPath, gameConfig)
             : new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
@@ -77,13 +86,16 @@ public static class ReinsertTextureService
                 if (!writtenByImage.TryGetValue(imageKey, out var textureName))
                 {
                     var preferredNames = preferredOriginalNamesByImageKey.TryGetValue(imageKey, out var foundPreferredNames) ? foundPreferredNames : [];
+                    var originalNameCandidates = useOriginalNameTickets
+                        ? BuildOriginalNameCandidates(normalizedReference, preferredNames, originalTextureNamePool)
+                        : preferredNames;
                     var semanticTemplateName = ResolveSemanticTemplateName(primitive, image.Name, normalizedReference, semanticTemplateNames, gameConfig);
                     if (ShouldSkipUnmappedSecondaryTexture(gameConfig, nameMode, normalizedReference, semanticTemplateName))
                     {
                         continue;
                     }
 
-                    var sourceTexturePath = FindSourceTextureTemplateForMode(templateMeshPath, image.Name, preferredNames, semanticTemplateName, nameMode);
+                    var sourceTexturePath = FindSourceTextureTemplateForMode(templateMeshPath, image.Name, originalNameCandidates, semanticTemplateName, nameMode);
                     var sourceImageMatches = sourceTexturePath is not null && ImageMatchesSourceTexture(image, sourceTexturePath);
                     var preserveDiffuseName = reference.Equals("diffuse", StringComparison.OrdinalIgnoreCase) ||
                                               diffuseImageKeys.Contains(imageKey);
@@ -93,10 +105,17 @@ public static class ReinsertTextureService
                         sourceTexturePath,
                         existingNames,
                         reservedNames,
-                        preferredNames,
+                        originalNameCandidates,
                         semanticTemplateName,
                         nameMode,
+                        useOriginalNameTickets,
                         preserveTemplateName: preserveDiffuseName || sourceImageMatches);
+                    if (FindSourceTextureTemplate(templateMeshPath, textureName) is { } chosenSourceTexturePath)
+                    {
+                        sourceTexturePath = chosenSourceTexturePath;
+                        sourceImageMatches = ImageMatchesSourceTexture(image, sourceTexturePath);
+                    }
+
                     var outputTexturePath = Path.Combine(outputFolder, textureName + ".d3dtx");
                     if (ShouldInvertCharacterLineAlpha(gameConfig, primitive, normalizedReference, image.Name))
                     {
@@ -486,6 +505,50 @@ public static class ReinsertTextureService
 
     private static bool IsSupportedTextureSlot(string slot) => TextureSlotsV13.Contains(slot);
 
+    private static bool ShouldUseOriginalNameTickets(
+        GltfModel model,
+        ReinsertTextureOptions options,
+        ResolvedTextureNameMode nameMode)
+    {
+        if (nameMode is not ResolvedTextureNameMode.PreferTemplateNames and
+            not ResolvedTextureNameMode.SemanticTemplateNames)
+        {
+            return false;
+        }
+
+        var textureCount = CountImportedTextureImages(model, options);
+        return textureCount is > 0 and <= 2;
+    }
+
+    private static int CountImportedTextureImages(GltfModel model, ReinsertTextureOptions options)
+    {
+        var imageKeys = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        foreach (var primitive in model.Primitives)
+        {
+            foreach (var (slot, image) in primitive.ReferencedTextures)
+            {
+                if (IsGeneratedGltfHelperTexture(image.Name))
+                {
+                    continue;
+                }
+
+                var normalizedSlot = NormalizeTextureSlotName(slot);
+                if (!IsSupportedTextureSlot(normalizedSlot) || !options.IncludesSlot(normalizedSlot))
+                {
+                    continue;
+                }
+
+                imageKeys.Add(ImageKey(image));
+                if (imageKeys.Count > 2)
+                {
+                    return imageKeys.Count;
+                }
+            }
+        }
+
+        return imageKeys.Count;
+    }
+
     private static ResolvedTextureNameMode ResolveNameMode(GameConfig? gameConfig, ReinsertTextureNameMode requested)
     {
         return requested switch
@@ -545,6 +608,7 @@ public static class ReinsertTextureService
                     [],
                     semanticTemplateName: null,
                     ResolvedTextureNameMode.PreferTemplateNames,
+                    useOriginalNameTickets: false,
                     preserveTemplateName: true);
                 var outputTexturePath = Path.Combine(outputFolder, textureName + ".d3dtx");
                 WriteTexturePreservingTemplate(fallbackTemplateBytes, primitive.BaseColor, sourceTexturePath, outputTexturePath, sourceImageMatches);
@@ -670,6 +734,7 @@ public static class ReinsertTextureService
         IReadOnlyList<string> preferredOriginalNames,
         string? semanticTemplateName,
         ResolvedTextureNameMode nameMode,
+        bool useOriginalNameTickets,
         bool preserveTemplateName)
     {
         if (nameMode == ResolvedTextureNameMode.SemanticTemplateNames &&
@@ -682,6 +747,17 @@ public static class ReinsertTextureService
         if (nameMode == ResolvedTextureNameMode.SemanticTemplateNames &&
             semanticTemplateName is null)
         {
+            if (useOriginalNameTickets)
+            {
+                foreach (var preferred in preferredOriginalNames)
+                {
+                    if (TryReserveOriginalReplacementName(preferred, reservedNames) is { } preferredName)
+                    {
+                        return preferredName;
+                    }
+                }
+            }
+
             if (TryReservePreservedName(rawName, reservedNames) is { } rawSemanticFallback)
             {
                 return rawSemanticFallback;
@@ -708,25 +784,46 @@ public static class ReinsertTextureService
             }
         }
 
-        if (nameMode == ResolvedTextureNameMode.PreferTemplateNames && preserveTemplateName)
+        if (nameMode == ResolvedTextureNameMode.PreferTemplateNames)
         {
-            foreach (var preferred in preferredOriginalNames)
+            if (useOriginalNameTickets)
             {
-                if (TryReservePreservedName(preferred, reservedNames) is { } preferredName)
+                foreach (var preferred in preferredOriginalNames)
                 {
-                    return preferredName;
+                    if (TryReserveOriginalReplacementName(preferred, reservedNames) is { } preferredName)
+                    {
+                        return preferredName;
+                    }
                 }
             }
 
-            if (sourceTexturePath is not null)
+            if (preserveTemplateName && !useOriginalNameTickets)
             {
-                if (TryReservePreservedName(Path.GetFileName(sourceTexturePath), reservedNames) is { } originalName)
+                foreach (var preferred in preferredOriginalNames)
+                {
+                    if (TryReservePreservedName(preferred, reservedNames) is { } preferredName)
+                    {
+                        return preferredName;
+                    }
+                }
+            }
+
+            if (preserveTemplateName && sourceTexturePath is not null)
+            {
+                var sourceName = Path.GetFileName(sourceTexturePath);
+                var originalName = useOriginalNameTickets
+                    ? TryReserveOriginalReplacementName(sourceName, reservedNames)
+                    : TryReservePreservedName(sourceName, reservedNames);
+                if (originalName is not null)
                 {
                     return originalName;
                 }
             }
 
-            if (TryReservePreservedName(rawName, reservedNames) is { } rawOriginalName)
+            if (preserveTemplateName &&
+                (useOriginalNameTickets
+                    ? TryReserveOriginalReplacementName(rawName, reservedNames)
+                    : TryReservePreservedName(rawName, reservedNames)) is { } rawOriginalName)
             {
                 return rawOriginalName;
             }
@@ -740,6 +837,13 @@ public static class ReinsertTextureService
         var sanitized = SanitizeName(StripKnownTextureExtension(Path.GetFileName(name)));
         return !string.IsNullOrWhiteSpace(sanitized) && reservedNames.Add(sanitized)
             ? sanitized
+            : null;
+    }
+
+    private static string? TryReserveOriginalReplacementName(string name, HashSet<string> reservedNames)
+    {
+        return IsSafeOriginalReplacementTextureName(name)
+            ? TryReservePreservedName(name, reservedNames)
             : null;
     }
 
@@ -945,11 +1049,130 @@ public static class ReinsertTextureService
         return result;
     }
 
+    private static OriginalTextureNamePool BuildOriginalTextureNamePool(string templateMeshPath)
+    {
+        MeshData templateMesh;
+        try
+        {
+            templateMesh = D3DMeshParser.Parse(File.ReadAllBytes(templateMeshPath));
+        }
+        catch
+        {
+            return OriginalTextureNamePool.Empty;
+        }
+
+        var allNames = new List<string>();
+        var bySlot = new Dictionary<string, IReadOnlyList<string>>(StringComparer.OrdinalIgnoreCase);
+        foreach (var slot in TextureSlotsV13)
+        {
+            var slotNames = new List<string>();
+            foreach (var submesh in templateMesh.Submeshes)
+            {
+                if (!submesh.TextureNames.TryGetValue(slot, out var textureName) ||
+                    !IsSafeOriginalReplacementTextureName(textureName))
+                {
+                    continue;
+                }
+
+                if (!slotNames.Contains(textureName, StringComparer.OrdinalIgnoreCase))
+                {
+                    slotNames.Add(textureName);
+                }
+                if (!allNames.Contains(textureName, StringComparer.OrdinalIgnoreCase))
+                {
+                    allNames.Add(textureName);
+                }
+            }
+
+            if (slotNames.Count > 0)
+            {
+                bySlot[slot] = slotNames;
+            }
+        }
+
+        return allNames.Count == 0
+            ? OriginalTextureNamePool.Empty
+            : new OriginalTextureNamePool(bySlot, allNames);
+    }
+
+    private static IReadOnlyList<string> BuildOriginalNameCandidates(
+        string slot,
+        IReadOnlyList<string> preferredOriginalNames,
+        OriginalTextureNamePool pool)
+    {
+        var result = new List<string>();
+        AddSafeOriginalCandidates(result, preferredOriginalNames);
+
+        if (pool.AllNames.Count == 0)
+        {
+            return result;
+        }
+
+        if (pool.NamesBySlot.TryGetValue(slot, out var slotNames))
+        {
+            AddSafeOriginalCandidates(result, slotNames);
+        }
+        AddSafeOriginalCandidates(result, pool.AllNames);
+        return result;
+    }
+
+    private static void AddSafeOriginalCandidates(List<string> target, IEnumerable<string> names)
+    {
+        foreach (var name in names.OrderBy(OriginalReplacementTexturePriority))
+        {
+            if (IsSafeOriginalReplacementTextureName(name) &&
+                !target.Contains(name, StringComparer.OrdinalIgnoreCase))
+            {
+                target.Add(name);
+            }
+        }
+    }
+
     private static bool IsUsableOriginalTextureName(string name)
     {
         return !string.IsNullOrWhiteSpace(name) &&
                !name.StartsWith("texture_", StringComparison.OrdinalIgnoreCase) &&
                !name.StartsWith("0x", StringComparison.OrdinalIgnoreCase);
+    }
+
+    private static bool IsSafeOriginalReplacementTextureName(string name)
+    {
+        if (!IsUsableOriginalTextureName(name))
+        {
+            return false;
+        }
+
+        var stem = StripKnownTextureExtension(Path.GetFileName(name)).ToLowerInvariant();
+        return !SharedOriginalReplacementTextureNames.Contains(stem) &&
+               !stem.StartsWith("map_1px", StringComparison.OrdinalIgnoreCase) &&
+               !stem.StartsWith("sk_sharedparts_", StringComparison.OrdinalIgnoreCase) &&
+               !stem.StartsWith("map_gradient", StringComparison.OrdinalIgnoreCase);
+    }
+
+    private static int OriginalReplacementTexturePriority(string name)
+    {
+        var stem = StripKnownTextureExtension(Path.GetFileName(name)).ToLowerInvariant();
+        if (stem.Contains("body") || stem.Contains("torso") || stem.Contains("skin"))
+        {
+            return 0;
+        }
+
+        if (stem.Contains("head") || stem.Contains("face"))
+        {
+            return 1;
+        }
+
+        if (stem.Contains("hair"))
+        {
+            return 2;
+        }
+
+        if (stem.Contains("hand") || stem.Contains("arm"))
+        {
+            return 3;
+        }
+
+        return 4;
     }
 
     private static string ImageKey(GltfImage image)
@@ -1142,6 +1365,14 @@ public static class ReinsertTextureService
 public sealed record ReinsertedTextures(
     IReadOnlyList<IReadOnlyDictionary<string, string>> PrimitiveSlots,
     IReadOnlyList<string> WrittenNames);
+
+internal sealed record OriginalTextureNamePool(
+    IReadOnlyDictionary<string, IReadOnlyList<string>> NamesBySlot,
+    IReadOnlyList<string> AllNames)
+{
+    public static OriginalTextureNamePool Empty { get; } =
+        new(new Dictionary<string, IReadOnlyList<string>>(StringComparer.OrdinalIgnoreCase), []);
+}
 
 public sealed class ReinsertTextureOptions
 {

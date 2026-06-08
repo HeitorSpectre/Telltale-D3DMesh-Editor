@@ -114,11 +114,18 @@ public static class ReinsertCli
         Console.WriteLine($"submeshes   : {layout.SubmeshCount}");
         Console.WriteLine($"faces       : {layout.FacePointCount / 3}");
         Console.WriteLine($"vertices    : {layout.VertexCount}");
-        Console.WriteLine($"vertex data : 0x{layout.VertexDataOffset:X} stride {layout.VertexStride} len {layout.VertexDataLength}");
+        foreach (var vertexBuffer in layout.VertexBuffers)
+        {
+            Console.WriteLine($"vertex data : #{vertexBuffer.Index} 0x{vertexBuffer.DataOffset:X} stride {vertexBuffer.VertexStride} len {vertexBuffer.DataLength}");
+        }
         Console.WriteLine($"tail        : 0x{layout.TailOffset:X} len {layout.TailLength}");
         Console.WriteLine($"parsed      : {mesh.Submeshes.Count} submeshes, {mesh.VertexCount} verts, {mesh.FaceCount} tris");
         PrintBounds("bounds      ", mesh.GetBounds());
-        PrintAttrs(layout.Attributes);
+        foreach (var vertexBuffer in layout.VertexBuffers)
+        {
+            Console.WriteLine($"attrs       : vertex buffer #{vertexBuffer.Index}");
+            PrintAttrs(vertexBuffer.Attributes);
+        }
         Console.WriteLine(layout.TailOffset + layout.TailLength == data.Length
             ? "layout      : closes at EOF"
             : $"layout      : ends at 0x{layout.TailOffset + layout.TailLength:X}, file ends at 0x{data.Length:X}");
@@ -1396,7 +1403,6 @@ public static class ReinsertCli
 
     private static void PrintAttrs(VertexAttrLayout a)
     {
-        Console.WriteLine("attrs       :");
         PrintAttr("position", a.Position);
         PrintAttr("uv1", a.Uv1);
         PrintAttr("normal", a.Normals);
@@ -1409,6 +1415,10 @@ public static class ReinsertCli
         PrintAttr("uv2", a.Uv2);
         PrintAttr("uv3", a.Uv3);
         PrintAttr("uv4", a.Uv4);
+        if (a.Uv5.Format != 0)
+        {
+            PrintAttr("uv5", a.Uv5);
+        }
     }
 
     private static void PrintAttr(string name, AttrDescriptor attr)
@@ -1428,6 +1438,13 @@ public static class ReinsertCli
             text.Contains("Wolf Among Us", StringComparison.OrdinalIgnoreCase))
         {
             return GameConfig.WolfAmongUs;
+        }
+
+        if (text.Contains("MCSM", StringComparison.OrdinalIgnoreCase) ||
+            text.Contains("Minecraft Story Mode", StringComparison.OrdinalIgnoreCase) ||
+            text.Contains("Minecraft: Story Mode", StringComparison.OrdinalIgnoreCase))
+        {
+            return GameConfig.MinecraftStoryMode;
         }
 
         return GameConfig.Current;

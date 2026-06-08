@@ -53,6 +53,14 @@ public sealed class DataReader
         return value;
     }
 
+    public ushort ReadUInt16BigEndian()
+    {
+        Ensure(2);
+        var value = BinaryPrimitives.ReadUInt16BigEndian(_data.AsSpan(Position, 2));
+        Position += 2;
+        return value;
+    }
+
     public short ReadInt16()
     {
         Ensure(2);

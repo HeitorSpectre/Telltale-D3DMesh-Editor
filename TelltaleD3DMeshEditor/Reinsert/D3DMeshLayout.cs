@@ -2,21 +2,35 @@ using TelltaleD3DMeshEditor.Core;
 
 namespace TelltaleD3DMeshEditor.Reinsert;
 
-// Layout map for a V13 .d3dmesh (The Wolf Among Us). Walks the file exactly like
-// D3DMeshParser.ParseV13, but records offsets and sizes for each editable region
+// Layout map for a .d3dmesh. Walks the file exactly like the matching D3DMeshParser path,
+// but records offsets and sizes for each editable region
 // (bounds, submesh table, UV scales, face buffer, vertex buffer) instead of decoding data.
 // This is the base for the reimporter: the template-patch writer uses these offsets to replace
 // only the desired region while preserving headers, materials, palettes, and padding byte-for-byte.
 //
-// Coverage proof: the walker computes vertex stride by summing each attribute size and validates
-// that VertexDataOffset + VertexCount*Stride lands exactly at the end of the useful block.
+// Coverage proof: the walker computes or reads each vertex-buffer stride and validates
+// that the final vertex buffer lands exactly at the end of the useful block.
 // When the map closes with the file, it covers 100% of the bytes.
 public sealed class D3DMeshLayout
 {
+    private static readonly string[] TextureSlotsV13 =
+    [
+        "diffuse", "bake", "bump", "environment", "detail_diffuse", "detail_bump",
+        "specular", "tex8", "gradient", "tex10", "shadow"
+    ];
+
+    private static readonly string[] TextureSlotsV18 =
+    [
+        "diffuse", "bake", "bump", "environment", "detail_diffuse", "detail_bump",
+        "specular", "tex8", "gradient", "tex10", "shadow", "emissive",
+        "alternate_bump", "occlusion"
+    ];
+
     public required byte[] Original { get; init; }
     public required string Name { get; init; }
     public int Version { get; init; }
     public int DataOffset { get; init; }
+    public required string[] TextureSlots { get; init; }
 
     // Global bounds: 2x vec3 (min, max) = 24 bytes.
     public int BoundsOffset { get; init; }
@@ -38,11 +52,14 @@ public sealed class D3DMeshLayout
     public int TextureGroupBlockLength { get; init; }
     public required List<TextureGroupLayout> TextureGroups { get; init; }
 
-    // 8 floats: uv1X uv1Y uv4X uv4Y uv2X uv2Y uv3X uv3Y.
+    // V13/14: 8 floats in uv1X uv1Y uv4X uv4Y uv2X uv2Y uv3X uv3Y order.
+    // V17/18: 10 floats in uv1X uv1Y extraX extraY uv2X uv2Y uv3X uv3Y uv4X uv4Y order.
     public int UvScalesOffset { get; init; }
+    public int UvScalesLength { get; init; }
 
     // Face buffer: count (facePointCount, u32) + data (facePointCount * uint16).
     public int FaceCountFieldOffset { get; init; }
+    public int FaceIndexFormat { get; init; }
     public int FacePointCount { get; init; }
     public int FaceDataOffset { get; init; }
     public int FaceDataLength { get; init; }
@@ -53,10 +70,13 @@ public sealed class D3DMeshLayout
     public int VertexAttrTableOffset { get; init; }
     public int VertexDataOffset { get; init; }
     public int VertexStride { get; init; }
-    public int VertexDataLength => VertexCount * VertexStride;
+    public int VertexDataLength => VertexBuffers.Count == 0 ? VertexCount * VertexStride : VertexBuffers[0].DataLength;
+    public required List<VertexBufferLayout> VertexBuffers { get; init; }
 
     // Tail after the vertex block (should be empty in TWAU V13; tracked for safety).
-    public int TailOffset => VertexDataOffset + VertexDataLength;
+    public int TailOffset => VertexBuffers.Count == 0
+        ? VertexDataOffset + VertexDataLength
+        : VertexBuffers[^1].DataOffset + VertexBuffers[^1].DataLength;
     public int TailLength { get; init; }
 
     public required VertexAttrLayout Attributes { get; init; }
@@ -80,10 +100,13 @@ public sealed class D3DMeshLayout
 
         var name = reader.ReadAscii((int)nameLength);
         var version = reader.ReadInt32();
-        if (version is not (13 or 14))
+        if (version is not (13 or 14 or 17 or 18))
         {
-            throw new NotSupportedException($"D3DMeshLayout currently supports only V13/14 (got {version}).");
+            throw new NotSupportedException($"D3DMeshLayout currently supports only V13/14/17/18 (got {version}).");
         }
+
+        var isV18Layout = version is 17 or 18;
+        var textureSlots = isV18Layout ? TextureSlotsV18 : TextureSlotsV13;
 
         reader.Skip(4);
         var boundsOffset = reader.Position;
@@ -128,8 +151,8 @@ public sealed class D3DMeshLayout
             reader.ReadFloat();
             reader.ReadUInt32();
             var subHeaderEnd = reader.Position + (int)reader.ReadUInt32();
-            var textureSlotOffsets = new int[11];
-            for (var tex = 0; tex < 11; tex++)
+            var textureSlotOffsets = new int[textureSlots.Length];
+            for (var tex = 0; tex < textureSlots.Length; tex++)
             {
                 textureSlotOffsets[tex] = reader.Position;
                 reader.ReadUInt32();
@@ -170,11 +193,12 @@ public sealed class D3DMeshLayout
         reader.Skip(0x08);
 
         var textureGroupBlockOffset = reader.Position;
-        var textureGroups = ReadV13TextureGroups(reader);
+        var textureGroups = ReadTextureGroups(reader, textureSlots.Length, isV18Layout ? 24 : 20);
         var textureGroupBlockLength = reader.Position - textureGroupBlockOffset;
 
         var uvScalesOffset = reader.Position;
-        for (var i = 0; i < 8; i++)
+        var uvScaleFloatCount = isV18Layout ? 10 : 8;
+        for (var i = 0; i < uvScaleFloatCount; i++)
         {
             reader.ReadFloat();
         }
@@ -186,27 +210,56 @@ public sealed class D3DMeshLayout
 
         var faceCountFieldOffset = reader.Position;
         var facePointCount = (int)reader.ReadUInt32();
-        reader.Skip(8);
+        var faceIndexFormat = 0;
+        if (isV18Layout)
+        {
+            faceIndexFormat = (int)reader.ReadUInt32();
+            reader.Skip(4);
+        }
+        else
+        {
+            reader.Skip(8);
+        }
+
         var faceDataOffset = reader.Position;
         var faceDataLength = facePointCount * 2;
         reader.Skip(faceDataLength);
 
-        var vertexCountFieldOffset = reader.Position;
-        var vertexCount = (int)reader.ReadUInt32();
-        reader.ReadUInt32();
-        reader.Skip(0x0C);
-        reader.ReadUInt32();
+        var vertexBuffers = new List<VertexBufferLayout>(isV18Layout ? 2 : 1);
+        var vertexBufferCount = isV18Layout ? 2 : 1;
+        for (var bufferIndex = 0; bufferIndex < vertexBufferCount; bufferIndex++)
+        {
+            var vertexCountFieldOffset = reader.Position;
+            var vertexCount = (int)reader.ReadUInt32();
+            var strideFieldOffset = reader.Position;
+            var storedStride = (int)reader.ReadUInt32();
+            reader.Skip(isV18Layout ? 0x08 : 0x0C);
+            reader.ReadUInt32();
 
-        var attrTableOffset = reader.Position;
-        var attrs = VertexAttrLayout.Read(reader);
-        var vertexDataOffset = reader.Position;
-        var stride = attrs.Stride;
+            var attrTableOffset = reader.Position;
+            var attrs = VertexAttrLayout.Read(reader, isV18Layout ? 13 : 12);
+            var vertexDataOffset = reader.Position;
+            var stride = isV18Layout && storedStride > 0 ? storedStride : attrs.Stride;
+            var vertexDataLength = checked(vertexCount * stride);
+            reader.Skip(vertexDataLength);
 
-        var tailOffset = vertexDataOffset + vertexCount * stride;
+            vertexBuffers.Add(new VertexBufferLayout(
+                Index: bufferIndex,
+                CountFieldOffset: vertexCountFieldOffset,
+                StrideFieldOffset: strideFieldOffset,
+                AttrTableOffset: attrTableOffset,
+                DataOffset: vertexDataOffset,
+                VertexCount: vertexCount,
+                VertexStride: stride,
+                Attributes: attrs));
+        }
+
+        var primaryBuffer = vertexBuffers[0];
+        var tailOffset = vertexBuffers[^1].DataOffset + vertexBuffers[^1].DataLength;
         if (tailOffset > data.Length)
         {
             throw new InvalidDataException(
-                $"Vertex block exceeds file bounds: dataOff=0x{vertexDataOffset:X} count={vertexCount} stride={stride} -> 0x{tailOffset:X} > 0x{data.Length:X}");
+                $"Vertex block exceeds file bounds: dataOff=0x{primaryBuffer.DataOffset:X} count={primaryBuffer.VertexCount} stride={primaryBuffer.VertexStride} -> 0x{tailOffset:X} > 0x{data.Length:X}");
         }
 
         return new D3DMeshLayout
@@ -215,6 +268,7 @@ public sealed class D3DMeshLayout
             Name = name,
             Version = version,
             DataOffset = header.DataOffset,
+            TextureSlots = textureSlots,
             BoundsOffset = boundsOffset,
             SubmeshCount = submeshCount,
             SubmeshBlockSizeFieldOffset = submeshBlockSizeFieldOffset,
@@ -233,17 +287,20 @@ public sealed class D3DMeshLayout
             TextureGroupBlockLength = textureGroupBlockLength,
             TextureGroups = textureGroups,
             UvScalesOffset = uvScalesOffset,
+            UvScalesLength = uvScaleFloatCount * 4,
             FaceCountFieldOffset = faceCountFieldOffset,
+            FaceIndexFormat = faceIndexFormat,
             FacePointCount = facePointCount,
             FaceDataOffset = faceDataOffset,
             FaceDataLength = faceDataLength,
-            VertexCountFieldOffset = vertexCountFieldOffset,
-            VertexCount = vertexCount,
-            VertexAttrTableOffset = attrTableOffset,
-            VertexDataOffset = vertexDataOffset,
-            VertexStride = stride,
+            VertexCountFieldOffset = primaryBuffer.CountFieldOffset,
+            VertexCount = primaryBuffer.VertexCount,
+            VertexAttrTableOffset = primaryBuffer.AttrTableOffset,
+            VertexDataOffset = primaryBuffer.DataOffset,
+            VertexStride = primaryBuffer.VertexStride,
+            VertexBuffers = vertexBuffers,
             TailLength = data.Length - tailOffset,
-            Attributes = attrs,
+            Attributes = primaryBuffer.Attributes,
         };
     }
 
@@ -290,11 +347,14 @@ public sealed class D3DMeshLayout
         return (palettes, entryTemplate);
     }
 
-    private static List<TextureGroupLayout> ReadV13TextureGroups(DataReader reader)
+    private static List<TextureGroupLayout> ReadTextureGroups(
+        DataReader reader,
+        int groupCount,
+        int finalTextureSubBlockBytes)
     {
         reader.ReadUInt32();
-        var groups = new List<TextureGroupLayout>(11);
-        for (var group = 0; group < 11; group++)
+        var groups = new List<TextureGroupLayout>(groupCount);
+        for (var group = 0; group < groupCount; group++)
         {
             var groupOffset = reader.Position;
             var countFieldOffset = reader.Position;
@@ -317,7 +377,7 @@ public sealed class D3DMeshLayout
                 reader.Skip(12);
                 reader.Skip(24);
                 reader.ReadUInt32();
-                reader.Skip(20);
+                reader.Skip(finalTextureSubBlockBytes);
                 entries.Add(new TextureEntryLayout(entryOffset, reader.Position - entryOffset, hashLowOffset, hashHighOffset, hashLow, hashHigh));
             }
 
@@ -364,3 +424,16 @@ public sealed record TextureEntryLayout(
     int HashHighFieldOffset,
     uint HashLow,
     uint HashHigh);
+
+public sealed record VertexBufferLayout(
+    int Index,
+    int CountFieldOffset,
+    int StrideFieldOffset,
+    int AttrTableOffset,
+    int DataOffset,
+    int VertexCount,
+    int VertexStride,
+    VertexAttrLayout Attributes)
+{
+    public int DataLength => VertexCount * VertexStride;
+}

@@ -5,6 +5,7 @@ public enum GameId
     Generic,
     WolfAmongUs,
     WalkingDeadSeason2,
+    MinecraftStoryMode,
 }
 
 // Per-game settings, so behaviour specific to one game stays isolated and never affects another. The
@@ -59,6 +60,15 @@ public sealed class GameConfig
     // "*_head_detail" textures are not affected.
     public bool InvertHeadLineAlphaOnReimport { get; init; }
 
+    // Existing TWAU/TWD2 environment assets often name baked/lightmap textures as adv/obj *_000.
+    // Minecraft: Story Mode uses the same suffix for normal diffuse atlas names, so this must be
+    // profile-specific instead of a global filename rule.
+    public bool TreatAdvObj000TexturesAsBake { get; init; }
+
+    // Minecraft character textures are deliberately low-resolution pixel art. glTF viewers default to
+    // linear filtering when a sampler does not specify filters, which blurs those pixels on export.
+    public bool PixelatedGltfTextures { get; init; }
+
     public static readonly GameConfig Generic = new()
     {
         Id = GameId.Generic,
@@ -72,6 +82,8 @@ public sealed class GameConfig
         SplitBodyLineAlphaOnReimport = false,
         InvertBodyLineAlphaOnReimport = false,
         InvertHeadLineAlphaOnReimport = false,
+        TreatAdvObj000TexturesAsBake = true,
+        PixelatedGltfTextures = false,
     };
 
     public static readonly GameConfig WolfAmongUs = new()
@@ -87,6 +99,8 @@ public sealed class GameConfig
         SplitBodyLineAlphaOnReimport = false,
         InvertBodyLineAlphaOnReimport = true,
         InvertHeadLineAlphaOnReimport = false,
+        TreatAdvObj000TexturesAsBake = true,
+        PixelatedGltfTextures = false,
     };
 
     public static readonly GameConfig WalkingDeadSeason2 = new()
@@ -102,9 +116,28 @@ public sealed class GameConfig
         SplitBodyLineAlphaOnReimport = true,
         InvertBodyLineAlphaOnReimport = false,
         InvertHeadLineAlphaOnReimport = true,
+        TreatAdvObj000TexturesAsBake = true,
+        PixelatedGltfTextures = false,
     };
 
-    public static readonly IReadOnlyList<GameConfig> All = [Generic, WolfAmongUs, WalkingDeadSeason2];
+    public static readonly GameConfig MinecraftStoryMode = new()
+    {
+        Id = GameId.MinecraftStoryMode,
+        DisplayName = "Minecraft: Story Mode",
+        UsesCompanionAlphaTextures = false,
+        ClearInheritedBakeOnReimport = false,
+        ClearInheritedSecondaryTexturesOnReimport = false,
+        PreferGltfTextureNamesOnReimport = false,
+        PreferSemanticTemplateTextureNamesOnReimport = false,
+        RemoveEyeHelperPrimitivesOnReimport = false,
+        SplitBodyLineAlphaOnReimport = false,
+        InvertBodyLineAlphaOnReimport = false,
+        InvertHeadLineAlphaOnReimport = false,
+        TreatAdvObj000TexturesAsBake = false,
+        PixelatedGltfTextures = true,
+    };
+
+    public static readonly IReadOnlyList<GameConfig> All = [Generic, WolfAmongUs, WalkingDeadSeason2, MinecraftStoryMode];
 
     // The active game. Defaults to Generic, which behaves exactly as the tool did before per-game config.
     public static GameConfig Current { get; set; } = Generic;

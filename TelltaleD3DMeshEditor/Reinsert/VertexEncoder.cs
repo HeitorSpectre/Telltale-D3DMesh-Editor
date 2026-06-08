@@ -11,14 +11,18 @@ public sealed class VertexEncoder
 {
     private readonly VertexAttrLayout _attrs;
     private readonly UvMults _mults;
+    private readonly int _meshVersion;
+    private readonly int _stride;
 
-    public VertexEncoder(VertexAttrLayout attrs, UvMults mults)
+    public VertexEncoder(VertexAttrLayout attrs, UvMults mults, int meshVersion = 13, int? stride = null)
     {
         _attrs = attrs;
         _mults = mults;
+        _meshVersion = meshVersion;
+        _stride = stride ?? attrs.Stride;
     }
 
-    public int Stride => _attrs.Stride;
+    public int Stride => _stride;
 
     public void Write(Span<byte> dst, in EncVertex v)
     {
@@ -37,6 +41,8 @@ public sealed class VertexEncoder
         WriteUv(dst, ref p, _attrs.Uv3.Format, v.U2, v.V2, _mults.Uv3X, _mults.Uv3Y);
         p = (int)_attrs.Uv4.Offset;
         WriteUv(dst, ref p, _attrs.Uv4.Format, v.U3, v.V3, _mults.Uv4X, _mults.Uv4Y);
+        p = (int)_attrs.Uv5.Offset;
+        WriteUv(dst, ref p, _attrs.Uv5.Format, v.U3, v.V3, _mults.Uv4X, _mults.Uv4Y);
         p = (int)_attrs.Bones.Offset;
         WriteBones(dst, ref p, _attrs.Bones.Format, v);
         p = (int)_attrs.Weights.Offset;
@@ -86,8 +92,8 @@ public sealed class VertexEncoder
                 WriteScaledUInt16(dst, ref p, v, multY);
                 return;
             case 11:
-                BinaryPrimitives.WriteHalfLittleEndian(dst[p..], (Half)(u / 2f)); p += 2;
-                BinaryPrimitives.WriteHalfLittleEndian(dst[p..], (Half)(v / 2f)); p += 2;
+                BinaryPrimitives.WriteHalfLittleEndian(dst[p..], (Half)u); p += 2;
+                BinaryPrimitives.WriteHalfLittleEndian(dst[p..], (Half)v); p += 2;
                 return;
             default:
                 throw new InvalidDataException($"Unsupported UV format for writing: {format}");
@@ -163,7 +169,7 @@ public sealed class VertexEncoder
         p += 2;
     }
 
-    private static void WriteBones(Span<byte> dst, ref int p, uint format, in EncVertex v)
+    private void WriteBones(Span<byte> dst, ref int p, uint format, in EncVertex v)
     {
         switch (format)
         {
@@ -171,14 +177,30 @@ public sealed class VertexEncoder
                 return;
             case 3:
             case 8:
-                dst[p++] = (byte)Math.Clamp(v.Bone0, 0, 255);
-                dst[p++] = (byte)Math.Clamp(v.Bone1, 0, 255);
-                dst[p++] = (byte)Math.Clamp(v.Bone2, 0, 255);
-                dst[p++] = (byte)Math.Clamp(v.Bone3, 0, 255);
+                var factor = BoneIndexWriteFactor(format);
+                dst[p++] = (byte)Math.Clamp(v.Bone0 * factor, 0, 255);
+                dst[p++] = (byte)Math.Clamp(v.Bone1 * factor, 0, 255);
+                dst[p++] = (byte)Math.Clamp(v.Bone2 * factor, 0, 255);
+                dst[p++] = (byte)Math.Clamp(v.Bone3 * factor, 0, 255);
                 return;
             default:
                 throw new InvalidDataException($"Unsupported bone format for writing: {format}");
         }
+    }
+
+    private int BoneIndexWriteFactor(uint format)
+    {
+        if (_meshVersion is not (17 or 18))
+        {
+            return 1;
+        }
+
+        return format switch
+        {
+            3 => 4,
+            8 => 3,
+            _ => 1,
+        };
     }
 
     private static void WriteWeights(Span<byte> dst, ref int p, uint format, in EncVertex v)

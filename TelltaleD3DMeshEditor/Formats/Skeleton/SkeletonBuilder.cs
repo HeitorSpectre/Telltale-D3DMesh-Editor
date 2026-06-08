@@ -29,13 +29,10 @@ public static class SkeletonBuilder
             var parentSymbol = ResolveParentSymbol(bone, skeleton);
             result.Entries.Add(new TtkSkeleton.Entry
             {
-                JointNameS = jointSymbol,
-                JointName = ResolveBoneName(bone, jointSymbol),
-                ParentNameS = parentSymbol,
-                ParentName = parentSymbol.DebugString ?? BoneHashDatabase.Resolve(parentSymbol.Crc64) ?? "",
+                JointName = jointSymbol,
+                ParentName = parentSymbol,
                 ParentIndex = bone.ParentIndex,
-                MirrorBoneNameS = Symbol.Empty,
-                MirrorBoneName = "",
+                MirrorBoneName = Symbol.Empty,
                 MirrorBoneIndex = -1,
                 LocalPosition = new Vector3(bone.X, bone.Y, bone.Z),
                 LocalQuat = new Quaternion(bone.Qx, bone.Qy, bone.Qz, bone.Qw),
@@ -52,11 +49,6 @@ public static class SkeletonBuilder
 
     private static Symbol ResolveBoneSymbol(BoneData bone)
         => string.IsNullOrEmpty(bone.Name) ? Symbol.FromCrc64(bone.Hash) : Symbol.FromName(bone.Name);
-
-    private static string ResolveBoneName(BoneData bone, Symbol symbol)
-        => !string.IsNullOrEmpty(bone.Name)
-            ? bone.Name
-            : symbol.DebugString ?? BoneHashDatabase.Resolve(symbol.Crc64) ?? $"bone_{symbol.Crc64:X16}";
 
     private static Symbol ResolveParentSymbol(BoneData bone, SkeletonData skeleton)
     {

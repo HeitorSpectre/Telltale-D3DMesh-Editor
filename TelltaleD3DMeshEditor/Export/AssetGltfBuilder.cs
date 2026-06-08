@@ -1,6 +1,7 @@
 using System.Drawing;
 using System.Drawing.Imaging;
 using System.Numerics;
+using TelltaleD3DMeshEditor.Core;
 using TelltaleD3DMeshEditor.Formats.Mesh;
 using TelltaleD3DMeshEditor.Formats.Skeleton;
 
@@ -443,11 +444,27 @@ internal static class AssetGltfBuilder
         if (textures.Count > 0)
         {
             gltf["textures"] = textures;
-            gltf["samplers"] = new[] { new Dictionary<string, object> { ["wrapS"] = 10497, ["wrapT"] = 10497 } };
+            gltf["samplers"] = new[] { BuildSampler() };
         }
         if (skin is not null) gltf["skins"] = new[] { skin };
 
         return new BuiltAsset { Gltf = gltf, Bin = bin, Images = images };
+    }
+
+    private static Dictionary<string, object> BuildSampler()
+    {
+        var sampler = new Dictionary<string, object>
+        {
+            ["wrapS"] = 10497,
+            ["wrapT"] = 10497,
+        };
+        if (GameConfig.Current.PixelatedGltfTextures)
+        {
+            sampler["magFilter"] = 9728;
+            sampler["minFilter"] = 9728;
+        }
+
+        return sampler;
     }
 
     private static (float R, float G, float B, float A) NormalizeVertexColor(VertexData vertex)

@@ -19,6 +19,7 @@ public sealed class VertexAttrLayout
     public required AttrDescriptor Uv2 { get; init; }
     public required AttrDescriptor Uv3 { get; init; }
     public required AttrDescriptor Uv4 { get; init; }
+    public AttrDescriptor Uv5 { get; init; }
 
     public int Stride => new[]
     {
@@ -34,10 +35,16 @@ public sealed class VertexAttrLayout
         End(Uv2, UvSize(Uv2.Format)),
         End(Uv3, UvSize(Uv3.Format)),
         End(Uv4, UvSize(Uv4.Format)),
+        End(Uv5, UvSize(Uv5.Format)),
     }.Max();
 
-    public static VertexAttrLayout Read(DataReader reader)
+    public static VertexAttrLayout Read(DataReader reader, int attributeCount = 12)
     {
+        if (attributeCount is not (12 or 13))
+        {
+            throw new InvalidDataException($"Unsupported vertex attribute count: {attributeCount}");
+        }
+
         return new VertexAttrLayout
         {
             Position = ReadAttr(reader),
@@ -52,6 +59,7 @@ public sealed class VertexAttrLayout
             Uv2 = ReadAttr(reader),
             Uv3 = ReadAttr(reader),
             Uv4 = ReadAttr(reader),
+            Uv5 = attributeCount >= 13 ? ReadAttr(reader) : default,
         };
     }
 

@@ -17,6 +17,12 @@ public static class D3DMeshParser
         "diffuse", "bake", "bump", "environment", "detail_diffuse", "detail_bump",
         "specular", "tex8", "gradient", "tex10", "shadow"
     ];
+    private static readonly string[] TextureSlotsV18 =
+    [
+        "diffuse", "bake", "bump", "environment", "detail_diffuse", "detail_bump",
+        "specular", "tex8", "gradient", "tex10", "shadow", "emissive",
+        "alternate_bump", "occlusion"
+    ];
 
     public static MeshData Parse(byte[] data)
     {
@@ -50,6 +56,10 @@ public static class D3DMeshParser
         if (version is 13 or 14)
         {
             return ParseV13(reader, name, version);
+        }
+        if (version is 17 or 18)
+        {
+            return ParseV18(reader, name, version);
         }
 
         reader.Skip(version >= 13 ? 4 : 5);
@@ -258,6 +268,183 @@ public static class D3DMeshParser
         return mesh;
     }
 
+    // Minecraft: Story Mode Season 1 PC uses D3DMesh v18. It is close to the v13/v14 layout but has
+    // fourteen texture groups and stores vertex attributes across two vertex-buffer blocks.
+    private static MeshData ParseV18(DataReader reader, string name, int version)
+    {
+        reader.Skip(4);
+        reader.ReadVec3();
+        reader.ReadVec3();
+
+        var headerLength = checked((int)reader.ReadUInt32() - 4);
+        reader.Skip(headerLength);
+
+        reader.ReadUInt32();
+        var submeshCount = checked((int)reader.ReadUInt32());
+        if (submeshCount < 0 || submeshCount > 4096)
+        {
+            throw new InvalidDataException($"Invalid submesh count: {submeshCount}");
+        }
+
+        var infos = new List<SubmeshInfo>();
+        for (var i = 0; i < submeshCount; i++)
+        {
+            reader.ReadUInt32();
+            var boneSet = ReadOptionalIndexPlusOne(reader);
+            reader.ReadUInt32();
+            reader.ReadUInt32();
+            var vertexMin = checked((int)reader.ReadUInt32() + 1);
+            var vertexMax = checked((int)reader.ReadUInt32() + 1);
+            var facePointStart = checked((int)reader.ReadUInt32());
+            var polygonCount = checked((int)reader.ReadUInt32());
+            reader.ReadVec3();
+            reader.ReadVec3();
+            reader.ReadUInt32();
+            reader.ReadFloat();
+            reader.ReadFloat();
+            reader.ReadFloat();
+            reader.ReadUInt32();
+            var headerEnd = reader.Position + checked((int)reader.ReadUInt32());
+
+            var texIndices = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+            for (var tex = 0; tex < TextureSlotsV18.Length; tex++)
+            {
+                var index = ReadOptionalIndexPlusOne(reader);
+                if (index > 0)
+                {
+                    texIndices[TextureSlotsV18[tex]] = $"texture_{index}";
+                }
+            }
+
+            reader.Seek(headerEnd);
+            reader.Skip(0x88);
+            reader.ReadFloat();
+            reader.ReadFloat();
+            reader.ReadFloat();
+            reader.ReadFloat();
+
+            infos.Add(new SubmeshInfo(
+                Index: i,
+                BoneSetIndex: boneSet,
+                VertexMin: vertexMin,
+                VertexMax: vertexMax,
+                PolygonStart: facePointStart / 3 + 1,
+                PolygonCount: polygonCount,
+                MaterialIndex: 0,
+                TextureNames: texIndices));
+        }
+
+        SkipSizedBlock(reader);
+
+        var bonePalettes = ReadBonePalettes(reader, 56);
+
+        SkipSizedBlock(reader);
+        SkipSizedBlock(reader);
+        SkipSizedBlock(reader);
+        reader.Skip(0x08);
+
+        ReadTextureGroups(reader, infos, TextureSlotsV18, finalTextureSubBlockBytes: 24);
+
+        var uv1X = reader.ReadFloat();
+        var uv1Y = reader.ReadFloat();
+        reader.ReadFloat();
+        reader.ReadFloat();
+        var uv2X = reader.ReadFloat();
+        var uv2Y = reader.ReadFloat();
+        var uv3X = reader.ReadFloat();
+        var uv3Y = reader.ReadFloat();
+        var uv4X = reader.ReadFloat();
+        var uv4Y = reader.ReadFloat();
+        SkipSizedBlock(reader);
+        SkipSizedBlock(reader);
+        reader.ReadByte();
+        reader.ReadUInt32();
+
+        var facePointCount = checked((int)reader.ReadUInt32());
+        var faceType = reader.ReadUInt32();
+        reader.Skip(4);
+        var rawFaces = new List<(int A, int B, int C)>();
+        for (var i = 0; i < facePointCount / 3; i++)
+        {
+            rawFaces.Add(faceType switch
+            {
+                0 => (reader.ReadUInt16() + 1, reader.ReadUInt16() + 1, reader.ReadUInt16() + 1),
+                2 => (reader.ReadUInt16BigEndian() + 1, reader.ReadUInt16BigEndian() + 1, reader.ReadUInt16BigEndian() + 1),
+                _ => throw new InvalidDataException($"Unknown face index format: {faceType}"),
+            });
+        }
+
+        var vertices = ReadVerticesV18(reader, uv1X, uv1Y, uv2X, uv2Y, uv3X, uv3Y, uv4X, uv4Y);
+        if (vertices.Count == 0)
+        {
+            if (facePointCount == 0 && infos.All(info => info.PolygonCount == 0))
+            {
+                var emptyMesh = new MeshData { Name = name, Version = version };
+                emptyMesh.BonePalettes.AddRange(bonePalettes);
+                return emptyMesh;
+            }
+
+            throw new InvalidDataException("No vertices found.");
+        }
+
+        var mesh = new MeshData { Name = name, Version = version };
+        mesh.BonePalettes.AddRange(bonePalettes);
+        foreach (var info in infos)
+        {
+            var materialName = info.TextureNames.TryGetValue("diffuse", out var diffuse) ? diffuse : $"material_{info.Index + 1}";
+            var submesh = new SubmeshData
+            {
+                Name = materialName,
+                MaterialName = materialName,
+                BonePaletteIndex = NormalizePaletteIndex(info.BoneSetIndex, bonePalettes.Count),
+            };
+            foreach (var texture in info.TextureNames)
+            {
+                submesh.TextureNames[texture.Key] = texture.Value;
+            }
+
+            for (var vertex = info.VertexMin; vertex <= info.VertexMax; vertex++)
+            {
+                var index = vertex - 1;
+                if (index >= 0 && index < vertices.Count)
+                {
+                    submesh.Vertices.Add(vertices[index]);
+                }
+            }
+
+            for (var i = 0; i < info.PolygonCount; i++)
+            {
+                var faceIndex = info.PolygonStart - 1 + i;
+                if (faceIndex < 0 || faceIndex >= rawFaces.Count)
+                {
+                    continue;
+                }
+
+                var face = rawFaces[faceIndex];
+                var a = face.A - info.VertexMin;
+                var b = face.B - info.VertexMin;
+                var c = face.C - info.VertexMin;
+                if (a >= 0 && b >= 0 && c >= 0 &&
+                    a < submesh.Vertices.Count && b < submesh.Vertices.Count && c < submesh.Vertices.Count)
+                {
+                    submesh.Faces.Add((a, b, c));
+                }
+            }
+
+            if (submesh.Vertices.Count > 0 && submesh.Faces.Count > 0)
+            {
+                mesh.Submeshes.Add(submesh);
+            }
+        }
+
+        if (mesh.Submeshes.Count == 0)
+        {
+            throw new InvalidDataException("No submesh with valid triangles was found.");
+        }
+
+        return mesh;
+    }
+
     private static MeshData ParseV13(DataReader reader, string name, int version)
     {
         reader.Skip(4);
@@ -331,7 +518,7 @@ public static class D3DMeshParser
         SkipSizedBlock(reader);
         reader.Skip(0x08);
 
-        ReadV13TextureGroups(reader, infos);
+        ReadTextureGroups(reader, infos, TextureSlotsV13);
 
         var uv1X = reader.ReadFloat();
         var uv1Y = reader.ReadFloat();
@@ -522,13 +709,17 @@ public static class D3DMeshParser
         return vertices;
     }
 
-    private static void ReadV13TextureGroups(DataReader reader, IReadOnlyList<SubmeshInfo> infos)
+    private static void ReadTextureGroups(
+        DataReader reader,
+        IReadOnlyList<SubmeshInfo> infos,
+        IReadOnlyList<string> textureSlots,
+        int finalTextureSubBlockBytes = 20)
     {
         reader.ReadUInt32();
-        var groups = TextureSlotsV13.ToDictionary(slot => slot, _ => new List<string>(), StringComparer.OrdinalIgnoreCase);
-        for (var group = 0; group < TextureSlotsV13.Length; group++)
+        var groups = textureSlots.ToDictionary(slot => slot, _ => new List<string>(), StringComparer.OrdinalIgnoreCase);
+        for (var group = 0; group < textureSlots.Count; group++)
         {
-            var slot = TextureSlotsV13[group];
+            var slot = textureSlots[group];
             var textureCount = checked((int)reader.ReadUInt32());
             if (textureCount < 0 || textureCount > 4096)
             {
@@ -544,13 +735,13 @@ public static class D3DMeshParser
                 reader.Skip(12);
                 reader.Skip(24);
                 reader.ReadUInt32();
-                reader.Skip(20);
+                reader.Skip(finalTextureSubBlockBytes);
             }
         }
 
         foreach (var info in infos)
         {
-            foreach (var slot in TextureSlotsV13)
+            foreach (var slot in textureSlots)
             {
                 if (!info.TextureNames.TryGetValue(slot, out var reference) ||
                     !reference.StartsWith("texture_", StringComparison.OrdinalIgnoreCase) ||
@@ -680,6 +871,258 @@ public static class D3DMeshParser
         return vertices;
     }
 
+    private static List<VertexData> ReadVerticesV18(
+        DataReader reader,
+        float uv1X,
+        float uv1Y,
+        float uv2X,
+        float uv2Y,
+        float uv3X,
+        float uv3Y,
+        float uv4X,
+        float uv4Y)
+    {
+        var sections = new List<VertexBufferSection>();
+        for (var bufferIndex = 0; bufferIndex < 2; bufferIndex++)
+        {
+            var vertexCount = checked((int)reader.ReadUInt32());
+            var vertexStride = checked((int)reader.ReadUInt32());
+            reader.Skip(0x08);
+            reader.ReadUInt32();
+
+            var attrs = new Dictionary<string, AttrDescriptor>(StringComparer.OrdinalIgnoreCase)
+            {
+                ["position"] = ReadAttr(reader),
+                ["uv1"] = ReadAttr(reader),
+                ["normals"] = ReadAttr(reader),
+                ["weights"] = ReadAttr(reader),
+                ["bones"] = ReadAttr(reader),
+                ["colors"] = ReadAttr(reader),
+                ["unknown1"] = ReadAttr(reader),
+                ["binormals"] = ReadAttr(reader),
+                ["tangents"] = ReadAttr(reader),
+                ["uv2"] = ReadAttr(reader),
+                ["uv3"] = ReadAttr(reader),
+                ["uv4"] = ReadAttr(reader),
+                ["uv5"] = ReadAttr(reader),
+            };
+
+            var dataStart = reader.Position;
+            sections.Add(new VertexBufferSection(vertexCount, vertexStride, dataStart, attrs));
+            reader.Seek(dataStart + checked(vertexCount * vertexStride));
+        }
+
+        var totalVertices = sections.Count == 0 ? 0 : sections.Max(section => section.VertexCount);
+        var vertices = new List<VertexData>(totalVertices);
+        for (var i = 0; i < totalVertices; i++)
+        {
+            var (x, y, z) = ReadPositionFromSections(reader, sections, i);
+            var (u, v) = ReadUvFromSections(reader, sections, i, "uv1", uv1X, uv1Y);
+            var (u2, v2) = ReadUvFromSections(reader, sections, i, "uv2", uv2X, uv2Y);
+            var (u3, v3) = ReadUvFromSections(reader, sections, i, "uv3", uv3X, uv3Y);
+            var (u4, v4) = ReadUvFromSections(reader, sections, i, "uv4", uv4X, uv4Y);
+            if (u2 == 0f && v2 == 0f)
+            {
+                u2 = u;
+                v2 = v;
+            }
+            if (u3 == 0f && v3 == 0f)
+            {
+                u3 = u2;
+                v3 = v2;
+            }
+            if (u4 == 0f && v4 == 0f)
+            {
+                u4 = u3;
+                v4 = v3;
+            }
+
+            var (nx, ny, nz) = ReadNormalFromSections(reader, sections, i);
+            var (bone0, bone1, bone2, bone3) = ReadBonesFromSectionsV18(reader, sections, i);
+            var (weight0, weight1, weight2, weight3) = ReadWeightsFromSectionsV18(reader, sections, i);
+            var (colorR, colorG, colorB, colorA) = ReadColorFromSections(reader, sections, i);
+            var unknown1Value = ReadUnknownFromSections(reader, sections, i);
+            var (binormalX, binormalY, binormalZ, binormalW) = ReadVector4FromSections(reader, sections, i, "binormals");
+            var (tangentX, tangentY, tangentZ, tangentW) = ReadVector4FromSections(reader, sections, i, "tangents");
+
+            vertices.Add(new VertexData(x, y, z, nx, ny, nz, u, v, u2, v2, u3, v3, u4, v4, bone0, bone1, bone2, bone3, weight0, weight1, weight2, weight3, colorR, colorG, colorB, colorA, unknown1Value, binormalX, binormalY, binormalZ, binormalW, tangentX, tangentY, tangentZ, tangentW));
+        }
+
+        return vertices;
+    }
+
+    private static (float X, float Y, float Z) ReadPositionFromSections(
+        DataReader reader,
+        IReadOnlyList<VertexBufferSection> sections,
+        int vertexIndex)
+    {
+        if (!TryFindAttr(sections, vertexIndex, "position", out var section, out var attr))
+        {
+            return (0f, 0f, 0f);
+        }
+
+        reader.Seek(section.DataStart + vertexIndex * section.Stride + checked((int)attr.Offset));
+        return attr.Format switch
+        {
+            1 => (reader.ReadFloat(), reader.ReadFloat(), reader.ReadFloat()),
+            _ => throw new InvalidDataException($"Unknown position format: {attr.Format}"),
+        };
+    }
+
+    private static (float U, float V) ReadUvFromSections(
+        DataReader reader,
+        IReadOnlyList<VertexBufferSection> sections,
+        int vertexIndex,
+        string attrName,
+        float multX,
+        float multY)
+    {
+        if (!TryFindAttr(sections, vertexIndex, attrName, out var section, out var attr))
+        {
+            return (0f, 0f);
+        }
+
+        reader.Seek(section.DataStart + vertexIndex * section.Stride + checked((int)attr.Offset));
+        ReadUv(reader, attr.Format, multX, multY, out var u, out var v);
+        return (u, v);
+    }
+
+    private static (float X, float Y, float Z) ReadNormalFromSections(
+        DataReader reader,
+        IReadOnlyList<VertexBufferSection> sections,
+        int vertexIndex)
+    {
+        if (!TryFindAttr(sections, vertexIndex, "normals", out var section, out var attr))
+        {
+            return (0f, 1f, 0f);
+        }
+
+        reader.Seek(section.DataStart + vertexIndex * section.Stride + checked((int)attr.Offset));
+        if (attr.Format == 2)
+        {
+            return (reader.ReadSByte() / 127f, reader.ReadSByte() / 127f, reader.ReadSByte() / 127f);
+        }
+        if (attr.Format == 4)
+        {
+            return (reader.ReadInt16() / 32767f, reader.ReadInt16() / 32767f, reader.ReadInt16() / 32767f);
+        }
+
+        throw new InvalidDataException($"Unknown normal format: {attr.Format}");
+    }
+
+    private static (int Bone0, int Bone1, int Bone2, int Bone3) ReadBonesFromSectionsV18(
+        DataReader reader,
+        IReadOnlyList<VertexBufferSection> sections,
+        int vertexIndex)
+    {
+        if (!TryFindAttr(sections, vertexIndex, "bones", out var section, out var attr))
+        {
+            return (0, 0, 0, 0);
+        }
+
+        reader.Seek(section.DataStart + vertexIndex * section.Stride + checked((int)attr.Offset));
+        return attr.Format switch
+        {
+            3 => (reader.ReadByte() / 4, reader.ReadByte() / 4, reader.ReadByte() / 4, reader.ReadByte() / 4),
+            8 => (reader.ReadByte() / 3, reader.ReadByte() / 3, reader.ReadByte() / 3, reader.ReadByte() / 3),
+            _ => throw new InvalidDataException($"Unknown bone format: {attr.Format}"),
+        };
+    }
+
+    private static (float Weight0, float Weight1, float Weight2, float Weight3) ReadWeightsFromSectionsV18(
+        DataReader reader,
+        IReadOnlyList<VertexBufferSection> sections,
+        int vertexIndex)
+    {
+        if (!TryFindAttr(sections, vertexIndex, "weights", out var section, out var attr))
+        {
+            return (1f, 0f, 0f, 0f);
+        }
+
+        reader.Seek(section.DataStart + vertexIndex * section.Stride + checked((int)attr.Offset));
+        return attr.Format switch
+        {
+            1 => NormalizeWeights(reader.ReadFloat(), reader.ReadFloat(), reader.ReadFloat(), 0f),
+            4 => NormalizeWeights(
+                reader.ReadInt16() / 32767f,
+                reader.ReadInt16() / 32767f,
+                reader.ReadInt16() / 32767f,
+                reader.ReadInt16() / 32767f),
+            5 => NormalizeWeights(
+                reader.ReadUInt16() / 65535f,
+                reader.ReadUInt16() / 65535f,
+                reader.ReadUInt16() / 65535f,
+                reader.ReadUInt16() / 65535f),
+            _ => throw new InvalidDataException($"Unknown weight format: {attr.Format}"),
+        };
+    }
+
+    private static (float R, float G, float B, float A) ReadColorFromSections(
+        DataReader reader,
+        IReadOnlyList<VertexBufferSection> sections,
+        int vertexIndex)
+    {
+        if (!TryFindAttr(sections, vertexIndex, "colors", out var section, out var attr))
+        {
+            return (1f, 1f, 1f, 1f);
+        }
+
+        reader.Seek(section.DataStart + vertexIndex * section.Stride + checked((int)attr.Offset));
+        return ReadColor(reader, attr.Format);
+    }
+
+    private static float ReadUnknownFromSections(
+        DataReader reader,
+        IReadOnlyList<VertexBufferSection> sections,
+        int vertexIndex)
+    {
+        if (!TryFindAttr(sections, vertexIndex, "unknown1", out var section, out var attr))
+        {
+            return 0f;
+        }
+
+        reader.Seek(section.DataStart + vertexIndex * section.Stride + checked((int)attr.Offset));
+        return ReadUnknown(reader, attr.Format);
+    }
+
+    private static (float X, float Y, float Z, float W) ReadVector4FromSections(
+        DataReader reader,
+        IReadOnlyList<VertexBufferSection> sections,
+        int vertexIndex,
+        string attrName)
+    {
+        if (!TryFindAttr(sections, vertexIndex, attrName, out var section, out var attr))
+        {
+            return (0f, 0f, 0f, 0f);
+        }
+
+        reader.Seek(section.DataStart + vertexIndex * section.Stride + checked((int)attr.Offset));
+        return ReadVector4(reader, attr.Format);
+    }
+
+    private static bool TryFindAttr(
+        IReadOnlyList<VertexBufferSection> sections,
+        int vertexIndex,
+        string attrName,
+        out VertexBufferSection section,
+        out AttrDescriptor attr)
+    {
+        foreach (var candidate in sections)
+        {
+            if (vertexIndex < candidate.VertexCount &&
+                candidate.Attributes.TryGetValue(attrName, out attr) &&
+                attr.Format != 0)
+            {
+                section = candidate;
+                return true;
+            }
+        }
+
+        section = null!;
+        attr = default;
+        return false;
+    }
+
     private static AttrDescriptor ReadAttr(DataReader reader)
     {
         return new AttrDescriptor(reader.ReadUInt32(), reader.ReadUInt32(), reader.ReadUInt32());
@@ -788,6 +1231,12 @@ public static class D3DMeshParser
         reader.Skip(size);
     }
 
+    private static int ReadOptionalIndexPlusOne(DataReader reader)
+    {
+        var raw = reader.ReadUInt32();
+        return raw == uint.MaxValue ? 0 : checked((int)raw + 1);
+    }
+
     private static List<ulong[]> ReadBonePalettes(DataReader reader, int entrySize)
     {
         reader.ReadUInt32();
@@ -856,8 +1305,8 @@ public static class D3DMeshParser
                 v = -(reader.ReadUInt16() / 65535f * multY) + 1f;
                 return;
             case 11:
-                u = reader.ReadHalf() * 2f;
-                v = -(reader.ReadHalf() * 2f) + 1f;
+                u = reader.ReadHalf();
+                v = -reader.ReadHalf() + 1f;
                 return;
             default:
                 throw new InvalidDataException($"Unknown UV format: {format}");
@@ -997,6 +1446,12 @@ public static class D3DMeshParser
         int PolygonCount,
         int MaterialIndex,
         Dictionary<string, string> TextureNames);
+
+    private sealed record VertexBufferSection(
+        int VertexCount,
+        int Stride,
+        int DataStart,
+        IReadOnlyDictionary<string, AttrDescriptor> Attributes);
 
     private readonly record struct AttrDescriptor(uint Offset = 0, uint Count = 0, uint Format = 0);
 }

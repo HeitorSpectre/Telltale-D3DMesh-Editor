@@ -24,7 +24,7 @@ public static class SkeletonMerger
         var outputIndexByHash = new Dictionary<ulong, int>();
         for (var i = 0; i < original.Entries.Count; i++)
         {
-            var name = original.Entries[i].JointNameS;
+            var name = original.Entries[i].JointName;
             if (name is null)
             {
                 continue;
@@ -103,13 +103,13 @@ public static class SkeletonMerger
         IReadOnlyDictionary<string, BoneData> editedByName,
         out BoneData bone)
     {
-        if (entry.JointNameS is not null &&
-            editedByHash.TryGetValue(entry.JointNameS.Crc64, out bone!))
+        if (entry.JointName is not null &&
+            editedByHash.TryGetValue(entry.JointName.Crc64, out bone!))
         {
             return true;
         }
 
-        var name = entry.JointNameS?.DebugString ?? entry.JointName;
+        var name = GetSymbolName(entry.JointName);
         if (!string.IsNullOrWhiteSpace(name) &&
             editedByName.TryGetValue(name, out bone!))
         {
@@ -154,13 +154,10 @@ public static class SkeletonMerger
         var parentSymbol = ResolveParentSymbol(bone, original, parentIndex);
         return new TtkSkeleton.Entry
         {
-            JointNameS = jointSymbol,
-            JointName = ResolveBoneName(bone, jointSymbol),
-            ParentNameS = parentSymbol,
-            ParentName = parentSymbol.DebugString ?? BoneHashDatabase.Resolve(parentSymbol.Crc64) ?? "",
+            JointName = jointSymbol,
+            ParentName = parentSymbol,
             ParentIndex = parentIndex,
-            MirrorBoneNameS = Symbol.Empty,
-            MirrorBoneName = "",
+            MirrorBoneName = Symbol.Empty,
             MirrorBoneIndex = -1,
             LocalPosition = position,
             LocalQuat = rotation,
@@ -178,11 +175,6 @@ public static class SkeletonMerger
 
     private static Symbol ResolveBoneSymbol(BoneData bone)
         => string.IsNullOrEmpty(bone.Name) ? Symbol.FromCrc64(bone.Hash) : Symbol.FromName(bone.Name);
-
-    private static string ResolveBoneName(BoneData bone, Symbol symbol)
-        => !string.IsNullOrEmpty(bone.Name)
-            ? bone.Name
-            : symbol.DebugString ?? BoneHashDatabase.Resolve(symbol.Crc64) ?? $"bone_{symbol.Crc64:X16}";
 
     private static void RefreshDerivedFields(TtkSkeleton skeleton, IReadOnlySet<int> entryIndices)
     {
@@ -227,7 +219,7 @@ public static class SkeletonMerger
     {
         if (parentIndex >= 0 && parentIndex < skeleton.Entries.Count)
         {
-            return skeleton.Entries[parentIndex].JointNameS ?? Symbol.FromCrc64(bone.ParentHash);
+            return skeleton.Entries[parentIndex].JointName ?? Symbol.FromCrc64(bone.ParentHash);
         }
 
         return bone.ParentHash != 0 ? Symbol.FromCrc64(bone.ParentHash) : Symbol.Empty;
@@ -339,5 +331,15 @@ public static class SkeletonMerger
         }
 
         return Quaternion.Normalize(rotation);
+    }
+
+    private static string? GetSymbolName(Symbol? symbol)
+    {
+        if (symbol is null || string.IsNullOrWhiteSpace(symbol.DebugString))
+        {
+            return null;
+        }
+
+        return symbol.DebugString;
     }
 }

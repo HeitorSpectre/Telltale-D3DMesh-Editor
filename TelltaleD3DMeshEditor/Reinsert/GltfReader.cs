@@ -577,8 +577,7 @@ public static class GltfReader
                         continue;
                     }
 
-                    var primitiveTransform = hasSkin ? worldTransform : Matrix4x4.Identity;
-                    primitives.Add(ReadPrimitive(prim, ctx, primitiveTransform, isSkinned: hasSkin));
+                    primitives.Add(ReadPrimitive(prim, ctx, worldTransform, isSkinned: hasSkin));
                 }
             }
         }
@@ -775,6 +774,11 @@ public static class GltfReader
            primitive.SourceSubmeshIndex is not null ||
            !string.IsNullOrWhiteSpace(primitive.SourceMeshPath);
 
+    private static bool HasTelltaleSourceMetadata((int? BonePaletteIndex, string? SourceMeshPath, int? SourceSubmeshIndex) source)
+        => source.BonePaletteIndex is not null ||
+           source.SourceSubmeshIndex is not null ||
+           !string.IsNullOrWhiteSpace(source.SourceMeshPath);
+
     private static void RotateZUpToYUp(Vector3[] vectors, bool positiveZIsUp, bool normalize = false)
     {
         for (var i = 0; i < vectors.Length; i++)
@@ -922,12 +926,16 @@ public static class GltfReader
     private static GltfPrimitive ReadPrimitive(JsonElement prim, ParseContext ctx, Matrix4x4 transform, bool isSkinned = false)
     {
         var attrs = prim.GetProperty("attributes");
+        var source = ReadTelltaleSource(prim);
+        var effectiveTransform = !isSkinned && HasTelltaleSourceMetadata(source)
+            ? Matrix4x4.Identity
+            : transform;
         var positions = ReadVec3(ctx, GetAttr(attrs, "POSITION"))
             ?? throw new InvalidDataException("primitiva sem POSITION.");
         var normals = ReadVec3(ctx, GetAttr(attrs, "NORMAL"));
         var tangents = ReadVec4(ctx, GetAttr(attrs, "TANGENT"));
         var binormals = ReadVec4(ctx, GetAttr(attrs, "_TT_BINORMAL"));
-        ApplyTransform(positions, normals, tangents, binormals, transform);
+        ApplyTransform(positions, normals, tangents, binormals, effectiveTransform);
         var uv0 = ReadVec2(ctx, GetAttr(attrs, "TEXCOORD_0"));
         var uv1 = ReadVec2(ctx, GetAttr(attrs, "TEXCOORD_1"));
         var uv2 = ReadVec2(ctx, GetAttr(attrs, "TEXCOORD_2"));
@@ -936,8 +944,6 @@ public static class GltfReader
         var unknown1 = ReadScalarFloats(ctx, GetAttr(attrs, "_TT_UNKNOWN1"));
         var joints0 = ReadUShort4(ctx, GetAttr(attrs, "JOINTS_0"));
         var weights0 = ReadVec4(ctx, GetAttr(attrs, "WEIGHTS_0"));
-        var source = ReadTelltaleSource(prim);
-
         int[] indices;
         if (prim.TryGetProperty("indices", out var indicesElem))
         {
