@@ -1,9 +1,15 @@
 # Telltale D3DMesh Editor
 
-[![Wiki](https://img.shields.io/badge/Wiki-gray?style=flat-square)](https://github.com/HeitorSpectre/Telltale-D3DMesh-Editor/wiki)
-[![Release](https://img.shields.io/github/v/release/HeitorSpectre/Telltale-D3DMesh-Editor?label=release&style=flat-square)](https://github.com/HeitorSpectre/Telltale-D3DMesh-Editor/releases)
-[![Discord](https://img.shields.io/badge/Discord-blue?style=flat-square&logo=discord&logoColor=white)](https://discord.com/invite/HqpnTenqwp)
-[![Downloads](https://img.shields.io/github/downloads/HeitorSpectre/Telltale-D3DMesh-Editor/latest/total?label=downloads&style=flat-square&color=green)](https://github.com/HeitorSpectre/Telltale-D3DMesh-Editor/releases/latest)
+![Version](https://img.shields.io/github/v/release/HeitorSpectre/Telltale-D3DMesh-Editor?style=for-the-badge&label=Version)
+![Downloads](https://img.shields.io/github/downloads/HeitorSpectre/Telltale-D3DMesh-Editor/total?style=for-the-badge&label=Downloads)
+![Latest Downloads](https://img.shields.io/github/downloads/HeitorSpectre/Telltale-D3DMesh-Editor/latest/total?style=for-the-badge&label=Latest%20Downloads)
+![Stars](https://img.shields.io/github/stars/HeitorSpectre/Telltale-D3DMesh-Editor?style=for-the-badge&label=Stars)
+![License](https://img.shields.io/github/license/HeitorSpectre/Telltale-D3DMesh-Editor?style=for-the-badge&label=License)
+
+![Engine](https://img.shields.io/badge/Engine-Telltale%20Tool-darkgreen?style=for-the-badge)
+![Type](https://img.shields.io/badge/Type-D3DMesh%20Editor-orange?style=for-the-badge)
+![Language](https://img.shields.io/badge/C%23-.NET%209-purple?style=for-the-badge)
+![Status](https://img.shields.io/badge/Status-Active-success?style=for-the-badge)
 
 ## Description
 
