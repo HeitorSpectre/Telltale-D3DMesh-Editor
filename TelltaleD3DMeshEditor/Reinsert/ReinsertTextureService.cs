@@ -85,12 +85,15 @@ public static class ReinsertTextureService
                 var imageKey = ImageKey(image);
                 if (!writtenByImage.TryGetValue(imageKey, out var textureName))
                 {
+                    var namingSlot = diffuseImageKeys.Contains(imageKey)
+                        ? "diffuse"
+                        : normalizedReference;
                     var preferredNames = preferredOriginalNamesByImageKey.TryGetValue(imageKey, out var foundPreferredNames) ? foundPreferredNames : [];
                     var originalNameCandidates = useOriginalNameTickets
-                        ? BuildOriginalNameCandidates(normalizedReference, preferredNames, originalTextureNamePool)
+                        ? BuildOriginalNameCandidates(namingSlot, preferredNames, originalTextureNamePool)
                         : preferredNames;
-                    var semanticTemplateName = ResolveSemanticTemplateName(primitive, image.Name, normalizedReference, semanticTemplateNames, gameConfig);
-                    if (ShouldSkipUnmappedSecondaryTexture(gameConfig, nameMode, normalizedReference, semanticTemplateName))
+                    var semanticTemplateName = ResolveSemanticTemplateName(primitive, image.Name, namingSlot, semanticTemplateNames, gameConfig);
+                    if (ShouldSkipUnmappedSecondaryTexture(gameConfig, nameMode, namingSlot, semanticTemplateName))
                     {
                         continue;
                     }
@@ -138,6 +141,17 @@ public static class ReinsertTextureService
                 var normalizedSlot = NormalizeTextureSlotName(slot);
                 if (!IsSupportedTextureSlot(normalizedSlot) || !options.IncludesSlot(normalizedSlot))
                 {
+                    continue;
+                }
+
+                var slotImageKey = ImageKey(image);
+                if (!normalizedSlot.Equals("diffuse", StringComparison.OrdinalIgnoreCase) &&
+                    diffuseImageKeys.Contains(slotImageKey))
+                {
+                    if (writtenByImage.TryGetValue(slotImageKey, out var sharedDiffuseTextureName))
+                    {
+                        slots[normalizedSlot] = sharedDiffuseTextureName;
+                    }
                     continue;
                 }
 
@@ -201,8 +215,7 @@ public static class ReinsertTextureService
                     continue;
                 }
 
-                var imageKey = ImageKey(image);
-                if (writtenByImage.TryGetValue(imageKey, out var textureName))
+                if (writtenByImage.TryGetValue(slotImageKey, out var textureName))
                 {
                     slots[normalizedSlot] = textureName;
                 }
