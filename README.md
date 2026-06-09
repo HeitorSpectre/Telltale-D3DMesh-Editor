@@ -2,7 +2,7 @@
 
 ![Version](https://img.shields.io/github/v/release/HeitorSpectre/Telltale-D3DMesh-Editor?style=for-the-badge&label=Version)
 ![Downloads](https://img.shields.io/github/downloads/HeitorSpectre/Telltale-D3DMesh-Editor/total?style=for-the-badge&label=Downloads)
-[![Wiki](https://img.shields.io/badge/Wiki-Documentation-blue?style=for-the-badge)](https://github.com/HeitorSpectre/Telltale-D3DMesh-Editor/wiki)
+[![Wiki](https://img.shields.io/badge/Wiki-Documentation-blue?style=for-the-badge)](https://github.com/HeitorSpectre/Telltale-D3DMesh-Editor/wiki/D3Dmesh-editing-using-Blender-Tutorial)
 ![Engine](https://img.shields.io/badge/Engine-Telltale%20Tool-darkgreen?style=for-the-badge)
 ![Status](https://img.shields.io/badge/Status-Active-success?style=for-the-badge)
 
