@@ -70,4 +70,4 @@ Special thanks to everyone who helped with this project:
 - **D3DMeshUtilities** by [Gamma_02](https://github.com/gamma-02)
 - **D3DMESH-Converter** by [David Matos](https://github.com/frostbone25)
 - **TelltaleGames_D3DMesh** by [RandomTBush](https://github.com/RandomTBush)
-- **Testing** by [Aabii / Arizzble](https://github.com/Arizzble)
+- **Testing and Documentation** by [Aabii / Arizzble](https://github.com/Arizzble)
