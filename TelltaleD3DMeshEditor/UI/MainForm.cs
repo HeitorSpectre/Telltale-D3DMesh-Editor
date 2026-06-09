@@ -1514,6 +1514,14 @@ public sealed class MainForm : Form
         var gameConfig = GameConfig.Current;
         var layout = D3DMeshLayout.Build(File.ReadAllBytes(asset.MeshPath));
         var model = GltfModelPreprocessor.ApplyGameReinsertRules(GltfReader.Load(input), gameConfig);
+        // With the atlas active the face/hand ink-line textures are baked into the atlas and their detail
+        // slots are dropped, so the normal detail-write inversion can't run. Invert the face and hand line
+        // alpha here, before atlasing, so the baked head and hands still render correctly (TWD S2 shader).
+        if (useDiffuseAtlas && gameConfig.InvertHeadLineAlphaOnReimport)
+        {
+            model = CharacterLineAtlasFix.InvertFaceAndHandLineAlpha(model);
+        }
+
         var atlas = ApplyDiffuseAtlasIfRequested(model, useDiffuseAtlas);
         model = atlas.Model;
         var skeleton = LoadSkeletonOrNull(asset.SkeletonPath, layout.Version);
@@ -1612,6 +1620,11 @@ public sealed class MainForm : Form
                 Joints = combinedModel.Joints,
                 Skeleton = combinedModel.Skeleton,
             };
+            if (useDiffuseAtlas && gameConfig.InvertHeadLineAlphaOnReimport)
+            {
+                partModel = CharacterLineAtlasFix.InvertFaceAndHandLineAlpha(partModel);
+            }
+
             var atlas = ApplyDiffuseAtlasIfRequested(partModel, useDiffuseAtlas);
             partModel = atlas.Model;
             var output = Path.Combine(outputFolder, Path.GetFileName(asset.MeshPath));
