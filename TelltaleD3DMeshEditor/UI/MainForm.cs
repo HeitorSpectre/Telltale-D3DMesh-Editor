@@ -1672,6 +1672,8 @@ public sealed class MainForm : Form
                     "detail_diffuse",
                     "tex7",
                     "tex8",
+                    "bump",
+                    "normal",
                 },
             }
             : new ReinsertTextureOptions { ForceUncompressed = uncompressedTextures };

@@ -48,6 +48,23 @@ public static class GltfDiffuseAtlasPacker
                 MimeType = "image/png",
             };
 
+            // Normal maps share UV0 with the diffuse, so they can't live in a separate region of the same
+            // atlas. Instead build a PARALLEL normal-map atlas with identical placements: each material's
+            // normal map sits at the exact spot its diffuse occupies in the diffuse atlas, so the same
+            // remapped UV0 samples the matching normal map. Unused/detail areas stay flat normal.
+            var bumpByDiffuseKey = CollectBumpByDiffuseKey(model);
+            GltfImage? normalAtlasImage = null;
+            if (bumpByDiffuseKey.Count > 0)
+            {
+                using var normalAtlas = BuildNormalAtlas(atlas.Width, atlas.Height, placements, bumpByDiffuseKey, Math.Max(0, options.Padding));
+                normalAtlasImage = new GltfImage
+                {
+                    Name = options.AtlasName + "_nm",
+                    Data = EncodePng(normalAtlas),
+                    MimeType = "image/png",
+                };
+            }
+
             var warnings = new List<string>();
             var newPrimitives = new List<GltfPrimitive>(model.Primitives.Count);
             for (var primitiveIndex = 0; primitiveIndex < model.Primitives.Count; primitiveIndex++)
@@ -108,6 +125,13 @@ public static class GltfDiffuseAtlasPacker
                     referencedTextures["detail_diffuse"] = atlasImage;
                 }
 
+                // Point the normal-map slot at the parallel normal atlas (sampled with the same UV0).
+                if (normalAtlasImage is not null && TryGetBumpSlot(primitive, out var bumpSlot))
+                {
+                    textureSlots[bumpSlot] = normalAtlasImage;
+                    referencedTextures[bumpSlot] = normalAtlasImage;
+                }
+
                 newPrimitives.Add(ClonePrimitive(primitive, uv0, uv1, uv2, textureSlots, referencedTextures, atlasImage));
             }
 
@@ -164,6 +188,111 @@ public static class GltfDiffuseAtlasPacker
         }
 
         return result;
+    }
+
+    private static readonly string[] BumpSlotNames = ["bump", "normal", "normalmap", "normal_map", "nm"];
+
+    // Maps each unique diffuse (by its atlas key) to a normal-map image, so the normal atlas can place
+    // that normal map at the same spot the diffuse occupies in the diffuse atlas.
+    private static Dictionary<string, GltfImage> CollectBumpByDiffuseKey(GltfModel model)
+    {
+        var map = new Dictionary<string, GltfImage>(StringComparer.OrdinalIgnoreCase);
+        foreach (var primitive in model.Primitives)
+        {
+            if (primitive.TextureSlots.TryGetValue("diffuse", out var diffuse) &&
+                primitive.Uv0 is not null &&
+                TryGetBumpSlot(primitive, out var bumpSlot))
+            {
+                map.TryAdd(DiffuseAtlasKey(diffuse), primitive.TextureSlots[bumpSlot]);
+            }
+        }
+
+        return map;
+    }
+
+    private static bool TryGetBumpSlot(GltfPrimitive primitive, out string slot)
+    {
+        foreach (var candidate in BumpSlotNames)
+        {
+            if (primitive.TextureSlots.ContainsKey(candidate))
+            {
+                slot = candidate;
+                return true;
+            }
+        }
+
+        foreach (var (key, image) in primitive.TextureSlots)
+        {
+            if (IsNormalMapName(image.Name))
+            {
+                slot = key;
+                return true;
+            }
+        }
+
+        slot = "";
+        return false;
+    }
+
+    private static bool IsNormalMapName(string textureName)
+    {
+        var lower = Path.GetFileNameWithoutExtension(textureName).ToLowerInvariant();
+        return lower.EndsWith("_nm", StringComparison.Ordinal) ||
+               lower.EndsWith("_normal", StringComparison.Ordinal) ||
+               lower.Contains("_normal_", StringComparison.Ordinal) ||
+               lower.Contains("normalmap", StringComparison.Ordinal);
+    }
+
+    // Builds a normal-map atlas the same size as the diffuse atlas, with each material's normal map drawn
+    // at its diffuse placement. Everything else is filled with a flat tangent-space normal (128,128,255).
+    private static Bitmap BuildNormalAtlas(
+        int width,
+        int height,
+        IReadOnlyDictionary<string, AtlasPlacement> placements,
+        IReadOnlyDictionary<string, GltfImage> bumpByDiffuseKey,
+        int padding)
+    {
+        var atlas = new Bitmap(width, height, PixelFormat.Format32bppArgb);
+        using (var graphics = Graphics.FromImage(atlas))
+        {
+            graphics.Clear(Color.FromArgb(255, 128, 128, 255));
+        }
+
+        foreach (var (diffuseKey, bump) in bumpByDiffuseKey)
+        {
+            if (!placements.TryGetValue(diffuseKey, out var placement))
+            {
+                continue;
+            }
+
+            using var stream = new MemoryStream(bump.Data);
+            using var source = new Bitmap(stream);
+            var normalBitmap = new Bitmap(source.Width, source.Height, PixelFormat.Format32bppArgb);
+            using (var graphics = Graphics.FromImage(normalBitmap))
+            {
+                graphics.CompositingMode = CompositingMode.SourceCopy;
+                graphics.DrawImage(source, 0, 0, source.Width, source.Height);
+            }
+
+            if (normalBitmap.Width != placement.SourceWidth || normalBitmap.Height != placement.SourceHeight)
+            {
+                var resized = ResizeBitmap(normalBitmap, placement.SourceWidth, placement.SourceHeight);
+                normalBitmap.Dispose();
+                normalBitmap = resized;
+            }
+
+            using (var graphics = Graphics.FromImage(atlas))
+            {
+                graphics.CompositingMode = CompositingMode.SourceCopy;
+                graphics.PixelOffsetMode = PixelOffsetMode.Half;
+                graphics.DrawImageUnscaled(normalBitmap, placement.X, placement.Y);
+            }
+
+            ReplicatePadding(atlas, normalBitmap, placement);
+            normalBitmap.Dispose();
+        }
+
+        return atlas;
     }
 
     private static List<DecodedImage> DecodeImages(IReadOnlyList<AtlasSourceImage> images)
