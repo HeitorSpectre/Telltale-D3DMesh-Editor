@@ -146,10 +146,10 @@ internal static class AssetGltfBuilder
                                    Math.Abs(vertexColor.G - 1f) > 0.001f ||
                                    Math.Abs(vertexColor.B - 1f) > 0.001f ||
                                    Math.Abs(vertexColor.A - 1f) > 0.001f;
-                GltfCommon.AddUInt16(joints, GltfCommon.RemapJoint(v.Bone0, palette, boneIndexByHash));
-                GltfCommon.AddUInt16(joints, GltfCommon.RemapJoint(v.Bone1, palette, boneIndexByHash));
-                GltfCommon.AddUInt16(joints, GltfCommon.RemapJoint(v.Bone2, palette, boneIndexByHash));
-                GltfCommon.AddUInt16(joints, GltfCommon.RemapJoint(v.Bone3, palette, boneIndexByHash));
+                GltfCommon.AddUInt16(joints, GltfCommon.RemapJoint(v.Bone0, mesh.Version, palette, boneIndexByHash));
+                GltfCommon.AddUInt16(joints, GltfCommon.RemapJoint(v.Bone1, mesh.Version, palette, boneIndexByHash));
+                GltfCommon.AddUInt16(joints, GltfCommon.RemapJoint(v.Bone2, mesh.Version, palette, boneIndexByHash));
+                GltfCommon.AddUInt16(joints, GltfCommon.RemapJoint(v.Bone3, mesh.Version, palette, boneIndexByHash));
                 GltfCommon.AddFloat(weights, v.Weight0); GltfCommon.AddFloat(weights, v.Weight1);
                 GltfCommon.AddFloat(weights, v.Weight2); GltfCommon.AddFloat(weights, v.Weight3);
                 xs.Add(v.X); ys.Add(v.Y); zs.Add(v.Z);

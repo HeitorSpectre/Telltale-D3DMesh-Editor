@@ -78,7 +78,7 @@ public static class ReinsertCli
                 return;
             case "--rewrite-texture":
                 Require(args, 4);
-                RewriteTexture(args[1], args[2], args[3]);
+                RewriteTexture(args[1], args[2], args[3], args.Length > 4 && args[4] == "--uncompressed");
                 return;
             case "--reinsert-prop":
                 Require(args, 4);
@@ -500,7 +500,7 @@ public static class ReinsertCli
         }
     }
 
-    private static void RewriteTexture(string templateTexture, string imagePath, string outputTexture)
+    private static void RewriteTexture(string templateTexture, string imagePath, string outputTexture, bool forceUncompressed = false)
     {
         Directory.CreateDirectory(Path.GetDirectoryName(Path.GetFullPath(outputTexture)) ?? ".");
         var image = new GltfImage
@@ -509,7 +509,7 @@ public static class ReinsertCli
             Data = File.ReadAllBytes(imagePath),
             MimeType = MimeTypeFromExtension(imagePath),
         };
-        D3dtxWriter.WriteFromImageBytes(File.ReadAllBytes(templateTexture), image, outputTexture);
+        D3dtxWriter.WriteFromImageBytes(File.ReadAllBytes(templateTexture), image, outputTexture, forceUncompressed);
         var info = TextureLoader.InspectFormat(outputTexture);
         Console.WriteLine($"rewritten  : {outputTexture}");
         PrintTextureFormatRow(outputTexture, info);

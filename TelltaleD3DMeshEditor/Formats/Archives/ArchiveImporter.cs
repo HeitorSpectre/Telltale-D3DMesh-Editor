@@ -53,8 +53,13 @@ public static class ArchiveImporter
         var (archive, key) = OpenArchiveAuto(archivePath);
         using var _ = archive;
 
+        // Read entries in ascending archive-offset order. Many assets are tiny, so jumping around the
+        // file by entry order makes the I/O / decompression read pages backward and miss the cache;
+        // walking forward by offset keeps reads sequential and speeds up extraction (suggested by the
+        // TelltaleToolKit author).
         var entries = archive.GetAllEntries()
             .Where(e => AssetExtensions.Contains(Path.GetExtension(e.Name), StringComparer.OrdinalIgnoreCase))
+            .OrderBy(e => e.Offset)
             .ToList();
 
         // Note: the output folder is created lazily (per file below) so that archives without any

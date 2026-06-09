@@ -122,11 +122,11 @@ public static class ReinsertTextureService
                         var templateBytes = sourceTexturePath is not null
                             ? File.ReadAllBytes(sourceTexturePath)
                             : fallbackTemplateBytes;
-                        D3dtxWriter.WriteFromImageBytes(templateBytes, InvertImageAlpha(image), outputTexturePath);
+                        D3dtxWriter.WriteFromImageBytes(templateBytes, InvertImageAlpha(image), outputTexturePath, options.ForceUncompressed);
                     }
                     else
                     {
-                        WriteTexturePreservingTemplate(fallbackTemplateBytes, image, sourceTexturePath, outputTexturePath, sourceImageMatches);
+                        WriteTexturePreservingTemplate(fallbackTemplateBytes, image, sourceTexturePath, outputTexturePath, sourceImageMatches, options.ForceUncompressed);
                     }
                     writtenByImage[imageKey] = textureName;
                     writtenNames.Add(textureName);
@@ -706,8 +706,12 @@ public static class ReinsertTextureService
         GltfImage image,
         string? sourceTexturePath,
         string outputTexturePath,
-        bool sourceImageMatches)
+        bool sourceImageMatches,
+        bool forceUncompressed = false)
     {
+        // An exact, unmodified match of the game's own texture is copied verbatim: it already renders
+        // correctly in-game (whatever format it shipped in), so we never recompress it. Forcing
+        // uncompressed only applies when we actually re-encode an imported/modified image below.
         if (sourceTexturePath is not null && sourceImageMatches)
         {
             if (Path.GetFullPath(sourceTexturePath).Equals(Path.GetFullPath(outputTexturePath), StringComparison.OrdinalIgnoreCase))
@@ -722,7 +726,7 @@ public static class ReinsertTextureService
         var templateBytes = sourceTexturePath is not null
             ? File.ReadAllBytes(sourceTexturePath)
             : fallbackTemplateBytes;
-        D3dtxWriter.WriteFromImageBytes(templateBytes, image, outputTexturePath);
+        D3dtxWriter.WriteFromImageBytes(templateBytes, image, outputTexturePath, forceUncompressed);
     }
 
     private static string ChooseOutputTextureName(
@@ -1380,6 +1384,10 @@ public sealed class ReinsertTextureOptions
 
     public ReinsertTextureNameMode NameMode { get; init; } = ReinsertTextureNameMode.GameDefault;
     public IReadOnlySet<string>? IncludedSlots { get; init; }
+
+    // When true, re-encoded textures are written uncompressed (ARGB8) instead of DXT. Used for games
+    // like Minecraft: Story Mode whose low-res character textures ship uncompressed.
+    public bool ForceUncompressed { get; init; }
 
     public bool IncludesSlot(string slot)
     {

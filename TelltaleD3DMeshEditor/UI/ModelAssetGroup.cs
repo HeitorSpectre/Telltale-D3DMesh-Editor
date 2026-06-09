@@ -33,6 +33,9 @@ public sealed class ModelAssetGroup
         "mouth",
         "brow",
         "cheek",
+        "eyelids",
+        "eyelashes",
+        "brows",
         "ear",
         "body",
         "torso",
@@ -322,6 +325,17 @@ public sealed class ModelAssetGroup
         }
 
         var skeletonStem = stem;
+
+        // The Wither Storm is a single giant creature whose parts (three heads, eyelids, mouths, armour,
+        // command block, growths, debris, tentacles) all coexist in one rig. The generic slot classifier
+        // mistakes its Left/Middle/Right heads for mutually-exclusive variants and drops the many unnamed
+        // structural pieces, so the default combine came out as a lone head. Assemble the whole model
+        // instead, with the mouth state (and the transformed middle head) as the only real alternatives.
+        if (skeletonStem.Contains("witherstorm", StringComparison.OrdinalIgnoreCase))
+        {
+            return BuildWitherStormGroups(skeletonStem, skeletonPath, relativeDirectory, assets).ToList();
+        }
+
         var parts = assets
             .Select(asset => ClassifyPart(asset, skeletonStem))
             .ToList();
@@ -381,6 +395,118 @@ public sealed class ModelAssetGroup
         }
 
         return [];
+    }
+
+    // Assembles the complete Wither Storm from its part meshes. Every structural piece (body, heads,
+    // eyelids, armour, command block, growths, debris, tentacles) is kept; only the per-head mouth state
+    // (Default vs Open) and the transformed middle head are mutually-exclusive, so they become the
+    // variant axis. This produces a whole creature instead of the single-head fragment the slot
+    // classifier used to emit.
+    private static IEnumerable<ModelAssetGroup> BuildWitherStormGroups(
+        string skeletonStem,
+        string skeletonPath,
+        string relativeDirectory,
+        IReadOnlyList<ModelAsset> assets)
+    {
+        var tailed = assets
+            .Select(asset => (Asset: asset, Tail: ExtractTail(Path.GetFileNameWithoutExtension(asset.MeshPath), skeletonStem)))
+            .Where(part => !string.IsNullOrEmpty(part.Tail))
+            .ToList();
+        if (tailed.Count <= 1)
+        {
+            return [];
+        }
+
+        bool IsMouth(string tail, string state) => tail.StartsWith("mouth" + state, StringComparison.OrdinalIgnoreCase);
+        bool IsTransformed(string tail) => tail.Contains("Transformed", StringComparison.OrdinalIgnoreCase);
+        bool IsMiddle(string tail) => tail.Contains("Middle", StringComparison.OrdinalIgnoreCase);
+        // The debris clusters are the loose blocks scattered far around the creature (bounds span ~5-11
+        // units vs the ~2.5 body). They clutter the silhouette, so they form a removable layer and a
+        // "clean" group leaves just the recognisable Wither body, growths, armour and command block.
+        bool IsDebris(string tail) => tail.StartsWith("debris", StringComparison.OrdinalIgnoreCase);
+        // Armour plates and growths are the bulky outer masses. A "core" group drops them (and the debris)
+        // to expose just the body, heads and the command block at the centre.
+        bool IsBulk(string tail) => IsDebris(tail)
+            || tail.StartsWith("armor", StringComparison.OrdinalIgnoreCase)
+            || tail.StartsWith("growth", StringComparison.OrdinalIgnoreCase);
+
+        var mouthDefault = tailed.Where(part => IsMouth(part.Tail, "Default")).ToList();
+        var mouthOpen = tailed.Where(part => IsMouth(part.Tail, "Open")).ToList();
+        var transformed = tailed.Where(part => IsTransformed(part.Tail)).ToList();
+        // Structural = everything that is neither a mouth state nor the transformed head. These pieces are
+        // always present and define the bulk of the creature.
+        var structural = tailed
+            .Where(part => !IsMouth(part.Tail, "Default") && !IsMouth(part.Tail, "Open") && !IsTransformed(part.Tail))
+            .Select(part => part.Asset)
+            .ToList();
+        var structuralNoDebris = tailed
+            .Where(part => !IsMouth(part.Tail, "Default") && !IsMouth(part.Tail, "Open")
+                           && !IsTransformed(part.Tail) && !IsDebris(part.Tail))
+            .Select(part => part.Asset)
+            .ToList();
+        var structuralCore = tailed
+            .Where(part => !IsMouth(part.Tail, "Default") && !IsMouth(part.Tail, "Open")
+                           && !IsTransformed(part.Tail) && !IsBulk(part.Tail))
+            .Select(part => part.Asset)
+            .ToList();
+        var hasDebris = structural.Count != structuralNoDebris.Count;
+        var hasBulk = structural.Count != structuralCore.Count;
+
+        var primaryMouth = (mouthDefault.Count > 0 ? mouthDefault : mouthOpen)
+            .Select(part => part.Asset)
+            .ToList();
+
+        var groups = new List<ModelAssetGroup>();
+
+        // The complete model (canonical name = the skeleton stem), closed mouths when available.
+        groups.Add(CreateGroup(skeletonStem, skeletonPath, relativeDirectory, structural.Concat(primaryMouth)));
+
+        // Clean version without the scattered debris blocks: just the Wither body and its growths.
+        if (hasDebris)
+        {
+            groups.Add(CreateGroup(
+                $"{skeletonStem}_clean",
+                skeletonPath,
+                relativeDirectory,
+                structuralNoDebris.Concat(primaryMouth)));
+        }
+
+        // Core version: drops the armour, growths and debris to leave only the body, heads and command
+        // block at the centre.
+        if (hasBulk && structuralCore.Count != structuralNoDebris.Count)
+        {
+            groups.Add(CreateGroup(
+                $"{skeletonStem}_core",
+                skeletonPath,
+                relativeDirectory,
+                structuralCore.Concat(primaryMouth)));
+        }
+
+        // Alternate mouth state: same creature with every mouth open.
+        if (mouthDefault.Count > 0 && mouthOpen.Count > 0)
+        {
+            groups.Add(CreateGroup(
+                $"{skeletonStem}_mouthOpen",
+                skeletonPath,
+                relativeDirectory,
+                structural.Concat(mouthOpen.Select(part => part.Asset))));
+        }
+
+        // Transformed head: the middle head (and its eyelids/mouth) is swapped for the transformed mesh.
+        if (transformed.Count > 0)
+        {
+            var withoutMiddle = structural.Where(asset =>
+                !IsMiddle(ExtractTail(Path.GetFileNameWithoutExtension(asset.MeshPath), skeletonStem)));
+            var primaryMouthNoMiddle = primaryMouth.Where(asset =>
+                !IsMiddle(ExtractTail(Path.GetFileNameWithoutExtension(asset.MeshPath), skeletonStem)));
+            groups.Add(CreateGroup(
+                $"{skeletonStem}_headTransformed",
+                skeletonPath,
+                relativeDirectory,
+                withoutMiddle.Concat(primaryMouthNoMiddle).Concat(transformed.Select(part => part.Asset))));
+        }
+
+        return groups;
     }
 
     private static IEnumerable<ModelAssetGroup> BuildCharacterGroups(
@@ -1004,8 +1130,11 @@ public sealed class ModelAssetGroup
     private static readonly string[] SidedBases =
     [
         "shoulder", "clavicle", "forearm", "elbow", "thigh", "knee", "ankle", "wrist",
-        "leg", "arm", "hand", "foot", "neck", "ear", "eye", "mouth", "brow", "cheek", "lip", "horn",
+        "leg", "arm", "hand", "foot", "neck", "ear", "eye", "brow", "cheek", "lip", "horn",
     ];
+    // NOTE: "mouth" is deliberately NOT a sided base. Character mouths are visemes (mouthAA, mouthLL,
+    // mouthI...), and treating "mouthLL" as "mouth" + side "L" split it into its own slot, so the combine
+    // ended up with two mouths. The Wither Storm's positional mouths are handled by its own planner.
 
     // Side tokens, longest first so "Left"/"Right" win before the single-letter "L"/"R".
     private static readonly (string Token, string Canonical)[] SideTokens =
@@ -1058,11 +1187,21 @@ public sealed class ModelAssetGroup
     private static PartInfo PickSlotDefault(IEnumerable<PartInfo> slotParts)
     {
         return slotParts
-            .OrderBy(part => string.IsNullOrEmpty(part.Variant) ? 0 : 1)
+            .OrderBy(part => string.IsNullOrEmpty(part.Variant) || IsNeutralVariant(part.Variant) ? 0 : 1)
             .ThenBy(part => StateWords.Count(word => part.Variant.Contains(word, StringComparison.OrdinalIgnoreCase)))
             .ThenBy(part => part.Variant.Length)
             .ThenBy(part => part.Asset.MeshPath, StringComparer.OrdinalIgnoreCase)
             .First();
+    }
+
+    // A "neutral" variant is the resting/closed form a slot should default to (e.g. the mouth viseme
+    // "Default" or "None"), so the combined model shows a calm face instead of a random open viseme.
+    private static bool IsNeutralVariant(string variant)
+    {
+        return variant.Equals("Default", StringComparison.OrdinalIgnoreCase) ||
+               variant.Equals("None", StringComparison.OrdinalIgnoreCase) ||
+               variant.Equals("Neutral", StringComparison.OrdinalIgnoreCase) ||
+               variant.Equals("Closed", StringComparison.OrdinalIgnoreCase);
     }
 
     private static bool LooksLikeAdditiveStatePart(string tail)

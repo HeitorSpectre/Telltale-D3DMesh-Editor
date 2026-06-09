@@ -8,6 +8,11 @@ public sealed record AppPreferences
     public string OutputFormat { get; init; } = "Glb";
     public bool TextureAtlas { get; init; }
 
+    // When true, textures written on reimport are saved uncompressed (ARGB8) instead of DXT.
+    // Needed for games like Minecraft: Story Mode whose low-resolution character ("skin") textures
+    // are shipped uncompressed; DXT block compression smears their sharp pixel-art edges in-game.
+    public bool UncompressedTextures { get; init; }
+
     private static readonly JsonSerializerOptions JsonOptions = new()
     {
         WriteIndented = true,
@@ -47,13 +52,14 @@ public sealed record AppPreferences
         Save(current with { LastGame = game.Id });
     }
 
-    public static void SaveToolSettings(string outputFormat, bool textureAtlas)
+    public static void SaveToolSettings(string outputFormat, bool textureAtlas, bool uncompressedTextures)
     {
         var current = Load();
         Save(current with
         {
             OutputFormat = outputFormat,
             TextureAtlas = textureAtlas,
+            UncompressedTextures = uncompressedTextures,
         });
     }
 

@@ -60,13 +60,21 @@ public sealed class MainForm : Form
     private ModelAsset? _selectedAsset;
     private ModelAssetGroup? _selectedGroup;
     private ExportFormat _exportFormat = ExportFormat.Glb;
+    private bool _uncompressedTextures;
     private bool _isBusy;
     private bool _applyingTreeSelection;
 
     public MainForm()
     {
-        // Shows the version and build time (in the user's own timezone) in the title.
-        Text = $"Telltale D3DMesh Editor  v{UpdateChecker.CurrentVersion}  (build {GetLocalBuildTime():HH:mm:ss})";
+        // Title shows the version and the build tag. Release builds show the build time (in the user's own
+        // timezone); Debug builds show "DEBUG" instead, so a development build is never mistaken for a
+        // shipped release.
+#if DEBUG
+        const string build = "DEBUG";
+#else
+        var build = GetLocalBuildTime().ToString("HH:mm:ss");
+#endif
+        Text = $"Telltale D3DMesh Editor - v{UpdateChecker.CurrentVersion} (build: {build})";
         Width = 1180;
         Height = 760;
         MinimumSize = new Size(920, 560);
@@ -80,6 +88,7 @@ public sealed class MainForm : Form
             ? ExportFormat.GltfSeparate
             : ExportFormat.Glb;
         _btnDiffuseAtlas.Checked = preferences.TextureAtlas;
+        _uncompressedTextures = preferences.UncompressedTextures;
 
         BuildUi();
         WireEvents();
@@ -381,7 +390,7 @@ public sealed class MainForm : Form
             MaximizeBox = false,
             ShowIcon = false,
             ShowInTaskbar = false,
-            ClientSize = new Size(360, 156),
+            ClientSize = new Size(360, 196),
             Font = Font,
         };
 
@@ -390,10 +399,11 @@ public sealed class MainForm : Form
             Dock = DockStyle.Fill,
             Padding = new Padding(12),
             ColumnCount = 2,
-            RowCount = 3,
+            RowCount = 4,
         };
         layout.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 110));
         layout.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100));
+        layout.RowStyles.Add(new RowStyle(SizeType.AutoSize));
         layout.RowStyles.Add(new RowStyle(SizeType.AutoSize));
         layout.RowStyles.Add(new RowStyle(SizeType.AutoSize));
         layout.RowStyles.Add(new RowStyle(SizeType.Percent, 100));
@@ -431,6 +441,22 @@ public sealed class MainForm : Form
             Margin = new Padding(0, 0, 0, 10),
         };
 
+        var compressionLabel = new Label
+        {
+            Text = "Textures:",
+            AutoSize = true,
+            Anchor = AnchorStyles.Left,
+            Margin = new Padding(0, 3, 8, 10),
+        };
+        var uncompressedCheck = new CheckBox
+        {
+            Text = "Uncompressed textures (no DXT)",
+            Checked = _uncompressedTextures,
+            AutoSize = true,
+            Anchor = AnchorStyles.Left,
+            Margin = new Padding(0, 0, 0, 10),
+        };
+
         var buttons = new FlowLayoutPanel
         {
             FlowDirection = FlowDirection.RightToLeft,
@@ -442,12 +468,21 @@ public sealed class MainForm : Form
         var cancel = new Button { Text = "Cancel", DialogResult = DialogResult.Cancel, Width = 86 };
         buttons.Controls.Add(ok);
         buttons.Controls.Add(cancel);
+#if DEBUG
+        // Debug-only: pull the latest release and show the update dialog as if an update had arrived, so
+        // the update UI (HTML rendering, buttons) can be tested without publishing a newer version.
+        var simulateUpdate = new Button { Text = "Simulate update", AutoSize = true, Margin = new Padding(0, 0, 12, 0) };
+        simulateUpdate.Click += async (_, _) => await SimulateUpdateAsync();
+        buttons.Controls.Add(simulateUpdate);
+#endif
 
         layout.Controls.Add(formatLabel, 0, 0);
         layout.Controls.Add(formatCombo, 1, 0);
         layout.Controls.Add(atlasLabel, 0, 1);
         layout.Controls.Add(atlasCheck, 1, 1);
-        layout.Controls.Add(buttons, 0, 2);
+        layout.Controls.Add(compressionLabel, 0, 2);
+        layout.Controls.Add(uncompressedCheck, 1, 2);
+        layout.Controls.Add(buttons, 0, 3);
         layout.SetColumnSpan(buttons, 2);
         dialog.Controls.Add(layout);
         dialog.AcceptButton = ok;
@@ -460,10 +495,12 @@ public sealed class MainForm : Form
 
         _exportFormat = formatCombo.SelectedIndex == 0 ? ExportFormat.Glb : ExportFormat.GltfSeparate;
         _btnDiffuseAtlas.Checked = atlasCheck.Checked;
+        _uncompressedTextures = uncompressedCheck.Checked;
         UpdateFormatButton();
         AppPreferences.SaveToolSettings(
             _exportFormat == ExportFormat.Glb ? "Glb" : "GltfSeparate",
-            _btnDiffuseAtlas.Checked);
+            _btnDiffuseAtlas.Checked,
+            _uncompressedTextures);
     }
 
     private void SetReadyState()
@@ -1421,7 +1458,8 @@ public sealed class MainForm : Form
         await RunWithUiLockAsync(async () =>
         {
             var useDiffuseAtlas = _btnDiffuseAtlas.Checked;
-            var result = await Task.Run(() => ReimportSingleAsset(asset, input, output, useDiffuseAtlas));
+            var uncompressedTextures = _uncompressedTextures;
+            var result = await Task.Run(() => ReimportSingleAsset(asset, input, output, useDiffuseAtlas, uncompressedTextures));
             return result;
         });
 
@@ -1452,13 +1490,14 @@ public sealed class MainForm : Form
 
         var root = _rootFolder;
         var useDiffuseAtlas = _btnDiffuseAtlas.Checked;
+        var uncompressedTextures = _uncompressedTextures;
 
         await RunWithUiLockAsync(async () =>
         {
             var result = await Task.Run(() =>
             {
                 var model = GltfReader.Load(input);
-                return ReimportCombinedGroup(group, root, model, input, outputFolder, useDiffuseAtlas);
+                return ReimportCombinedGroup(group, root, model, input, outputFolder, useDiffuseAtlas, uncompressedTextures);
             });
 
             return result;
@@ -1470,7 +1509,7 @@ public sealed class MainForm : Form
         }
     }
 
-    private static string ReimportSingleAsset(ModelAsset asset, string input, string output, bool useDiffuseAtlas)
+    private static string ReimportSingleAsset(ModelAsset asset, string input, string output, bool useDiffuseAtlas, bool uncompressedTextures)
     {
         var gameConfig = GameConfig.Current;
         var layout = D3DMeshLayout.Build(File.ReadAllBytes(asset.MeshPath));
@@ -1478,7 +1517,7 @@ public sealed class MainForm : Form
         var atlas = ApplyDiffuseAtlasIfRequested(model, useDiffuseAtlas);
         model = atlas.Model;
         var skeleton = LoadSkeletonOrNull(asset.SkeletonPath, layout.Version);
-        var textureOptions = BuildReinsertTextureOptions(useDiffuseAtlas);
+        var textureOptions = BuildReinsertTextureOptions(useDiffuseAtlas, uncompressedTextures);
         var textures = ReinsertTextureService.WriteAllReferencedTextures(model, asset.MeshPath, output, gameConfig, textureOptions);
         var bytes = MeshReinserter.ReinsertGeometry(layout, model, textures, skeleton, gameConfig);
         File.WriteAllBytes(output, bytes);
@@ -1541,7 +1580,8 @@ public sealed class MainForm : Form
         GltfModel combinedModel,
         string input,
         string outputFolder,
-        bool useDiffuseAtlas)
+        bool useDiffuseAtlas,
+        bool uncompressedTextures)
     {
         Directory.CreateDirectory(outputFolder);
         var gameConfig = GameConfig.Current;
@@ -1577,7 +1617,7 @@ public sealed class MainForm : Form
             var output = Path.Combine(outputFolder, Path.GetFileName(asset.MeshPath));
             var layout = D3DMeshLayout.Build(File.ReadAllBytes(asset.MeshPath));
             var skeleton = LoadSkeletonOrNull(asset.SkeletonPath, layout.Version);
-            var textureOptions = BuildReinsertTextureOptions(useDiffuseAtlas);
+            var textureOptions = BuildReinsertTextureOptions(useDiffuseAtlas, uncompressedTextures);
             var textures = ReinsertTextureService.WriteAllReferencedTextures(partModel, asset.MeshPath, output, gameConfig, textureOptions);
             var bytes = MeshReinserter.ReinsertGeometry(layout, partModel, textures, skeleton, gameConfig);
             File.WriteAllBytes(output, bytes);
@@ -1608,10 +1648,11 @@ public sealed class MainForm : Form
             string.Join(Environment.NewLine, lines));
     }
 
-    private static ReinsertTextureOptions BuildReinsertTextureOptions(bool useDiffuseAtlas)
+    private static ReinsertTextureOptions BuildReinsertTextureOptions(bool useDiffuseAtlas, bool uncompressedTextures)
         => useDiffuseAtlas
             ? new ReinsertTextureOptions
             {
+                ForceUncompressed = uncompressedTextures,
                 IncludedSlots = new HashSet<string>(StringComparer.OrdinalIgnoreCase)
                 {
                     "diffuse",
@@ -1620,7 +1661,7 @@ public sealed class MainForm : Form
                     "tex8",
                 },
             }
-            : ReinsertTextureOptions.Default;
+            : new ReinsertTextureOptions { ForceUncompressed = uncompressedTextures };
 
     private static GltfDiffuseAtlasResult ApplyDiffuseAtlasIfRequested(GltfModel model, bool useDiffuseAtlas)
         => useDiffuseAtlas
@@ -1862,6 +1903,26 @@ public sealed class MainForm : Form
         ShowUpdateDialog(info);
     }
 
+#if DEBUG
+    // Debug-only test harness: fetches the latest published release (ignoring the version comparison) and
+    // shows the normal update dialog, so the update experience can be rehearsed on demand.
+    private async Task SimulateUpdateAsync()
+    {
+        var info = await UpdateChecker.FetchLatestReleaseAsync();
+        if (info is null)
+        {
+            MessageBox.Show(
+                "Could not fetch the latest release to simulate (offline or rate-limited?).",
+                Text,
+                MessageBoxButtons.OK,
+                MessageBoxIcon.Warning);
+            return;
+        }
+
+        ShowUpdateDialog(info);
+    }
+#endif
+
     // Shows the new version and its changelog, and lets the user download it or open the release page.
     // Deliberately never downloads or replaces files on its own — the user stays in control.
     private void ShowUpdateDialog(UpdateInfo info)
@@ -1906,20 +1967,36 @@ public sealed class MainForm : Form
             Margin = new Padding(0, 0, 0, 8),
         };
 
-        var changelog = new TextBox
+        // Render the release notes as HTML so the dialog mirrors the GitHub page (headings, list, table,
+        // and the banner image at its intended size) instead of dumping the raw Markdown into a textbox.
+        var changelogFrame = new Panel
         {
-            Text = string.IsNullOrWhiteSpace(info.Changelog)
-                ? "(No changelog was provided for this release.)"
-                : info.Changelog.Replace("\r\n", "\n").Replace("\n", Environment.NewLine),
-            Multiline = true,
-            ReadOnly = true,
-            ScrollBars = ScrollBars.Vertical,
-            WordWrap = true,
             Dock = DockStyle.Fill,
             BorderStyle = BorderStyle.FixedSingle,
-            BackColor = SystemColors.Window,
             Margin = new Padding(0, 0, 0, 10),
+            Padding = new Padding(0),
         };
+        var changelog = new WebBrowser
+        {
+            Dock = DockStyle.Fill,
+            ScriptErrorsSuppressed = true,
+            AllowWebBrowserDrop = false,
+            IsWebBrowserContextMenuEnabled = false,
+            WebBrowserShortcutsEnabled = false,
+        };
+        // External links in the notes open in the user's real browser, not inside this control.
+        changelog.NewWindow += (_, e) => ((System.ComponentModel.CancelEventArgs)e).Cancel = true;
+        changelog.Navigating += (_, e) =>
+        {
+            if (changelog.DocumentText.Length > 0 && e.Url.Scheme is "http" or "https")
+            {
+                e.Cancel = true;
+                OpenUrl(e.Url.ToString());
+            }
+        };
+        changelogFrame.Controls.Add(changelog);
+        // Set the document once the dialog is shown, so the browser control's window handle already exists.
+        dialog.Shown += (_, _) => changelog.DocumentText = ReleaseNotesHtml.Build(info.Changelog);
 
         var buttons = new FlowLayoutPanel
         {
@@ -1939,7 +2016,7 @@ public sealed class MainForm : Form
 
         layout.Controls.Add(header, 0, 0);
         layout.Controls.Add(subtitle, 0, 1);
-        layout.Controls.Add(changelog, 0, 2);
+        layout.Controls.Add(changelogFrame, 0, 2);
         layout.Controls.Add(buttons, 0, 3);
         dialog.Controls.Add(layout);
         dialog.CancelButton = close;

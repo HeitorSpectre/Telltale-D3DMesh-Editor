@@ -12,7 +12,7 @@ public sealed record UpdateInfo(string Version, string Title, string Changelog, 
 public static class UpdateChecker
 {
     // Bump this on every release so the checker can tell when a newer one is published.
-    public const string CurrentVersion = "1.7";
+    public const string CurrentVersion = "1.8";
 
     private const string LatestReleaseApi =
         "https://api.github.com/repos/HeitorSpectre/Telltale-D3DMesh-Editor/releases/latest";
@@ -23,6 +23,15 @@ public static class UpdateChecker
     // Returns the latest release when it is newer than CurrentVersion; null when up to date, offline,
     // or anything goes wrong. Never throws.
     public static async Task<UpdateInfo?> CheckForUpdateAsync(CancellationToken cancellationToken = default)
+    {
+        var latest = await FetchLatestReleaseAsync(cancellationToken);
+        return latest is not null && IsNewer(latest.Version, CurrentVersion) ? latest : null;
+    }
+
+    // Fetches the latest published release as-is, WITHOUT comparing versions. Used by the debug-only
+    // "simulate update" action so the update dialog can be exercised even when we are already up to date.
+    // Still fails quietly (returns null) and never throws.
+    public static async Task<UpdateInfo?> FetchLatestReleaseAsync(CancellationToken cancellationToken = default)
     {
         try
         {
@@ -36,7 +45,7 @@ public static class UpdateChecker
             var root = json.RootElement;
 
             var tag = GetString(root, "tag_name");
-            if (string.IsNullOrWhiteSpace(tag) || !IsNewer(tag, CurrentVersion))
+            if (string.IsNullOrWhiteSpace(tag))
             {
                 return null;
             }

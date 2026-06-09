@@ -789,7 +789,7 @@ public sealed class MeshPreviewControl : Control
         return map;
     }
 
-    private static Vector3 ApplySkinning(VertexData vertex, int[]? boneMap, Matrix4x4[]? baseMatrices, Matrix4x4[]? posedMatrices)
+    private Vector3 ApplySkinning(VertexData vertex, int[]? boneMap, Matrix4x4[]? baseMatrices, Matrix4x4[]? posedMatrices)
     {
         var original = ToVector(vertex);
         if (boneMap is null || baseMatrices is null || posedMatrices is null || ReferenceEquals(baseMatrices, posedMatrices))
@@ -797,12 +797,13 @@ public sealed class MeshPreviewControl : Control
             return original;
         }
 
+        var version = _mesh?.Version ?? 0;
         var result = Vector3.Zero;
         var total = 0f;
-        AccumulateSkinned(vertex.Bone0, vertex.Weight0, original, boneMap, baseMatrices, posedMatrices, ref result, ref total);
-        AccumulateSkinned(vertex.Bone1, vertex.Weight1, original, boneMap, baseMatrices, posedMatrices, ref result, ref total);
-        AccumulateSkinned(vertex.Bone2, vertex.Weight2, original, boneMap, baseMatrices, posedMatrices, ref result, ref total);
-        AccumulateSkinned(vertex.Bone3, vertex.Weight3, original, boneMap, baseMatrices, posedMatrices, ref result, ref total);
+        AccumulateSkinned(vertex.Bone0, vertex.Weight0, version, original, boneMap, baseMatrices, posedMatrices, ref result, ref total);
+        AccumulateSkinned(vertex.Bone1, vertex.Weight1, version, original, boneMap, baseMatrices, posedMatrices, ref result, ref total);
+        AccumulateSkinned(vertex.Bone2, vertex.Weight2, version, original, boneMap, baseMatrices, posedMatrices, ref result, ref total);
+        AccumulateSkinned(vertex.Bone3, vertex.Weight3, version, original, boneMap, baseMatrices, posedMatrices, ref result, ref total);
 
         if (total <= 0.000001f)
         {
@@ -815,6 +816,7 @@ public sealed class MeshPreviewControl : Control
     private static void AccumulateSkinned(
         int paletteBone,
         float weight,
+        int meshVersion,
         Vector3 original,
         int[] boneMap,
         Matrix4x4[] baseMatrices,
@@ -827,7 +829,7 @@ public sealed class MeshPreviewControl : Control
             return;
         }
 
-        var paletteIndex = NormalizePaletteBoneIndex(paletteBone, boneMap.Length);
+        var paletteIndex = NormalizePaletteBoneIndex(paletteBone, boneMap.Length, meshVersion);
         if (paletteIndex < 0)
         {
             return;
@@ -849,23 +851,19 @@ public sealed class MeshPreviewControl : Control
         total += weight;
     }
 
-    private static int NormalizePaletteBoneIndex(int rawIndex, int paletteLength)
+    private static int NormalizePaletteBoneIndex(int rawIndex, int paletteLength, int meshVersion)
     {
-        if (rawIndex >= 0 && rawIndex % 3 == 0)
+        if (rawIndex < 0)
         {
-            var divided = rawIndex / 3;
-            if (divided < paletteLength)
-            {
-                return divided;
-            }
+            return -1;
         }
 
-        if (rawIndex >= 0 && rawIndex < paletteLength)
-        {
-            return rawIndex;
-        }
-
-        return -1;
+        // Use the same per-version convention as the parser and the glTF export. v17/v18 store the direct
+        // palette index; older versions store the index times 3. Re-dividing a v18 direct index (the old
+        // behaviour) sent every index that was a multiple of 3 to the wrong bone — e.g. the right ankle
+        // resolved to a left-leg bone, which is why posing one limb moved another in the combined preview.
+        var index = BoneIndexConvention.ToPaletteIndex(rawIndex, meshVersion);
+        return index >= 0 && index < paletteLength ? index : -1;
     }
 
     private int PickBone(Point location)
@@ -1073,12 +1071,13 @@ public sealed class MeshPreviewControl : Control
                 continue;
             }
 
+            var version = _mesh.Version;
             foreach (var vertex in submesh.Vertices)
             {
-                AddInfluencedBone(vertex.Bone0, vertex.Weight0, map, influenced);
-                AddInfluencedBone(vertex.Bone1, vertex.Weight1, map, influenced);
-                AddInfluencedBone(vertex.Bone2, vertex.Weight2, map, influenced);
-                AddInfluencedBone(vertex.Bone3, vertex.Weight3, map, influenced);
+                AddInfluencedBone(vertex.Bone0, vertex.Weight0, version, map, influenced);
+                AddInfluencedBone(vertex.Bone1, vertex.Weight1, version, map, influenced);
+                AddInfluencedBone(vertex.Bone2, vertex.Weight2, version, map, influenced);
+                AddInfluencedBone(vertex.Bone3, vertex.Weight3, version, map, influenced);
             }
         }
 
@@ -1139,14 +1138,14 @@ public sealed class MeshPreviewControl : Control
         }
     }
 
-    private static void AddInfluencedBone(int rawBone, float weight, int[] map, HashSet<int> influenced)
+    private static void AddInfluencedBone(int rawBone, float weight, int meshVersion, int[] map, HashSet<int> influenced)
     {
         if (weight <= 0.000001f)
         {
             return;
         }
 
-        var index = NormalizePaletteBoneIndex(rawBone, map.Length);
+        var index = NormalizePaletteBoneIndex(rawBone, map.Length, meshVersion);
         if (index >= 0 && index < map.Length && map[index] >= 0)
         {
             influenced.Add(map[index]);

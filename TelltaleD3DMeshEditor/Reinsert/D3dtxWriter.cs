@@ -12,10 +12,10 @@ public static class D3dtxWriter
     private const uint Dxt1Format = 0x40;
     private const uint Dxt5Format = 0x42;
 
-    public static void WriteFromImageBytes(byte[] templateBytes, GltfImage image, string outputPath)
+    public static void WriteFromImageBytes(byte[] templateBytes, GltfImage image, string outputPath, bool forceUncompressed = false)
     {
         var pixels = DecodeImage(image.Data, out var width, out var height);
-        var encoded = BuildFromTemplate(templateBytes, pixels, width, height, Path.GetFileName(outputPath));
+        var encoded = BuildFromTemplate(templateBytes, pixels, width, height, Path.GetFileName(outputPath), forceUncompressed);
         File.WriteAllBytes(outputPath, encoded);
     }
 
@@ -27,17 +27,26 @@ public static class D3dtxWriter
         File.WriteAllBytes(outputPath, sourceBytes);
     }
 
-    private static byte[] BuildFromTemplate(byte[] template, int[] pixels, int width, int height, string textureFileName)
+    private static byte[] BuildFromTemplate(byte[] template, int[] pixels, int width, int height, string textureFileName, bool forceUncompressed = false)
     {
         var tex = TtgTexture.Parse(template);
         var hasAlpha = HasMeaningfulAlpha(pixels);
-        var format = tex.TextureFormat switch
-        {
-            Argb8Format or Rgba8Format or A8Format => tex.TextureFormat,
-            Dxt5Format => Dxt5Format,
-            Dxt1Format => hasAlpha ? Dxt5Format : Dxt1Format,
-            _ => hasAlpha ? Dxt5Format : Dxt1Format,
-        };
+        // When uncompressed output is requested, keep an already-uncompressed template format as-is
+        // (ARGB8/RGBA8/A8) and convert any block-compressed template to ARGB8. Otherwise fall back to
+        // the normal codec choice that mirrors the template (DXT1 without alpha, DXT5 with alpha).
+        var format = forceUncompressed
+            ? tex.TextureFormat switch
+            {
+                Argb8Format or Rgba8Format or A8Format => tex.TextureFormat,
+                _ => Argb8Format,
+            }
+            : tex.TextureFormat switch
+            {
+                Argb8Format or Rgba8Format or A8Format => tex.TextureFormat,
+                Dxt5Format => Dxt5Format,
+                Dxt1Format => hasAlpha ? Dxt5Format : Dxt1Format,
+                _ => hasAlpha ? Dxt5Format : Dxt1Format,
+            };
         var mipCount = Math.Min(CountTtgMips(width, height, format), Math.Max(1, tex.Mip));
         // The mip payloads must be encoded with the same codec that the header declares.
         // When the template is DXT5 we keep DXT5 even for alpha-less images, otherwise the
