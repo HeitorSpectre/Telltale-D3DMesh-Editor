@@ -30,16 +30,36 @@ public static class GltfDiffuseAtlasPacker
             return NotApplied(model, 0, options.AtlasName);
         }
 
-        var sourceImages = CollectAtlasImages(model);
+        // Pack detail/lines at their native resolution first (no downscale). Only if that overflows the
+        // max atlas size do we fall back to matching detail to the diffuse size — so big line maps keep
+        // their resolution in the common case, while huge models still pack instead of failing.
+        var sourceImages = CollectAtlasImages(model, matchDetailToDiffuse: false);
         if (sourceImages.Count <= 1)
         {
             return NotApplied(model, sourceImages.Count, options.AtlasName);
         }
 
+        var matchedDetailToDiffuse = false;
         var decoded = DecodeImages(sourceImages);
+        Dictionary<string, AtlasPlacement> placements;
         try
         {
-            var placements = PackRectangles(decoded, Math.Max(0, options.Padding), options.MaxSize);
+            placements = PackRectangles(decoded, Math.Max(0, options.Padding), options.MaxSize);
+        }
+        catch (InvalidOperationException)
+        {
+            foreach (var image in decoded)
+            {
+                image.Dispose();
+            }
+
+            matchedDetailToDiffuse = true;
+            decoded = DecodeImages(CollectAtlasImages(model, matchDetailToDiffuse: true));
+            placements = PackRectangles(decoded, Math.Max(0, options.Padding), options.MaxSize);
+        }
+
+        try
+        {
             using var atlas = BuildAtlas(decoded, placements);
             var atlasImage = new GltfImage
             {
@@ -66,6 +86,11 @@ public static class GltfDiffuseAtlasPacker
             }
 
             var warnings = new List<string>();
+            if (matchedDetailToDiffuse)
+            {
+                warnings.Add("Detail/lines textures were downscaled to the diffuse size so the atlas would fit within its size limit.");
+            }
+
             var newPrimitives = new List<GltfPrimitive>(model.Primitives.Count);
             for (var primitiveIndex = 0; primitiveIndex < model.Primitives.Count; primitiveIndex++)
             {
@@ -161,7 +186,7 @@ public static class GltfDiffuseAtlasPacker
     private static GltfDiffuseAtlasResult NotApplied(GltfModel model, int sourceTextureCount, string atlasName)
         => new(model, Applied: false, sourceTextureCount, 0, 0, atlasName, []);
 
-    private static List<AtlasSourceImage> CollectAtlasImages(GltfModel model)
+    private static List<AtlasSourceImage> CollectAtlasImages(GltfModel model, bool matchDetailToDiffuse)
     {
         var result = new List<AtlasSourceImage>();
         var seen = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
@@ -181,7 +206,15 @@ public static class GltfDiffuseAtlasPacker
                     var detailKey = DetailAtlasKey(detail.Image, diffuse);
                     if (seen.Add(detailKey))
                     {
-                        result.Add(new AtlasSourceImage(detailKey, detail.Image, PreserveAlpha: true, MatchSizeOf: diffuse));
+                        // Keep the detail/lines texture at its native resolution. It gets its own atlas
+                        // region and its own remapped UV (uv1/uv2), so it does NOT need to match the
+                        // diffuse size — forcing that downscaled high-res line maps (e.g. 1024 lines onto
+                        // a 512 diffuse). Only the overflow fallback re-matches it to the diffuse size.
+                        result.Add(new AtlasSourceImage(
+                            detailKey,
+                            detail.Image,
+                            PreserveAlpha: true,
+                            MatchSizeOf: matchDetailToDiffuse ? diffuse : null));
                     }
                 }
             }
