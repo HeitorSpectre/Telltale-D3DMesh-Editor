@@ -681,11 +681,16 @@ public static class MeshReinserter
             return null;
         }
 
+        // The value handed to VertexEncoder must match each version's stored-raw convention:
+        // v13/14 store rawIndex = paletteIndex*3 (encoder factor 1), while v17/18 store
+        // paletteIndex*formatFactor (format 3 -> x4, format 8 -> x3, applied by the encoder),
+        // so on v17/18 the encoder must receive the DIRECT palette index, never pre-multiplied.
+        var rawMultiplier = layout.Version is 17 or 18 ? 1 : 3;
         var mapped = new Dictionary<int, int>();
         foreach (var gltfJoint in EnumerateWeightedJoints(prim).Distinct())
         {
             var localPaletteIndex = ResolvePaletteLocalIndex(gltfJoint, model, referenceSkeleton, palette);
-            mapped[gltfJoint] = localPaletteIndex >= 0 ? localPaletteIndex * 3 : -1;
+            mapped[gltfJoint] = localPaletteIndex >= 0 ? localPaletteIndex * rawMultiplier : -1;
         }
 
         return new PrimitiveSkinning { D3DMeshBoneByGltfJoint = mapped };

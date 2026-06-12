@@ -215,6 +215,14 @@ public sealed class VertexEncoder
                 BinaryPrimitives.WriteSingleLittleEndian(dst[p..], v.W2); p += 4;
                 return;
             case 4:
+                // Signed-normalized int16 (0..32767 = 0..1), mirroring ReadWeights format 4
+                // (reader.ReadInt16() / 32767f). Writing the uint16 scale here flips the sign
+                // bit for any weight >= 0.5, which breaks skinning on Minecraft: Story Mode.
+                WriteWeightInt16(dst, ref p, v.W0);
+                WriteWeightInt16(dst, ref p, v.W1);
+                WriteWeightInt16(dst, ref p, v.W2);
+                WriteWeightInt16(dst, ref p, v.W3);
+                return;
             case 5:
                 WriteWeightUInt16(dst, ref p, v.W0);
                 WriteWeightUInt16(dst, ref p, v.W1);
@@ -224,6 +232,13 @@ public sealed class VertexEncoder
             default:
                 throw new InvalidDataException($"Unsupported weight format for writing: {format}");
         }
+    }
+
+    private static void WriteWeightInt16(Span<byte> dst, ref int p, float value)
+    {
+        var i = (int)Math.Round(Math.Clamp(value, 0f, 1f) * 32767.0, MidpointRounding.AwayFromZero);
+        BinaryPrimitives.WriteInt16LittleEndian(dst[p..], (short)Math.Clamp(i, 0, 32767));
+        p += 2;
     }
 
     private static void WriteWeightUInt16(Span<byte> dst, ref int p, float value)
