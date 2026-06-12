@@ -530,7 +530,16 @@ public static class ReinsertCli
         var layout = D3DMeshLayout.Build(File.ReadAllBytes(template));
         var gameConfig = InferGameConfig(template);
         var model = GltfModelPreprocessor.ApplyGameReinsertRules(GltfReader.Load(glb), gameConfig);
-        var atlas = ApplyDiffuseAtlasIfRequested(model, useDiffuseAtlas);
+        if (useDiffuseAtlas)
+        {
+            model = StrippedLineTextureRecovery.RestoreStrippedTextures(model, template);
+        }
+        if (useDiffuseAtlas &&
+            (gameConfig.InvertHeadLineAlphaOnReimport || gameConfig.InvertBodyLineAlphaOnReimport || gameConfig.InvertHandLineAlphaOnReimport))
+        {
+            model = CharacterLineAtlasFix.InvertCharacterLineAlpha(model, gameConfig);
+        }
+        var atlas = ApplyDiffuseAtlasIfRequested(model, useDiffuseAtlas, template);
         model = atlas.Model;
         var textureOptions = BuildReinsertTextureOptions(useDiffuseAtlas);
         var textures = ReinsertTextureService.WriteAllReferencedTextures(model, template, output, gameConfig, textureOptions);
@@ -566,7 +575,16 @@ public static class ReinsertCli
         var skeleton = SkeletonLoader.Load(skeletonPath, layout.Version);
         var gameConfig = InferGameConfig(template);
         var model = GltfModelPreprocessor.ApplyGameReinsertRules(GltfReader.Load(glb), gameConfig);
-        var atlas = ApplyDiffuseAtlasIfRequested(model, useDiffuseAtlas);
+        if (useDiffuseAtlas)
+        {
+            model = StrippedLineTextureRecovery.RestoreStrippedTextures(model, template);
+        }
+        if (useDiffuseAtlas &&
+            (gameConfig.InvertHeadLineAlphaOnReimport || gameConfig.InvertBodyLineAlphaOnReimport || gameConfig.InvertHandLineAlphaOnReimport))
+        {
+            model = CharacterLineAtlasFix.InvertCharacterLineAlpha(model, gameConfig);
+        }
+        var atlas = ApplyDiffuseAtlasIfRequested(model, useDiffuseAtlas, template);
         model = atlas.Model;
         var textureOptions = BuildReinsertTextureOptions(useDiffuseAtlas);
         var textures = ReinsertTextureService.WriteAllReferencedTextures(model, template, output, gameConfig, textureOptions);
@@ -613,20 +631,34 @@ public static class ReinsertCli
         => useDiffuseAtlas
             ? new ReinsertTextureOptions
             {
+                NameMode = ReinsertTextureNameMode.PreferGltfNames,
                 IncludedSlots = new HashSet<string>(StringComparer.OrdinalIgnoreCase)
                 {
                     "diffuse",
                     "detail_diffuse",
                     "tex7",
                     "tex8",
+                    "bump",
+                    "normal",
                 },
             }
             : ReinsertTextureOptions.Default;
 
-    private static GltfDiffuseAtlasResult ApplyDiffuseAtlasIfRequested(GltfModel model, bool useDiffuseAtlas)
+    // Name the atlas after existing template textures (the body/head diffuse + its normal) instead of the
+    // generic "diffuse_atlas", so the atlas and its normal companion reuse real texture names the game already
+    // references. Never a lines/detail map (ResolveAtlasTextureNames enforces it).
+    private static GltfDiffuseAtlasResult ApplyDiffuseAtlasIfRequested(GltfModel model, bool useDiffuseAtlas, string templateMeshPath)
         => useDiffuseAtlas
-            ? GltfDiffuseAtlasPacker.Pack(model)
+            ? GltfDiffuseAtlasPacker.Pack(model, BuildAtlasOptions(templateMeshPath))
             : new GltfDiffuseAtlasResult(model, Applied: false, SourceTextureCount: 0, AtlasWidth: 0, AtlasHeight: 0, AtlasName: "", Warnings: []);
+
+    private static GltfDiffuseAtlasOptions BuildAtlasOptions(string templateMeshPath)
+    {
+        var names = ReinsertTextureService.ResolveAtlasTextureNames(templateMeshPath);
+        return names is null
+            ? new GltfDiffuseAtlasOptions()
+            : new GltfDiffuseAtlasOptions(AtlasName: names.Diffuse, NormalAtlasName: names.Normal);
+    }
 
     private static void PrintAtlasSummary(GltfDiffuseAtlasResult atlas)
     {

@@ -262,6 +262,11 @@ public static class D3DMeshParser
 
         if (mesh.Submeshes.Count == 0)
         {
+            if (IsIntentionallyEmptyMesh(facePointCount, infos))
+            {
+                return mesh;
+            }
+
             throw new InvalidDataException("No submesh with valid triangles was found.");
         }
 
@@ -439,6 +444,11 @@ public static class D3DMeshParser
 
         if (mesh.Submeshes.Count == 0)
         {
+            if (IsIntentionallyEmptyMesh(facePointCount, infos))
+            {
+                return mesh;
+            }
+
             throw new InvalidDataException("No submesh with valid triangles was found.");
         }
 
@@ -599,11 +609,19 @@ public static class D3DMeshParser
 
         if (mesh.Submeshes.Count == 0)
         {
+            if (IsIntentionallyEmptyMesh(facePointCount, infos))
+            {
+                return mesh;
+            }
+
             throw new InvalidDataException("No submesh with valid triangles was found.");
         }
 
         return mesh;
     }
+
+    private static bool IsIntentionallyEmptyMesh(int facePointCount, IReadOnlyList<SubmeshInfo> infos)
+        => facePointCount == 0 && infos.All(static info => info.PolygonCount == 0);
 
     private static List<VertexData> ReadVertices(
         DataReader reader,

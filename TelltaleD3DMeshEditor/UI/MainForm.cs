@@ -1,4 +1,5 @@
 using System.Diagnostics;
+using System.Buffers.Binary;
 using System.Globalization;
 using System.Reflection;
 using TelltaleD3DMeshEditor.Core;
@@ -18,6 +19,7 @@ public sealed class MainForm : Form
 {
     private const int PreferredTreePanelWidth = 360;
     private const int MinimumTreePanelWidth = 300;
+    private const int MaxTreeNodesToMeasureForAutoFit = 1500;
 
     private readonly ToolStrip _toolStrip = new();
     private readonly ToolStrip _viewerOverlay = new();
@@ -46,6 +48,7 @@ public sealed class MainForm : Form
     private readonly TreeView _tree = new();
     private readonly TextBox _searchText = new();
     private readonly System.Windows.Forms.Timer _searchDebounceTimer = new();
+    private readonly System.Windows.Forms.Timer _treeFitDebounceTimer = new();
     private readonly MeshPreviewControl _preview = new();
     private readonly StatusStrip _statusStrip = new();
     private readonly ToolStripStatusLabel _statusLabel = new();
@@ -63,6 +66,7 @@ public sealed class MainForm : Form
     private bool _uncompressedTextures;
     private bool _isBusy;
     private bool _applyingTreeSelection;
+    private bool _treeRebuildQueued;
 
     public MainForm()
     {
@@ -270,7 +274,7 @@ public sealed class MainForm : Form
         _btnCombineParts.CheckedChanged += (_, _) =>
         {
             _searchDebounceTimer.Stop();
-            RebuildAssetTree();
+            QueueAssetTreeRebuild(resetViewport: true);
         };
         _btnPan.CheckedChanged += (_, _) => _preview.SetPanMode(_btnPan.Checked);
         _btnPose.CheckedChanged += (_, _) =>
@@ -310,13 +314,19 @@ public sealed class MainForm : Form
         };
         _tree.AfterSelect += (_, e) => HandleTreeAfterSelect(e.Node);
         _tree.NodeMouseClick += (_, e) => HandleTreeNodeMouseClick(e);
-        _tree.AfterExpand += (_, _) => AutoFitTreeWidth();
-        _tree.AfterCollapse += (_, _) => AutoFitTreeWidth();
+        _tree.AfterExpand += (_, _) => ScheduleTreeAutoFit();
+        _tree.AfterCollapse += (_, _) => ScheduleTreeAutoFit();
         _searchDebounceTimer.Interval = 220;
         _searchDebounceTimer.Tick += (_, _) =>
         {
             _searchDebounceTimer.Stop();
-            RebuildAssetTree();
+            RebuildAssetTree(resetViewport: true);
+        };
+        _treeFitDebounceTimer.Interval = 180;
+        _treeFitDebounceTimer.Tick += (_, _) =>
+        {
+            _treeFitDebounceTimer.Stop();
+            AutoFitTreeWidth();
         };
         _searchText.TextChanged += (_, _) => ScheduleSearchRebuild();
 
@@ -734,7 +744,7 @@ public sealed class MainForm : Form
             _searchDebounceTimer.Stop();
         }
 
-        RebuildAssetTree();
+        RebuildAssetTree(resetViewport: true);
 
         _btnReload.Enabled = true;
         _btnExtractAll.Enabled = _assets.Count > 0;
@@ -761,7 +771,22 @@ public sealed class MainForm : Form
         public void Report(double value) => report(value);
     }
 
-    private void RebuildAssetTree()
+    private void QueueAssetTreeRebuild(bool resetViewport)
+    {
+        if (_treeRebuildQueued || _rootFolder is null)
+        {
+            return;
+        }
+
+        _treeRebuildQueued = true;
+        BeginInvoke(new Action(() =>
+        {
+            _treeRebuildQueued = false;
+            RebuildAssetTree(resetViewport);
+        }));
+    }
+
+    private void RebuildAssetTree(bool resetViewport)
     {
         if (_rootFolder is null)
         {
@@ -792,20 +817,34 @@ public sealed class MainForm : Form
         _btnExtractSelected.Enabled = false;
         _btnReimportSelected.Enabled = false;
 
+        TreeNode? root;
+        _applyingTreeSelection = true;
         _tree.BeginUpdate();
-        _tree.Nodes.Clear();
-        var root = new TreeNode(Path.GetFileName(_rootFolder.TrimEnd('\\', '/')))
+        try
         {
-            Tag = _rootFolder
-        };
-        _tree.Nodes.Add(root);
-        PopulateAssetTree(root, _rootFolder, visibleAssets, visibleGroups);
-        root.Expand();
-        if (!string.IsNullOrEmpty(query))
-        {
-            ExpandAllVisible(root);
+            _tree.Nodes.Clear();
+            root = new TreeNode(Path.GetFileName(_rootFolder.TrimEnd('\\', '/')))
+            {
+                Tag = _rootFolder
+            };
+            _tree.Nodes.Add(root);
+            PopulateAssetTree(root, _rootFolder, visibleAssets, visibleGroups);
+            root.Expand();
+            if (!string.IsNullOrEmpty(query))
+            {
+                ExpandAllVisible(root);
+            }
         }
-        _tree.EndUpdate();
+        finally
+        {
+            _tree.EndUpdate();
+            _applyingTreeSelection = false;
+        }
+
+        if (resetViewport)
+        {
+            ResetTreeViewport(root, preferFirstResult: !string.IsNullOrEmpty(query));
+        }
 
         _detailLabel.Text = string.IsNullOrEmpty(query)
             ? BuildLoadedDetailText(_assets.Count, visibleGroups.Count)
@@ -825,7 +864,8 @@ public sealed class MainForm : Form
                 : $"Loaded: {_rootFolder}";
         }
 
-        AutoFitTreeWidth();
+        EnsureTreePanelWidth();
+        ScheduleTreeAutoFit();
     }
 
     private void ScheduleSearchRebuild()
@@ -983,6 +1023,20 @@ public sealed class MainForm : Form
         {
             ExpandAllVisible(child);
         }
+    }
+
+    private void ResetTreeViewport(TreeNode root, bool preferFirstResult)
+    {
+        if (_tree.Nodes.Count == 0)
+        {
+            return;
+        }
+
+        var top = preferFirstResult
+            ? EnumerateVisibleNodes(root.Nodes).FirstOrDefault(IsExtractableNode) ?? root
+            : root;
+        _tree.TopNode = top;
+        _tree.SelectedNode = null;
     }
 
     private void HandleTreeAfterSelect(TreeNode? node)
@@ -1514,15 +1568,21 @@ public sealed class MainForm : Form
         var gameConfig = GameConfig.Current;
         var layout = D3DMeshLayout.Build(File.ReadAllBytes(asset.MeshPath));
         var model = GltfModelPreprocessor.ApplyGameReinsertRules(GltfReader.Load(input), gameConfig);
-        // With the atlas active the face/hand ink-line textures are baked into the atlas and their detail
-        // slots are dropped, so the normal detail-write inversion can't run. Invert the face and hand line
-        // alpha here, before atlasing, so the baked head and hands still render correctly (TWD S2 shader).
-        if (useDiffuseAtlas && gameConfig.InvertHeadLineAlphaOnReimport)
+        // With the atlas active, the line/normal textures must be present as image bytes to be packed, so
+        // reload them from the template folder before atlasing (Blender strips them). Off the atlas path
+        // the line and normal map are rebound by name in ReinsertTextureService, reusing the game's files.
+        if (useDiffuseAtlas)
         {
-            model = CharacterLineAtlasFix.InvertFaceAndHandLineAlpha(model);
+            model = StrippedLineTextureRecovery.RestoreStrippedTextures(model, asset.MeshPath);
         }
-
-        var atlas = ApplyDiffuseAtlasIfRequested(model, useDiffuseAtlas);
+        // With the atlas active, line textures are baked into the atlas and their detail slots are dropped,
+        // so normal detail-write inversion cannot run. Apply game-specific line alpha fixes before packing.
+        if (useDiffuseAtlas &&
+            (gameConfig.InvertHeadLineAlphaOnReimport || gameConfig.InvertBodyLineAlphaOnReimport || gameConfig.InvertHandLineAlphaOnReimport))
+        {
+            model = CharacterLineAtlasFix.InvertCharacterLineAlpha(model, gameConfig);
+        }
+        var atlas = ApplyDiffuseAtlasIfRequested(model, useDiffuseAtlas, asset.MeshPath);
         model = atlas.Model;
         var skeleton = LoadSkeletonOrNull(asset.SkeletonPath, layout.Version);
         var textureOptions = BuildReinsertTextureOptions(useDiffuseAtlas, uncompressedTextures);
@@ -1594,9 +1654,11 @@ public sealed class MainForm : Form
         Directory.CreateDirectory(outputFolder);
         var gameConfig = GameConfig.Current;
         combinedModel = GltfModelPreprocessor.ApplyGameReinsertRules(combinedModel, gameConfig);
-        var sourcePrimitives = BuildCombinedSourcePrimitiveMap(combinedModel, inputRoot);
+        var sourcePrimitives = BuildCombinedSourcePrimitiveMap(group, combinedModel, inputRoot, out var splitModeLine);
+        var combinedSkeleton = BuildCombinedReferenceSkeletonForReimport(group, combinedModel, outputFolder, out var skeletonLine);
         var ok = 0;
         var skipped = 0;
+        var invisible = 0;
         var totalTextures = 0;
         var lines = new List<string>();
 
@@ -1605,8 +1667,14 @@ public sealed class MainForm : Form
             var fullMeshPath = Path.GetFullPath(asset.MeshPath);
             if (!sourcePrimitives.TryGetValue(fullMeshPath, out var primitives) || primitives.Count == 0)
             {
-                skipped++;
-                lines.Add($"SKIP {Path.GetFileName(asset.MeshPath)}: no edited primitives with matching combined source metadata.");
+                var invisibleOutput = Path.Combine(outputFolder, Path.GetFileName(asset.MeshPath));
+                var invisibleBytes = BuildInvisibleMeshBytes(asset.MeshPath);
+                File.WriteAllBytes(invisibleOutput, invisibleBytes);
+
+                var invisibleCheck = D3DMeshLayout.Build(invisibleBytes);
+                var invisibleStatus = invisibleCheck.TailOffset + invisibleCheck.TailLength == invisibleBytes.Length ? "verified" : "layout warning";
+                invisible++;
+                lines.Add($"INVISIBLE {Path.GetFileName(asset.MeshPath)}: no imported primitives were assigned; wrote a valid no-triangle placeholder, {invisibleStatus}.");
                 continue;
             }
 
@@ -1620,17 +1688,23 @@ public sealed class MainForm : Form
                 Joints = combinedModel.Joints,
                 Skeleton = combinedModel.Skeleton,
             };
-            if (useDiffuseAtlas && gameConfig.InvertHeadLineAlphaOnReimport)
+            var autoDiffuseAtlas = ShouldAutoAtlasCombinedPart(gameConfig, useDiffuseAtlas, splitModeLine, partModel, asset.MeshPath);
+            var effectiveUseDiffuseAtlas = useDiffuseAtlas || autoDiffuseAtlas;
+            if (effectiveUseDiffuseAtlas)
             {
-                partModel = CharacterLineAtlasFix.InvertFaceAndHandLineAlpha(partModel);
+                partModel = StrippedLineTextureRecovery.RestoreStrippedTextures(partModel, asset.MeshPath);
             }
-
-            var atlas = ApplyDiffuseAtlasIfRequested(partModel, useDiffuseAtlas);
+            if (effectiveUseDiffuseAtlas &&
+                (gameConfig.InvertHeadLineAlphaOnReimport || gameConfig.InvertBodyLineAlphaOnReimport || gameConfig.InvertHandLineAlphaOnReimport))
+            {
+                partModel = CharacterLineAtlasFix.InvertCharacterLineAlpha(partModel, gameConfig);
+            }
+            var atlas = ApplyDiffuseAtlasIfRequested(partModel, effectiveUseDiffuseAtlas, asset.MeshPath);
             partModel = atlas.Model;
             var output = Path.Combine(outputFolder, Path.GetFileName(asset.MeshPath));
             var layout = D3DMeshLayout.Build(File.ReadAllBytes(asset.MeshPath));
-            var skeleton = LoadSkeletonOrNull(asset.SkeletonPath, layout.Version);
-            var textureOptions = BuildReinsertTextureOptions(useDiffuseAtlas, uncompressedTextures);
+            var skeleton = combinedSkeleton ?? LoadSkeletonOrNull(asset.SkeletonPath, layout.Version);
+            var textureOptions = BuildReinsertTextureOptions(effectiveUseDiffuseAtlas, uncompressedTextures);
             var textures = ReinsertTextureService.WriteAllReferencedTextures(partModel, asset.MeshPath, output, gameConfig, textureOptions);
             var bytes = MeshReinserter.ReinsertGeometry(layout, partModel, textures, skeleton, gameConfig);
             File.WriteAllBytes(output, bytes);
@@ -1642,14 +1716,18 @@ public sealed class MainForm : Form
             var atlasSummary = atlas.Applied
                 ? $", atlas {atlas.SourceTextureCount}->{atlas.AtlasWidth}x{atlas.AtlasHeight}"
                 : "";
+            if (autoDiffuseAtlas && atlas.Applied)
+            {
+                atlasSummary += " (auto: original texture names)";
+            }
             lines.Add($"OK {Path.GetFileName(asset.MeshPath)}: {primitives.Count} primitive(s), {textures.WrittenNames.Count} texture(s){atlasSummary}, {status}.");
         }
 
         if (ok == 0)
         {
             throw new InvalidOperationException(
-                "The selected GLB/GLTF does not contain combined source metadata for this group. " +
-                "Extract the Combined model with this tool and keep the primitive extras/source data when editing/exporting.");
+                "The selected GLB/GLTF could not be split for this Combined group. " +
+                "Use a model with recognizable part/material names, or extract a Combined model with this tool and keep the primitive extras/source data.");
         }
 
         return string.Join(
@@ -1657,14 +1735,106 @@ public sealed class MainForm : Form
             $"Reimported combined group: {group.Name}",
             $"Input: {input}",
             $"Output folder: {outputFolder}",
-            $"Parts OK: {ok}/{group.Assets.Count}, skipped: {skipped}, textures written: {totalTextures}",
+            splitModeLine,
+            skeletonLine,
+            $"Parts OK: {ok}/{group.Assets.Count}, invisible: {invisible}, skipped: {skipped}, textures written: {totalTextures}",
             string.Join(Environment.NewLine, lines));
+    }
+
+    private static byte[] BuildInvisibleMeshBytes(string templateMeshPath)
+    {
+        var layout = D3DMeshLayout.Build(File.ReadAllBytes(templateMeshPath));
+        var submeshBytes = layout.Original
+            .AsSpan(layout.SubmeshTableOffset, layout.SubmeshTableLength)
+            .ToArray();
+
+        foreach (var submesh in layout.Submeshes)
+        {
+            WriteU32(submeshBytes, submesh.FaceStartFieldOffset - layout.SubmeshTableOffset, 0);
+            WriteU32(submeshBytes, submesh.PolygonCountFieldOffset - layout.SubmeshTableOffset, 0);
+
+            // Keep vertex ranges untouched for old Telltale mesh versions that dislike zero-vertex files.
+            // With polygon counts and face buffer cleared, the mesh remains valid but has nothing to draw.
+        }
+
+        var patches = new List<RegionPatch>
+        {
+            new(layout.SubmeshTableOffset, layout.SubmeshTableLength, submeshBytes),
+            new(layout.FaceCountFieldOffset, 4, U32(0)),
+            new(layout.FaceDataOffset, layout.FaceDataLength, []),
+        };
+
+        var result = D3DMeshWriter.Apply(layout, patches);
+        BinaryPrimitives.WriteUInt32LittleEndian(result.AsSpan(4, 4), (uint)(result.Length - layout.DataOffset));
+        return result;
+    }
+
+    private static byte[] U32(int value)
+    {
+        var bytes = new byte[4];
+        BinaryPrimitives.WriteUInt32LittleEndian(bytes, unchecked((uint)value));
+        return bytes;
+    }
+
+    private static void WriteU32(byte[] bytes, int offset, int value)
+        => BinaryPrimitives.WriteUInt32LittleEndian(bytes.AsSpan(offset, 4), unchecked((uint)value));
+
+    private static SkeletonData? BuildCombinedReferenceSkeletonForReimport(
+        ModelAssetGroup group,
+        GltfModel model,
+        string outputFolder,
+        out string statusLine)
+    {
+        statusLine = "Skeleton: skipped.";
+        if (string.IsNullOrWhiteSpace(group.SkeletonPath) || !File.Exists(group.SkeletonPath))
+        {
+            if (model.Skeleton is { Bones.Count: > 0 } foreignSkeleton)
+            {
+                var outputPath = Path.Combine(outputFolder, group.OutputStem + ".skl");
+                var skeletonBytes = SkeletonRebuilder.WriteNewSkeleton(foreignSkeleton, GameConfig.Current.DisplayName);
+                File.WriteAllBytes(outputPath, skeletonBytes);
+                statusLine = $"Skeleton: {Path.GetFileName(outputPath)} created from the imported model ({foreignSkeleton.Bones.Count} bones).";
+                return LoadSkeletonOrNull(outputPath, version: 13);
+            }
+
+            statusLine = "Skeleton: skipped because the Combined group has no original .skl and the imported model has no skeleton.";
+            return null;
+        }
+
+        if (model.Skeleton is null || model.Skeleton.Bones.Count == 0)
+        {
+            var original = LoadSkeletonOrNull(group.SkeletonPath, version: 13);
+            var outputPath = Path.Combine(outputFolder, Path.GetFileName(group.SkeletonPath));
+            if (!Path.GetFullPath(group.SkeletonPath).Equals(Path.GetFullPath(outputPath), StringComparison.OrdinalIgnoreCase))
+            {
+                File.Copy(group.SkeletonPath, outputPath, overwrite: true);
+            }
+
+            statusLine = $"Skeleton: kept {Path.GetFileName(group.SkeletonPath)}; imported model has no skeleton.";
+            return original;
+        }
+
+        try
+        {
+            var skeletonName = Path.GetFileName(group.SkeletonPath);
+            var outputPath = Path.Combine(outputFolder, skeletonName);
+            var skeletonBytes = SkeletonRebuilder.RebuildWithEdits(group.SkeletonPath, model.Skeleton);
+            File.WriteAllBytes(outputPath, skeletonBytes);
+            statusLine = $"Skeleton: {skeletonName} rebuilt from the original skeleton + imported model ({model.Skeleton.Bones.Count} bones).";
+            return LoadSkeletonOrNull(outputPath, version: 13);
+        }
+        catch (Exception ex)
+        {
+            statusLine = $"Skeleton: could not rebuild the .skl ({ex.Message}); original skeleton was used for mesh mapping.";
+            return LoadSkeletonOrNull(group.SkeletonPath, version: 13);
+        }
     }
 
     private static ReinsertTextureOptions BuildReinsertTextureOptions(bool useDiffuseAtlas, bool uncompressedTextures)
         => useDiffuseAtlas
             ? new ReinsertTextureOptions
             {
+                NameMode = ReinsertTextureNameMode.PreferGltfNames,
                 ForceUncompressed = uncompressedTextures,
                 IncludedSlots = new HashSet<string>(StringComparer.OrdinalIgnoreCase)
                 {
@@ -1678,10 +1848,117 @@ public sealed class MainForm : Form
             }
             : new ReinsertTextureOptions { ForceUncompressed = uncompressedTextures };
 
-    private static GltfDiffuseAtlasResult ApplyDiffuseAtlasIfRequested(GltfModel model, bool useDiffuseAtlas)
+    // Name the atlas after existing template textures (the body/head diffuse + any existing normal) instead of
+    // the generic "diffuse_atlas", so the atlas and its normal companion reuse real texture names the game
+    // already references. Never a lines/detail map (ResolveAtlasTextureNames enforces it).
+    private static GltfDiffuseAtlasResult ApplyDiffuseAtlasIfRequested(GltfModel model, bool useDiffuseAtlas, string templateMeshPath)
         => useDiffuseAtlas
-            ? GltfDiffuseAtlasPacker.Pack(model)
+            ? GltfDiffuseAtlasPacker.Pack(model, BuildAtlasOptions(templateMeshPath))
             : new GltfDiffuseAtlasResult(model, Applied: false, SourceTextureCount: 0, AtlasWidth: 0, AtlasHeight: 0, AtlasName: "", Warnings: []);
+
+    private static bool ShouldAutoAtlasCombinedPart(
+        GameConfig gameConfig,
+        bool useDiffuseAtlas,
+        string splitModeLine,
+        GltfModel model,
+        string templateMeshPath)
+    {
+        if (useDiffuseAtlas ||
+            gameConfig.Id != GameId.WolfAmongUs ||
+            !splitModeLine.Contains("external model auto-split", StringComparison.OrdinalIgnoreCase))
+        {
+            return false;
+        }
+
+        var templateSemantics = BuildTemplateTextureSemantics(templateMeshPath);
+        if (templateSemantics.Count == 0)
+        {
+            return false;
+        }
+
+        foreach (var primitive in model.Primitives)
+        {
+            foreach (var image in primitive.TextureSlots.Values.Concat(primitive.ReferencedTextures.Values))
+            {
+                var semantic = ClassifyTextureSemantic(image.Name);
+                if (semantic is null || IsGameProvidedTextureName(image.Name))
+                {
+                    continue;
+                }
+
+                if (!templateSemantics.Contains(semantic))
+                {
+                    return true;
+                }
+            }
+        }
+
+        return false;
+    }
+
+    private static HashSet<string> BuildTemplateTextureSemantics(string templateMeshPath)
+    {
+        var result = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        try
+        {
+            var mesh = D3DMeshParser.Parse(File.ReadAllBytes(templateMeshPath));
+            foreach (var submesh in mesh.Submeshes)
+            {
+                foreach (var name in submesh.TextureNames.Values.Append(submesh.Name))
+                {
+                    if (ClassifyTextureSemantic(name) is { } semantic)
+                    {
+                        result.Add(semantic);
+                    }
+                }
+            }
+        }
+        catch
+        {
+            return [];
+        }
+
+        return result;
+    }
+
+    private static string? ClassifyTextureSemantic(string? name)
+    {
+        if (string.IsNullOrWhiteSpace(name))
+        {
+            return null;
+        }
+
+        var lower = Path.GetFileNameWithoutExtension(name).ToLowerInvariant();
+        if (lower.Contains("eye")) return "eye";
+        if (lower.Contains("mouth") || lower.Contains("teeth") || lower.Contains("tongue")) return "mouth";
+        if (lower.Contains("hair")) return "hair";
+        if (lower.Contains("hand")) return "hands";
+        if (lower.Contains("head") || lower.Contains("face")) return "head";
+        if (lower.Contains("body") || lower.Contains("torso")) return "body";
+        return null;
+    }
+
+    private static bool IsGameProvidedTextureName(string? name)
+    {
+        if (string.IsNullOrWhiteSpace(name))
+        {
+            return false;
+        }
+
+        var stem = Path.GetFileNameWithoutExtension(name).ToLowerInvariant();
+        return stem.StartsWith("color_", StringComparison.Ordinal) ||
+               stem.StartsWith("map_", StringComparison.Ordinal) ||
+               stem.StartsWith("sk_sharedparts", StringComparison.Ordinal) ||
+               stem.StartsWith("bmap_sk_sharedparts", StringComparison.Ordinal);
+    }
+
+    private static GltfDiffuseAtlasOptions BuildAtlasOptions(string templateMeshPath)
+    {
+        var names = ReinsertTextureService.ResolveAtlasTextureNames(templateMeshPath);
+        return names is null
+            ? new GltfDiffuseAtlasOptions()
+            : new GltfDiffuseAtlasOptions(AtlasName: names.Diffuse, NormalAtlasName: names.Normal);
+    }
 
     private static string BuildAtlasStatusLine(GltfDiffuseAtlasResult atlas)
     {
@@ -1701,32 +1978,310 @@ public sealed class MainForm : Form
         return line;
     }
 
-    private static Dictionary<string, List<GltfPrimitive>> BuildCombinedSourcePrimitiveMap(GltfModel model, string inputRoot)
+    private static Dictionary<string, List<GltfPrimitive>> BuildCombinedSourcePrimitiveMap(
+        ModelAssetGroup group,
+        GltfModel model,
+        string inputRoot,
+        out string modeLine)
     {
         var result = new Dictionary<string, List<GltfPrimitive>>(StringComparer.OrdinalIgnoreCase);
-        var missingSource = model.Primitives.Count(primitive => string.IsNullOrWhiteSpace(primitive.SourceMeshPath));
-        if (missingSource > 0)
-        {
-            throw new InvalidOperationException(
-                $"{missingSource} primitive(s) do not have combined source metadata. " +
-                "Make sure the edited file was originally extracted as a Combined model and that the exporter preserved custom extras.");
-        }
+        var groupPaths = group.Assets
+            .Select(asset => Path.GetFullPath(asset.MeshPath))
+            .ToHashSet(StringComparer.OrdinalIgnoreCase);
 
         foreach (var primitive in model.Primitives)
         {
-            var source = primitive.SourceMeshPath!;
-            var fullPath = Path.GetFullPath(Path.IsPathRooted(source) ? source : Path.Combine(inputRoot, source));
-            if (!result.TryGetValue(fullPath, out var primitives))
+            if (string.IsNullOrWhiteSpace(primitive.SourceMeshPath))
             {
-                primitives = [];
-                result[fullPath] = primitives;
+                continue;
             }
 
-            primitives.Add(primitive);
+            var source = primitive.SourceMeshPath!;
+            var fullPath = Path.GetFullPath(Path.IsPathRooted(source) ? source : Path.Combine(inputRoot, source));
+            if (!groupPaths.Contains(fullPath))
+            {
+                continue;
+            }
+
+            AddPrimitive(result, fullPath, primitive);
+        }
+
+        if (result.Values.Sum(static primitives => primitives.Count) == model.Primitives.Count)
+        {
+            modeLine = "Split mode: original Combined source metadata.";
+            return result;
+        }
+
+        var external = BuildExternalCombinedPrimitiveMap(group, model, inputRoot, result);
+        modeLine = "Split mode: external model auto-split by source/material/texture names; unmatched primitives were assigned to the main part.";
+        return external;
+    }
+
+    private static Dictionary<string, List<GltfPrimitive>> BuildExternalCombinedPrimitiveMap(
+        ModelAssetGroup group,
+        GltfModel model,
+        string inputRoot,
+        Dictionary<string, List<GltfPrimitive>> exactMatches)
+    {
+        var result = exactMatches.ToDictionary(
+            pair => pair.Key,
+            pair => pair.Value.ToList(),
+            StringComparer.OrdinalIgnoreCase);
+
+        var targets = group.Assets
+            .Select(asset => BuildCombinedPartTarget(asset, inputRoot))
+            .ToList();
+        ExpandMissingCombinedPartSlots(targets);
+        var mainTarget = targets
+            .OrderByDescending(static target => target.IsMainPart)
+            .ThenByDescending(static target => target.OriginalVertexCount)
+            .First();
+
+        var alreadyAssigned = new HashSet<GltfPrimitive>(result.Values.SelectMany(static primitives => primitives));
+        foreach (var primitive in model.Primitives)
+        {
+            if (!alreadyAssigned.Add(primitive))
+            {
+                continue;
+            }
+
+            var target = FindBestCombinedPartTarget(primitive, targets) ?? mainTarget;
+            AddPrimitive(result, target.FullPath, ClonePrimitiveForCombinedPart(primitive));
         }
 
         return result;
     }
+
+    private static CombinedPartTarget BuildCombinedPartTarget(ModelAsset asset, string inputRoot)
+    {
+        var mesh = D3DMeshParser.Parse(File.ReadAllBytes(asset.MeshPath));
+        var primaryLabels = new List<string>
+        {
+            Path.GetFileNameWithoutExtension(asset.MeshPath),
+            Path.GetRelativePath(inputRoot, asset.MeshPath),
+        };
+        var tokens = BuildPartTokens(primaryLabels);
+
+        if (tokens.Count == 0)
+        {
+            var fallbackLabels = new List<string>();
+            foreach (var submesh in mesh.Submeshes)
+            {
+                fallbackLabels.Add(submesh.Name);
+                if (!string.IsNullOrWhiteSpace(submesh.MaterialName))
+                {
+                    fallbackLabels.Add(submesh.MaterialName!);
+                }
+
+                fallbackLabels.AddRange(submesh.TextureNames.Values);
+            }
+
+            tokens = BuildPartTokens(fallbackLabels);
+        }
+
+        var isMain = tokens.Contains("body") ||
+                     tokens.Contains("torso") ||
+                     tokens.Contains("chest") ||
+                     tokens.Contains("upper") ||
+                     tokens.Contains("lower");
+
+        return new CombinedPartTarget(
+            asset,
+            Path.GetFullPath(asset.MeshPath),
+            tokens,
+            isMain,
+            mesh.VertexCount);
+    }
+
+    private static void ExpandMissingCombinedPartSlots(IReadOnlyList<CombinedPartTarget> targets)
+    {
+        CombinedPartTarget? Find(params string[] tokens)
+            => targets.FirstOrDefault(target => tokens.Any(token => target.Tokens.Contains(token)));
+
+        var main = targets
+            .OrderByDescending(static target => target.IsMainPart)
+            .ThenByDescending(static target => target.OriginalVertexCount)
+            .FirstOrDefault();
+        var head = Find("head") ?? main;
+        var teeth = Find("teeth");
+
+        if (head is not null)
+        {
+            foreach (var token in new[] { "hair", "eye", "brow", "ear", "nose", "neck" })
+            {
+                if (Find(token) is null)
+                {
+                    head.Tokens.Add(token);
+                }
+            }
+        }
+
+        if (teeth is not null)
+        {
+            teeth.Tokens.Add("mouth");
+            teeth.Tokens.Add("tongue");
+        }
+        else if (head is not null)
+        {
+            head.Tokens.Add("mouth");
+            head.Tokens.Add("tongue");
+        }
+
+        if (main is not null)
+        {
+            foreach (var token in new[] { "hand", "arm", "leg", "foot" })
+            {
+                if (Find(token) is null)
+                {
+                    main.Tokens.Add(token);
+                }
+            }
+        }
+    }
+
+    private static CombinedPartTarget? FindBestCombinedPartTarget(GltfPrimitive primitive, IReadOnlyList<CombinedPartTarget> targets)
+    {
+        var labels = new List<string?>();
+        labels.Add(primitive.SourceMeshPath);
+        labels.Add(primitive.MaterialName);
+        labels.AddRange(primitive.TextureSlots.Values.Select(static image => image.Name));
+        labels.AddRange(primitive.ReferencedTextures.Values.Select(static image => image.Name));
+
+        var primitiveTokens = BuildPartTokens(labels.Where(static label => !string.IsNullOrWhiteSpace(label))!);
+        if (primitiveTokens.Count == 0)
+        {
+            return null;
+        }
+
+        var bestScore = 0;
+        CombinedPartTarget? best = null;
+        foreach (var target in targets)
+        {
+            var score = target.Tokens.Sum(token => primitiveTokens.Contains(token) ? TokenWeight(token) : 0);
+            if (score > bestScore)
+            {
+                bestScore = score;
+                best = target;
+            }
+        }
+
+        return bestScore > 0 ? best : null;
+    }
+
+    private static HashSet<string> BuildPartTokens(IEnumerable<string> labels)
+    {
+        var tokens = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        foreach (var label in labels)
+        {
+            foreach (var token in SplitPartLabel(label))
+            {
+                AddPartToken(tokens, token);
+            }
+        }
+
+        return tokens;
+    }
+
+    private static IEnumerable<string> SplitPartLabel(string? label)
+    {
+        if (string.IsNullOrWhiteSpace(label))
+        {
+            yield break;
+        }
+
+        var chars = label.Select(static c => char.IsLetterOrDigit(c) ? char.ToLowerInvariant(c) : ' ').ToArray();
+        foreach (var raw in new string(chars).Split(' ', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries))
+        {
+            if (raw.Length >= 2)
+            {
+                yield return raw;
+            }
+        }
+    }
+
+    private static void AddPartToken(HashSet<string> tokens, string token)
+    {
+        token = token.Trim().ToLowerInvariant();
+        if (token.Length < 2 || token.StartsWith("sk", StringComparison.OrdinalIgnoreCase) || token.All(char.IsDigit))
+        {
+            return;
+        }
+
+        static bool Has(string value, string part) => value.Contains(part, StringComparison.OrdinalIgnoreCase);
+
+        if (Has(token, "body")) tokens.Add("body");
+        if (Has(token, "torso")) tokens.Add("torso");
+        if (Has(token, "chest")) tokens.Add("chest");
+        if (Has(token, "upper")) tokens.Add("upper");
+        if (Has(token, "lower")) tokens.Add("lower");
+        if (Has(token, "head")) tokens.Add("head");
+        if (Has(token, "face")) tokens.Add("head");
+        if (Has(token, "hair")) tokens.Add("hair");
+        if (Has(token, "hat")) tokens.Add("hat");
+        if (Has(token, "hand")) tokens.Add("hand");
+        if (Has(token, "arm")) tokens.Add("arm");
+        if (Has(token, "leg")) tokens.Add("leg");
+        if (Has(token, "foot") || Has(token, "feet")) tokens.Add("foot");
+        if (Has(token, "eye")) tokens.Add("eye");
+        if (Has(token, "mouth")) tokens.Add("mouth");
+        if (Has(token, "teeth")) tokens.Add("teeth");
+        if (Has(token, "tongue")) tokens.Add("tongue");
+        if (Has(token, "brow")) tokens.Add("brow");
+        if (Has(token, "ear")) tokens.Add("ear");
+        if (Has(token, "neck")) tokens.Add("neck");
+        if (Has(token, "nose")) tokens.Add("nose");
+        if (Has(token, "cloth") || Has(token, "shirt") || Has(token, "coat") || Has(token, "jacket")) tokens.Add("body");
+    }
+
+    private static int TokenWeight(string token)
+        => token is "body" or "torso" or "head" or "hair" or "hat" or "hand" or "arm" or "leg" or "foot" ? 3 : 1;
+
+    private static GltfPrimitive ClonePrimitiveForCombinedPart(GltfPrimitive source)
+    {
+        return new GltfPrimitive
+        {
+            Positions = source.Positions,
+            Normals = source.Normals,
+            Uv0 = source.Uv0,
+            Uv1 = source.Uv1,
+            Uv2 = source.Uv2,
+            Uv3 = source.Uv3,
+            Color0 = source.Color0,
+            Tangents = source.Tangents,
+            Binormals = source.Binormals,
+            Unknown1 = source.Unknown1,
+            Joints0 = source.Joints0,
+            Weights0 = source.Weights0,
+            Indices = source.Indices,
+            MaterialName = source.MaterialName,
+            BonePaletteIndex = null,
+            SourceMeshPath = null,
+            SourceSubmeshIndex = null,
+            RecoveredDetailLineTextureName = source.RecoveredDetailLineTextureName,
+            IsSkinned = source.IsSkinned,
+            BaseColor = source.BaseColor,
+            TextureSlots = source.TextureSlots,
+            ReferencedTextures = source.ReferencedTextures,
+        };
+    }
+
+    private static void AddPrimitive(Dictionary<string, List<GltfPrimitive>> map, string fullPath, GltfPrimitive primitive)
+    {
+        if (!map.TryGetValue(fullPath, out var primitives))
+        {
+            primitives = [];
+            map[fullPath] = primitives;
+        }
+
+        primitives.Add(primitive);
+    }
+
+    private sealed record CombinedPartTarget(
+        ModelAsset Asset,
+        string FullPath,
+        HashSet<string> Tokens,
+        bool IsMainPart,
+        int OriginalVertexCount);
 
     private string? ChooseOutputFolder()
     {
@@ -2205,9 +2760,10 @@ public sealed class MainForm : Form
         }
 
         var max = 0;
+        var measured = 0;
         using (var graphics = _tree.CreateGraphics())
         {
-            MeasureVisibleNodes(_tree.Nodes, graphics, _tree.Font, 0, ref max);
+            MeasureVisibleNodes(_tree.Nodes, graphics, _tree.Font, 0, ref max, ref measured, MaxTreeNodesToMeasureForAutoFit);
         }
 
         var target = max + SystemInformation.VerticalScrollBarWidth + 42;
@@ -2218,6 +2774,12 @@ public sealed class MainForm : Form
         {
             _split.SplitterDistance = target;
         }
+    }
+
+    private void ScheduleTreeAutoFit()
+    {
+        _treeFitDebounceTimer.Stop();
+        _treeFitDebounceTimer.Start();
     }
 
     private void EnsureTreePanelWidth()
@@ -2235,10 +2797,22 @@ public sealed class MainForm : Form
         }
     }
 
-    private static void MeasureVisibleNodes(TreeNodeCollection nodes, Graphics graphics, Font font, int depth, ref int maxPx)
+    private static void MeasureVisibleNodes(
+        TreeNodeCollection nodes,
+        Graphics graphics,
+        Font font,
+        int depth,
+        ref int maxPx,
+        ref int measured,
+        int maxNodes)
     {
         foreach (TreeNode node in nodes)
         {
+            if (measured++ >= maxNodes)
+            {
+                return;
+            }
+
             var width = (int)graphics.MeasureString(node.Text, font).Width + depth * 19;
             if (width > maxPx)
             {
@@ -2247,7 +2821,11 @@ public sealed class MainForm : Form
 
             if (node.IsExpanded)
             {
-                MeasureVisibleNodes(node.Nodes, graphics, font, depth + 1, ref maxPx);
+                MeasureVisibleNodes(node.Nodes, graphics, font, depth + 1, ref maxPx, ref measured, maxNodes);
+                if (measured >= maxNodes)
+                {
+                    return;
+                }
             }
         }
     }

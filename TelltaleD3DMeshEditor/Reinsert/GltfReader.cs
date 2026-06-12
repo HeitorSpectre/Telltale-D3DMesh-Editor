@@ -42,6 +42,13 @@ public sealed class GltfPrimitive
     public int? BonePaletteIndex { get; init; }
     public string? SourceMeshPath { get; init; }
     public int? SourceSubmeshIndex { get; init; }
+
+    // The original detail/line texture name recovered from the adjacent line-overlay primitive's
+    // material name (e.g. "base__tt_lines_<lineName>"). Blender strips the material/primitive extras
+    // that normally carry the line slot, so without this the detail_diffuse slot would be cleared on
+    // reimport and the character outlines would vanish. Set during parsing, consumed by the reinsert
+    // texture service to keep the template's original line binding.
+    public string? RecoveredDetailLineTextureName { get; set; }
     public bool IsSkinned { get; init; }
     public GltfImage? BaseColor { get; init; }
     public IReadOnlyDictionary<string, GltfImage> TextureSlots { get; init; } =
@@ -165,6 +172,7 @@ public static class GltfReader
                 {
                     if (IsGeneratedLineOverlayPrimitive(prim, ctx))
                     {
+                        AttachRecoveredLineOverlay(prim, ctx, primitives);
                         continue;
                     }
 
@@ -574,6 +582,7 @@ public static class GltfReader
                 {
                     if (IsGeneratedLineOverlayPrimitive(prim, ctx))
                     {
+                        AttachRecoveredLineOverlay(prim, ctx, primitives);
                         continue;
                     }
 
@@ -698,6 +707,67 @@ public static class GltfReader
         return !string.IsNullOrWhiteSpace(name) &&
                (name.Contains("__tt_lines_", StringComparison.OrdinalIgnoreCase) ||
                 name.Contains("__tt_lines_overlay", StringComparison.OrdinalIgnoreCase));
+    }
+
+    // A line-overlay primitive carries the original detail/line texture name only in its material
+    // name ("<baseMaterial>__tt_lines_<lineTexture>") once Blender has stripped the extras. Recover
+    // that name and attach it to the base primitive it shadows, so the reinserter can keep the line
+    // binding instead of clearing the slot. The overlay is emitted right after its base and shares the
+    // base index count, so we match the most recent base primitive with an equal index count.
+    private static void AttachRecoveredLineOverlay(JsonElement prim, ParseContext ctx, List<GltfPrimitive> primitives)
+    {
+        if (primitives.Count == 0 ||
+            !TryGetMaterial(prim, ctx, out var material) ||
+            !material.TryGetProperty("name", out var nameElem) ||
+            ExtractLineTextureNameFromOverlayMaterial(nameElem.GetString()) is not { } lineTextureName)
+        {
+            return;
+        }
+
+        var overlayIndexCount = prim.TryGetProperty("indices", out var indicesElem)
+            ? ctx.AccessorCount(indicesElem.GetInt32())
+            : -1;
+
+        for (var i = primitives.Count - 1; i >= 0; i--)
+        {
+            var candidate = primitives[i];
+            if (candidate.RecoveredDetailLineTextureName is not null)
+            {
+                continue;
+            }
+
+            if (overlayIndexCount < 0 || candidate.Indices.Length == overlayIndexCount)
+            {
+                candidate.RecoveredDetailLineTextureName = lineTextureName;
+                return;
+            }
+        }
+    }
+
+    private static string? ExtractLineTextureNameFromOverlayMaterial(string? materialName)
+    {
+        if (string.IsNullOrWhiteSpace(materialName))
+        {
+            return null;
+        }
+
+        const string separator = "__tt_lines_";
+        var index = materialName.IndexOf(separator, StringComparison.OrdinalIgnoreCase);
+        if (index < 0)
+        {
+            return null;
+        }
+
+        var lineName = materialName[(index + separator.Length)..];
+        // Drop a trailing "__tt_lines_overlay" tag and any Blender ".001" duplicate suffix.
+        var overlayTag = lineName.IndexOf("__tt_lines_overlay", StringComparison.OrdinalIgnoreCase);
+        if (overlayTag >= 0)
+        {
+            lineName = lineName[..overlayTag];
+        }
+
+        lineName = NormalizeImageName(lineName);
+        return string.IsNullOrWhiteSpace(lineName) ? null : lineName;
     }
 
     private static void AutoUprightSkinnedModel(IReadOnlyList<GltfPrimitive> primitives)
@@ -1173,11 +1243,31 @@ public static class GltfReader
         {
             foreach (var slotProperty in telltaleTextures.EnumerateObject())
             {
-                if (slotProperty.Value.ValueKind == JsonValueKind.Object &&
-                    slotProperty.Value.TryGetProperty("textureIndex", out var textureIndexElem) &&
-                    TryResolveTextureByIndex(textureIndexElem.GetInt32(), ctx, out var image))
+                if (slotProperty.Value.ValueKind != JsonValueKind.Object)
                 {
-                    result[slotProperty.Name] = image;
+                    continue;
+                }
+
+                // Resolve by the stored image name first: it survives a Blender round-trip, whereas the
+                // absolute textureIndex does not (Blender rewrites the textures/images arrays).
+                var storedName = slotProperty.Value.TryGetProperty("name", out var nameElem) &&
+                                 nameElem.ValueKind == JsonValueKind.String
+                    ? nameElem.GetString()
+                    : null;
+                if (TryResolveTextureByImageName(storedName, ctx, out var namedImage))
+                {
+                    result[slotProperty.Name] = namedImage;
+                }
+                else if (string.IsNullOrWhiteSpace(storedName) &&
+                         slotProperty.Value.TryGetProperty("textureIndex", out var textureIndexElem) &&
+                         TryResolveTextureByIndex(textureIndexElem.GetInt32(), ctx, out var indexedImage))
+                {
+                    // Legacy exports without a stored name fall back to the index. When a name *is*
+                    // present but no longer resolves (Blender pruned the image because nothing bound it),
+                    // the slot is left empty rather than binding an unrelated image by a stale index. The
+                    // reinserter then keeps the template submesh's own original binding for that slot,
+                    // which is the correct, unmodified line/detail texture.
+                    result[slotProperty.Name] = indexedImage;
                 }
             }
         }
@@ -1240,7 +1330,83 @@ public static class GltfReader
         }
 
         var imageIndex = sourceElem.GetInt32();
-        if (imageIndex < 0 || imageIndex >= ctx.Images.GetArrayLength())
+        return TryBuildImageFromIndex(imageIndex, ctx, out image);
+    }
+
+    // Resolves a Telltale texture slot by the image NAME stored in the material's telltaleTextures
+    // extras, rather than by the absolute textureIndex. A Blender round-trip preserves the embedded
+    // image names and the extras JSON verbatim, but rewrites the textures/images arrays — so the
+    // stored textureIndex goes stale and would bind the wrong image (e.g. the hand line slot lands on
+    // the head line, the body outline drops entirely). Matching by name survives that reindexing.
+    private static bool TryResolveTextureByImageName(string? name, ParseContext ctx, out GltfImage image)
+    {
+        image = null!;
+        if (string.IsNullOrWhiteSpace(name) || ctx.Images.ValueKind != JsonValueKind.Array)
+        {
+            return false;
+        }
+
+        var imageCount = ctx.Images.GetArrayLength();
+        for (var pass = 0; pass < 2; pass++)
+        {
+            for (var i = 0; i < imageCount; i++)
+            {
+                var imageElem = ctx.Images[i];
+                if (!imageElem.TryGetProperty("name", out var nameElem) ||
+                    nameElem.ValueKind != JsonValueKind.String)
+                {
+                    continue;
+                }
+
+                var candidate = nameElem.GetString();
+                var matches = pass == 0
+                    ? string.Equals(candidate, name, StringComparison.OrdinalIgnoreCase)
+                    : NormalizeImageName(candidate).Equals(NormalizeImageName(name), StringComparison.OrdinalIgnoreCase);
+                if (matches && TryBuildImageFromIndex(i, ctx, out image))
+                {
+                    return true;
+                }
+            }
+        }
+
+        return false;
+    }
+
+    // Blender can append a ".001" disambiguation suffix and a file extension to image names on
+    // round-trip; normalizing both sides lets the name match still land on the right image.
+    private static string NormalizeImageName(string? name)
+    {
+        if (string.IsNullOrWhiteSpace(name))
+        {
+            return "";
+        }
+
+        var stem = name;
+        foreach (var ext in new[] { ".png", ".jpg", ".jpeg", ".bmp", ".tga", ".dds", ".webp", ".d3dtx" })
+        {
+            if (stem.EndsWith(ext, StringComparison.OrdinalIgnoreCase))
+            {
+                stem = stem[..^ext.Length];
+                break;
+            }
+        }
+
+        // Strip a trailing Blender duplicate suffix like ".001".
+        if (stem.Length > 4 && stem[^4] == '.' &&
+            char.IsDigit(stem[^1]) && char.IsDigit(stem[^2]) && char.IsDigit(stem[^3]))
+        {
+            stem = stem[..^4];
+        }
+
+        return stem;
+    }
+
+    private static bool TryBuildImageFromIndex(int imageIndex, ParseContext ctx, out GltfImage image)
+    {
+        image = null!;
+        if (ctx.Images.ValueKind != JsonValueKind.Array ||
+            imageIndex < 0 ||
+            imageIndex >= ctx.Images.GetArrayLength())
         {
             return false;
         }
@@ -1403,6 +1569,18 @@ public static class GltfReader
         public JsonElement Images => images;
         public JsonElement Skins => skins;
         public string BaseDir => baseDir;
+
+        public int AccessorCount(int accessorIndex)
+        {
+            if (accessors.ValueKind != JsonValueKind.Array ||
+                accessorIndex < 0 ||
+                accessorIndex >= accessors.GetArrayLength())
+            {
+                return -1;
+            }
+
+            return accessors[accessorIndex].TryGetProperty("count", out var count) ? count.GetInt32() : -1;
+        }
 
         public byte[] SliceBufferView(int index)
         {

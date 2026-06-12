@@ -9,7 +9,8 @@ namespace TelltaleD3DMeshEditor.Reinsert;
 public sealed record GltfDiffuseAtlasOptions(
     int Padding = 4,
     int MaxSize = 8192,
-    string AtlasName = "diffuse_atlas");
+    string AtlasName = "diffuse_atlas",
+    string? NormalAtlasName = null);
 
 public sealed record GltfDiffuseAtlasResult(
     GltfModel Model,
@@ -79,7 +80,7 @@ public static class GltfDiffuseAtlasPacker
                 using var normalAtlas = BuildNormalAtlas(atlas.Width, atlas.Height, placements, bumpByDiffuseKey, Math.Max(0, options.Padding));
                 normalAtlasImage = new GltfImage
                 {
-                    Name = options.AtlasName + "_nm",
+                    Name = options.NormalAtlasName ?? options.AtlasName + "_nm",
                     Data = EncodePng(normalAtlas),
                     MimeType = "image/png",
                 };
@@ -96,6 +97,7 @@ public static class GltfDiffuseAtlasPacker
             {
                 var primitive = model.Primitives[primitiveIndex];
                 if (!primitive.TextureSlots.TryGetValue("diffuse", out var diffuseImage) ||
+                    IsGameProvidedTexture(diffuseImage.Name) ||
                     primitive.Uv0 is null ||
                     !placements.TryGetValue(DiffuseAtlasKey(primitive), out var placement))
                 {
@@ -193,7 +195,8 @@ public static class GltfDiffuseAtlasPacker
         foreach (var primitive in model.Primitives)
         {
             if (primitive.TextureSlots.TryGetValue("diffuse", out var diffuse) &&
-                primitive.Uv0 is not null)
+                primitive.Uv0 is not null &&
+                !IsGameProvidedTexture(diffuse.Name))
             {
                 var diffuseKey = DiffuseAtlasKey(diffuse);
                 if (seen.Add(diffuseKey))
@@ -234,6 +237,7 @@ public static class GltfDiffuseAtlasPacker
         {
             if (primitive.TextureSlots.TryGetValue("diffuse", out var diffuse) &&
                 primitive.Uv0 is not null &&
+                !IsGameProvidedTexture(diffuse.Name) &&
                 TryGetBumpSlot(primitive, out var bumpSlot))
             {
                 map.TryAdd(DiffuseAtlasKey(diffuse), primitive.TextureSlots[bumpSlot]);
@@ -876,6 +880,7 @@ public static class GltfDiffuseAtlasPacker
             BonePaletteIndex = source.BonePaletteIndex,
             SourceMeshPath = source.SourceMeshPath,
             SourceSubmeshIndex = source.SourceSubmeshIndex,
+            RecoveredDetailLineTextureName = source.RecoveredDetailLineTextureName,
             IsSkinned = source.IsSkinned,
             BaseColor = baseColor,
             TextureSlots = textureSlots,
@@ -895,6 +900,20 @@ public static class GltfDiffuseAtlasPacker
 
     private static string DetailAtlasKey(GltfImage image, GltfImage diffuse)
         => "detail:" + ImageKey(image) + ":match:" + ImageKey(diffuse);
+
+    private static bool IsGameProvidedTexture(string? name)
+    {
+        if (string.IsNullOrWhiteSpace(name))
+        {
+            return false;
+        }
+
+        var stem = Path.GetFileNameWithoutExtension(name).ToLowerInvariant();
+        return stem.StartsWith("color_", StringComparison.Ordinal) ||
+               stem.StartsWith("map_", StringComparison.Ordinal) ||
+               stem.StartsWith("sk_sharedparts", StringComparison.Ordinal) ||
+               stem.StartsWith("bmap_sk_sharedparts", StringComparison.Ordinal);
+    }
 
     private sealed record AtlasSourceImage(string Key, GltfImage Image, bool PreserveAlpha, GltfImage? MatchSizeOf = null);
 

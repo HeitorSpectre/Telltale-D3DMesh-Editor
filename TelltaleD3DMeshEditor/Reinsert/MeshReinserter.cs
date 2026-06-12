@@ -137,7 +137,8 @@ public static class MeshReinserter
                 VMax: verts.Count - 1,
                 FaceStart: faceStart,
                 PolyCount: (faceIndices.Count - faceStart) / 3,
-                BonePaletteIndex: prepared.BonePaletteIndex);
+                BonePaletteIndex: prepared.BonePaletteIndex,
+                TemplateSubmeshIndex: ResolveTemplateSubmeshIndex(layout, prim, k));
         }
 
         if (verts.Count > 65535)
@@ -153,7 +154,7 @@ public static class MeshReinserter
         var patches = new List<RegionPatch>
         {
             new(layout.BoundsOffset, 24, BuildBoundsBytes(verts)),
-            new(layout.SubmeshBlockSizeFieldOffset, 4, U32(layout.SubmeshBlockSize + BuildSubmeshTableSizeDelta(layout, subInfo.Length, preparedTextureSlotsByPrimitive))),
+            new(layout.SubmeshBlockSizeFieldOffset, 4, U32(layout.SubmeshBlockSize + BuildSubmeshTableSizeDelta(layout, subInfo, preparedTextureSlotsByPrimitive))),
             new(layout.SubmeshCountFieldOffset, 4, U32(subInfo.Length)),
             new(layout.SubmeshTableOffset, layout.SubmeshTableLength, BuildSubmeshTable(layout, subInfo, preparedTextureSlotsByPrimitive, gameConfig ?? GameConfig.Current)),
             new(layout.UvScalesOffset, layout.UvScalesLength, BuildUvScaleBytes(layout, mults)),
@@ -168,7 +169,7 @@ public static class MeshReinserter
             patches.Add(new RegionPatch(vertexBuffer.DataOffset, vertexBuffer.DataLength, vertexBytes));
         }
 
-        var texturePlansBySlot = BuildTextureGroupPlans(layout, preparedTextureSlotsByPrimitive);
+        var texturePlansBySlot = BuildTextureGroupPlans(layout, subInfo, preparedTextureSlotsByPrimitive);
         if (texturePlansBySlot.Count > 0)
         {
             patches.Add(new RegionPatch(
@@ -192,7 +193,7 @@ public static class MeshReinserter
         return result;
     }
 
-    private readonly record struct SubmeshPatchInfo(int VMin, int VMax, int FaceStart, int PolyCount, int? BonePaletteIndex);
+    private readonly record struct SubmeshPatchInfo(int VMin, int VMax, int FaceStart, int PolyCount, int? BonePaletteIndex, int TemplateSubmeshIndex);
     private sealed record TextureGroupEntryPlan(string TextureName, TextureEntryLayout TemplateEntry, int SortKey, int EncounterIndex);
     private sealed record PreparedPrimitive(
         GltfPrimitive Primitive,
@@ -693,6 +694,18 @@ public static class MeshReinserter
     private static int ResolvePrimitivePaletteIndex(D3DMeshLayout layout, GltfPrimitive prim, int primitiveIndex)
         => ResolvePrimitivePaletteIndex(layout, prim, primitiveIndex, preparedPaletteIndex: null);
 
+    private static int ResolveTemplateSubmeshIndex(D3DMeshLayout layout, GltfPrimitive prim, int primitiveIndex)
+    {
+        if (prim.SourceSubmeshIndex is { } sourceIndex &&
+            sourceIndex >= 0 &&
+            sourceIndex < layout.Submeshes.Count)
+        {
+            return sourceIndex;
+        }
+
+        return Math.Min(primitiveIndex, layout.Submeshes.Count - 1);
+    }
+
     private static int ResolvePrimitivePaletteIndex(D3DMeshLayout layout, GltfPrimitive prim, int primitiveIndex, int? preparedPaletteIndex)
     {
         if (preparedPaletteIndex is { } prepared &&
@@ -709,7 +722,7 @@ public static class MeshReinserter
             return explicitIndex;
         }
 
-        var template = GetSubmeshTemplate(layout, primitiveIndex);
+        var template = GetSubmeshTemplate(layout, ResolveTemplateSubmeshIndex(layout, prim, primitiveIndex));
         return NormalizePaletteIndex(template.BoneSetRaw + 1, layout.BonePalettes.Count);
     }
 
@@ -868,19 +881,19 @@ public static class MeshReinserter
 
     private static int BuildSubmeshTableSizeDelta(
         D3DMeshLayout layout,
-        int newCount,
+        IReadOnlyList<SubmeshPatchInfo> subInfo,
         IReadOnlyList<IReadOnlyDictionary<string, string>>? textureSlotsByPrimitive)
-        => BuildSubmeshTableLength(layout, newCount, textureSlotsByPrimitive) - layout.SubmeshTableLength;
+        => BuildSubmeshTableLength(layout, subInfo, textureSlotsByPrimitive) - layout.SubmeshTableLength;
 
     private static int BuildSubmeshTableLength(
         D3DMeshLayout layout,
-        int newCount,
+        IReadOnlyList<SubmeshPatchInfo> subInfo,
         IReadOnlyList<IReadOnlyDictionary<string, string>>? textureSlotsByPrimitive)
     {
         var total = 0;
-        for (var i = 0; i < newCount; i++)
+        for (var i = 0; i < subInfo.Count; i++)
         {
-            total += GetSubmeshTemplate(layout, i, TextureSlotsForPrimitive(textureSlotsByPrimitive, i)).EntryLength;
+            total += GetSubmeshTemplate(layout, subInfo[i].TemplateSubmeshIndex, TextureSlotsForPrimitive(textureSlotsByPrimitive, i)).EntryLength;
         }
 
         return total;
@@ -892,8 +905,8 @@ public static class MeshReinserter
         IReadOnlyList<IReadOnlyDictionary<string, string>>? textureSlotsByPrimitive,
         GameConfig gameConfig)
     {
-        using var ms = new MemoryStream(BuildSubmeshTableLength(layout, subInfo.Count, textureSlotsByPrimitive));
-        var texturePlansBySlot = BuildTextureGroupPlans(layout, textureSlotsByPrimitive);
+        using var ms = new MemoryStream(BuildSubmeshTableLength(layout, subInfo, textureSlotsByPrimitive));
+        var texturePlansBySlot = BuildTextureGroupPlans(layout, subInfo, textureSlotsByPrimitive);
         var rewrittenTextureSlots = texturePlansBySlot.Keys.ToHashSet(StringComparer.OrdinalIgnoreCase);
         var textureIndexBySlot = texturePlansBySlot
             .ToDictionary(
@@ -904,9 +917,9 @@ public static class MeshReinserter
                 StringComparer.OrdinalIgnoreCase);
         for (var i = 0; i < subInfo.Count; i++)
         {
-            var template = GetSubmeshTemplate(layout, i, TextureSlotsForPrimitive(textureSlotsByPrimitive, i));
-            var bytes = layout.Original.AsSpan(template.EntryOffset, template.EntryLength).ToArray();
             var info = subInfo[i];
+            var template = GetSubmeshTemplate(layout, info.TemplateSubmeshIndex, TextureSlotsForPrimitive(textureSlotsByPrimitive, i));
+            var bytes = layout.Original.AsSpan(template.EntryOffset, template.EntryLength).ToArray();
 
             WriteU32(bytes, template.VertexMinFieldOffset - template.EntryOffset, info.VMin);
             WriteU32(bytes, template.VertexMaxFieldOffset - template.EntryOffset, info.VMax);
@@ -1038,6 +1051,7 @@ public static class MeshReinserter
 
     private static Dictionary<string, List<TextureGroupEntryPlan>> BuildTextureGroupPlans(
         D3DMeshLayout layout,
+        IReadOnlyList<SubmeshPatchInfo> subInfo,
         IReadOnlyList<IReadOnlyDictionary<string, string>>? textureSlotsByPrimitive)
     {
         var result = new Dictionary<string, List<TextureGroupEntryPlan>>(StringComparer.OrdinalIgnoreCase);
@@ -1053,7 +1067,10 @@ public static class MeshReinserter
         for (var primitiveIndex = 0; primitiveIndex < textureSlotsByPrimitive.Count; primitiveIndex++)
         {
             var primitiveSlots = textureSlotsByPrimitive[primitiveIndex];
-            var template = GetSubmeshTemplate(layout, primitiveIndex, primitiveSlots);
+            var templateIndex = primitiveIndex < subInfo.Count
+                ? subInfo[primitiveIndex].TemplateSubmeshIndex
+                : primitiveIndex;
+            var template = GetSubmeshTemplate(layout, templateIndex, primitiveSlots);
             foreach (var (slot, textureName) in primitiveSlots)
             {
                 if (string.IsNullOrWhiteSpace(slot) || string.IsNullOrWhiteSpace(textureName))

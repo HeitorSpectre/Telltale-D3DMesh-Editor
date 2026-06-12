@@ -60,6 +60,11 @@ public sealed class GameConfig
     // "*_head_detail" textures are not affected.
     public bool InvertHeadLineAlphaOnReimport { get; init; }
 
+    // TWAU-style hand ink-line overlays use the opposite alpha convention after GLB reimport, same as the
+    // head lines. Flip the alpha of the hand line texture so the hand lines show and the rest of the hand
+    // stays transparent. Scoped by foreign ink/line + "hand" naming so native textures are not affected.
+    public bool InvertHandLineAlphaOnReimport { get; init; }
+
     // Existing TWAU/TWD2 environment assets often name baked/lightmap textures as adv/obj *_000.
     // Minecraft: Story Mode uses the same suffix for normal diffuse atlas names, so this must be
     // profile-specific instead of a global filename rule.
@@ -82,6 +87,7 @@ public sealed class GameConfig
         SplitBodyLineAlphaOnReimport = false,
         InvertBodyLineAlphaOnReimport = false,
         InvertHeadLineAlphaOnReimport = false,
+        InvertHandLineAlphaOnReimport = false,
         TreatAdvObj000TexturesAsBake = true,
         PixelatedGltfTextures = false,
     };
@@ -97,8 +103,9 @@ public sealed class GameConfig
         PreferSemanticTemplateTextureNamesOnReimport = true,
         RemoveEyeHelperPrimitivesOnReimport = true,
         SplitBodyLineAlphaOnReimport = false,
-        InvertBodyLineAlphaOnReimport = true,
+        InvertBodyLineAlphaOnReimport = false,
         InvertHeadLineAlphaOnReimport = false,
+        InvertHandLineAlphaOnReimport = false,
         TreatAdvObj000TexturesAsBake = true,
         PixelatedGltfTextures = false,
     };
@@ -116,6 +123,7 @@ public sealed class GameConfig
         SplitBodyLineAlphaOnReimport = true,
         InvertBodyLineAlphaOnReimport = false,
         InvertHeadLineAlphaOnReimport = true,
+        InvertHandLineAlphaOnReimport = true,
         TreatAdvObj000TexturesAsBake = true,
         PixelatedGltfTextures = false,
     };
@@ -133,6 +141,7 @@ public sealed class GameConfig
         SplitBodyLineAlphaOnReimport = false,
         InvertBodyLineAlphaOnReimport = false,
         InvertHeadLineAlphaOnReimport = false,
+        InvertHandLineAlphaOnReimport = false,
         TreatAdvObj000TexturesAsBake = false,
         PixelatedGltfTextures = true,
     };

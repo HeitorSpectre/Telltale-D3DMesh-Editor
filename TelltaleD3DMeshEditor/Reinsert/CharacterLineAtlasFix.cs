@@ -1,6 +1,6 @@
 using System.Drawing;
 using System.Drawing.Imaging;
-using System.Numerics;
+using TelltaleD3DMeshEditor.Core;
 
 namespace TelltaleD3DMeshEditor.Reinsert;
 
@@ -21,7 +21,7 @@ namespace TelltaleD3DMeshEditor.Reinsert;
 //   * The body line ("inklinesbody") is left untouched — the body shader expects the normal convention.
 public static class CharacterLineAtlasFix
 {
-    public static GltfModel InvertFaceAndHandLineAlpha(GltfModel model)
+    public static GltfModel InvertCharacterLineAlpha(GltfModel model, GameConfig gameConfig)
     {
         var cache = new Dictionary<GltfImage, GltfImage>();
         var changed = false;
@@ -41,12 +41,11 @@ public static class CharacterLineAtlasFix
         var primitives = new List<GltfPrimitive>(model.Primitives.Count);
         foreach (var primitive in model.Primitives)
         {
-            bool? isRightSide = null;
             bool? isBodySkin = null;
 
             GltfImage Map(GltfImage image)
             {
-                if (IsHeadLineTexture(image.Name))
+                if (gameConfig.InvertHeadLineAlphaOnReimport && IsHeadLineTexture(image.Name))
                 {
                     // The neck/chest skin connector borrows the head ink line but is a body-skin primitive;
                     // inverting it would paint a black mask under the chin, so it keeps the normal copy.
@@ -54,11 +53,14 @@ public static class CharacterLineAtlasFix
                     return isBodySkin.Value ? image : Invert(image);
                 }
 
-                if (IsHandLineTexture(image.Name))
+                if (gameConfig.InvertHandLineAlphaOnReimport && IsHandLineTexture(image.Name))
                 {
-                    // Only the right hand uses the inverted convention; the left hand stays normal.
-                    isRightSide ??= IsRightSidePrimitive(primitive, model);
-                    return isRightSide.Value ? Invert(image) : image;
+                    return Invert(image);
+                }
+
+                if (gameConfig.InvertBodyLineAlphaOnReimport && IsBodyLineTarget(image.Name, primitive))
+                {
+                    return Invert(image);
                 }
 
                 return image;
@@ -98,6 +100,49 @@ public static class CharacterLineAtlasFix
     private static bool IsHandLineTexture(string textureName)
         => IsLine(textureName) && Stem(textureName).Contains("hand", StringComparison.Ordinal);
 
+    private static bool IsBodyLineTarget(string textureName, GltfPrimitive primitive)
+        => IsLine(textureName) && IsBodyPrimitive(primitive);
+
+    private static bool IsBodyPrimitive(GltfPrimitive primitive)
+    {
+        if (primitive.TextureSlots.TryGetValue("diffuse", out var diffuse) &&
+            IsBodyTextureName(diffuse.Name))
+        {
+            return true;
+        }
+
+        if (!string.IsNullOrWhiteSpace(primitive.MaterialName) &&
+            IsBodyTextureName(primitive.MaterialName))
+        {
+            return true;
+        }
+
+        var sourceMesh = Stem(primitive.SourceMeshPath ?? "");
+        return sourceMesh.Contains("body", StringComparison.Ordinal) ||
+               sourceMesh.Contains("torso", StringComparison.Ordinal) ||
+               sourceMesh.Contains("leg", StringComparison.Ordinal) ||
+               sourceMesh.Contains("foot", StringComparison.Ordinal) ||
+               sourceMesh.Contains("feet", StringComparison.Ordinal) ||
+               sourceMesh.Contains("pant", StringComparison.Ordinal) ||
+               sourceMesh.Contains("cloth", StringComparison.Ordinal);
+    }
+
+    private static bool IsBodyTextureName(string name)
+    {
+        var stem = Stem(name);
+        return !stem.Contains("head", StringComparison.Ordinal) &&
+               !stem.Contains("hair", StringComparison.Ordinal) &&
+               !stem.Contains("hand", StringComparison.Ordinal) &&
+               (stem.Contains("body", StringComparison.Ordinal) ||
+                stem.Contains("neck", StringComparison.Ordinal) ||
+                stem.Contains("arm", StringComparison.Ordinal) ||
+                stem.Contains("leg", StringComparison.Ordinal) ||
+                stem.Contains("foot", StringComparison.Ordinal) ||
+                stem.Contains("feet", StringComparison.Ordinal) ||
+                stem.Contains("pant", StringComparison.Ordinal) ||
+                stem.Contains("cloth", StringComparison.Ordinal));
+    }
+
     private static bool IsLine(string textureName)
     {
         var stem = Stem(textureName);
@@ -106,72 +151,6 @@ public static class CharacterLineAtlasFix
 
     private static string Stem(string textureName)
         => Path.GetFileNameWithoutExtension(textureName).ToLowerInvariant();
-
-    // Decides whether a primitive belongs to the character's right side by tallying the skin weights of
-    // its _L vs _R joints. Used to invert the hand ink line for the right hand only. Falls back to "right"
-    // (invert) when there is no skin data, so the requested right-hand inversion is never silently lost.
-    private static bool IsRightSidePrimitive(GltfPrimitive primitive, GltfModel model)
-    {
-        if (primitive.Joints0 is not { Length: > 0 } joints || model.Joints.Count == 0)
-        {
-            return true;
-        }
-
-        var weights = primitive.Weights0;
-        double left = 0;
-        double right = 0;
-        var vertexCount = primitive.VertexCount;
-        for (var v = 0; v < vertexCount; v++)
-        {
-            for (var j = 0; j < 4; j++)
-            {
-                var flat = v * 4 + j;
-                if (flat >= joints.Length)
-                {
-                    break;
-                }
-
-                var weight = weights is not null && v < weights.Length ? Component(weights[v], j) : 1.0;
-                if (weight <= 0)
-                {
-                    continue;
-                }
-
-                var jointIndex = joints[flat];
-                if (jointIndex >= model.Joints.Count)
-                {
-                    continue;
-                }
-
-                var name = model.Joints[jointIndex].Name;
-                if (string.IsNullOrEmpty(name))
-                {
-                    continue;
-                }
-
-                var lower = name.ToLowerInvariant();
-                if (lower.EndsWith("_r", StringComparison.Ordinal) || lower.Contains("right", StringComparison.Ordinal))
-                {
-                    right += weight;
-                }
-                else if (lower.EndsWith("_l", StringComparison.Ordinal) || lower.Contains("left", StringComparison.Ordinal))
-                {
-                    left += weight;
-                }
-            }
-        }
-
-        // Ties (and the no-side case) resolve to right/invert, so the right hand always gets inverted.
-        return right >= left;
-    }
-
-    private static double Component(Vector4 weights, int index) => index switch
-    {
-        0 => weights.X,
-        1 => weights.Y,
-        2 => weights.Z,
-        _ => weights.W,
-    };
 
     private static GltfImage InvertAlpha(GltfImage image)
     {
@@ -235,6 +214,7 @@ public static class CharacterLineAtlasFix
             BonePaletteIndex = primitive.BonePaletteIndex,
             SourceMeshPath = primitive.SourceMeshPath,
             SourceSubmeshIndex = primitive.SourceSubmeshIndex,
+            RecoveredDetailLineTextureName = primitive.RecoveredDetailLineTextureName,
             IsSkinned = primitive.IsSkinned,
             BaseColor = baseColor,
             TextureSlots = textureSlots,
