@@ -67,8 +67,9 @@ public sealed class MainForm : Form
     private bool _isBusy;
     private bool _applyingTreeSelection;
     private bool _treeRebuildQueued;
+    private readonly string? _initialMeshPath;
 
-    public MainForm()
+    public MainForm(string? initialMeshPath = null)
     {
         // Title shows the version and the build tag. Release builds show the build time (in the user's own
         // timezone); Debug builds show "DEBUG" instead, so a development build is never mistaken for a
@@ -85,6 +86,7 @@ public sealed class MainForm : Form
         StartPosition = FormStartPosition.CenterScreen;
         Font = new Font("Segoe UI", 9F);
         Icon = Icon.ExtractAssociatedIcon(Application.ExecutablePath) ?? Icon;
+        _initialMeshPath = initialMeshPath;
 
         var preferences = AppPreferences.Load();
         GameConfig.Current = GameConfig.FromId(preferences.LastGame);
@@ -101,8 +103,16 @@ public sealed class MainForm : Form
 
         // Quietly check GitHub for a newer release once the window is up. It only notifies when an
         // update exists and never installs anything by itself; failures (offline, etc.) are ignored.
-        Shown += (_, _) => EnsureTreePanelWidth();
-        Shown += async (_, _) => await CheckForUpdatesAsync(silent: true);
+        Shown += async (_, _) =>
+        {
+            EnsureTreePanelWidth();
+            if (!string.IsNullOrWhiteSpace(_initialMeshPath))
+            {
+                await OpenMeshFileAsync(_initialMeshPath);
+            }
+
+            await CheckForUpdatesAsync(silent: true);
+        };
     }
 
     private void BuildUi()
@@ -378,8 +388,36 @@ public sealed class MainForm : Form
         }
         else if (File.Exists(path))
         {
-            await LoadFolderAsync(Path.GetDirectoryName(path)!);
+            if (path.EndsWith(".d3dmesh", StringComparison.OrdinalIgnoreCase))
+            {
+                await OpenMeshFileAsync(path);
+            }
+            else
+            {
+                await LoadFolderAsync(Path.GetDirectoryName(path)!);
+            }
         }
+    }
+
+    private async Task OpenMeshFileAsync(string meshPath)
+    {
+        if (!File.Exists(meshPath))
+        {
+            MessageBox.Show(
+                $"Could not find the selected .d3dmesh file:\n{meshPath}",
+                Text,
+                MessageBoxButtons.OK,
+                MessageBoxIcon.Warning);
+            return;
+        }
+
+        if (!EnsureGameSelectedForOpen())
+        {
+            return;
+        }
+
+        await LoadFolderAsync(Path.GetDirectoryName(meshPath)!);
+        SelectLoadedMesh(meshPath);
     }
 
     private void UpdateFormatButton()
@@ -866,6 +904,50 @@ public sealed class MainForm : Form
 
         EnsureTreePanelWidth();
         ScheduleTreeAutoFit();
+    }
+
+    private void SelectLoadedMesh(string meshPath)
+    {
+        var fullPath = Path.GetFullPath(meshPath);
+        var node = FindNodeByMeshPath(_tree.Nodes, fullPath);
+        if (node is null)
+        {
+            _statusLabel.Text = $"Loaded folder, but could not select: {Path.GetFileName(meshPath)}";
+            return;
+        }
+
+        ExpandParents(node);
+        ApplyTreeSelection(node, additive: false, range: false);
+        node.EnsureVisible();
+        _statusLabel.Text = $"Opened: {meshPath}";
+    }
+
+    private static TreeNode? FindNodeByMeshPath(TreeNodeCollection nodes, string meshPath)
+    {
+        foreach (TreeNode node in nodes)
+        {
+            if (node.Tag is ModelAsset asset &&
+                Path.GetFullPath(asset.MeshPath).Equals(meshPath, StringComparison.OrdinalIgnoreCase))
+            {
+                return node;
+            }
+
+            var child = FindNodeByMeshPath(node.Nodes, meshPath);
+            if (child is not null)
+            {
+                return child;
+            }
+        }
+
+        return null;
+    }
+
+    private static void ExpandParents(TreeNode node)
+    {
+        for (var parent = node.Parent; parent is not null; parent = parent.Parent)
+        {
+            parent.Expand();
+        }
     }
 
     private void ScheduleSearchRebuild()

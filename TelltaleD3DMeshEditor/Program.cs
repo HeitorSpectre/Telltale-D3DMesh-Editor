@@ -9,10 +9,13 @@ internal static class Program
     [STAThread]
     private static void Main(string[] args)
     {
-        if (ReinsertCli.TryRun(args))
+        var launchMeshPath = GetLaunchMeshPath(args);
+        if (launchMeshPath is null && ReinsertCli.TryRun(args))
         {
             return;
         }
+
+        FileAssociationService.RegisterD3DMeshAssociation();
 
         Application.SetUnhandledExceptionMode(UnhandledExceptionMode.CatchException);
         Application.ThreadException += (_, e) => ShowUnhandledException(e.Exception, "Unhandled UI exception");
@@ -30,7 +33,19 @@ internal static class Program
         };
 
         ApplicationConfiguration.Initialize();
-        Application.Run(new MainForm());
+        Application.Run(new MainForm(launchMeshPath));
+    }
+
+    private static string? GetLaunchMeshPath(string[] args)
+    {
+        if (args.Length != 1 ||
+            !args[0].EndsWith(".d3dmesh", StringComparison.OrdinalIgnoreCase) ||
+            !File.Exists(args[0]))
+        {
+            return null;
+        }
+
+        return Path.GetFullPath(args[0]);
     }
 
     private static void ShowUnhandledException(Exception ex, string context)

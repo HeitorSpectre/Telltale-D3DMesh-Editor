@@ -43,6 +43,9 @@
     <None Include="Resources\HashDBs\TexNames.HashDB" Link="HashDBs\TexNames.HashDB">
       <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
     </None>
+    <None Include="Resources\Icons\d3dmesh.ico" Link="Resources\Icons\d3dmesh.ico">
+      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+    </None>
     <EmbeddedResource Include="Resources\Images\drag and drop.png">
       <LogicalName>TelltaleD3DMeshEditor.Resources.Images.DragDrop.png</LogicalName>
     </EmbeddedResource>
