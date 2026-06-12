@@ -43,6 +43,7 @@ public sealed class MainForm : Form
     private readonly ToolStripMenuItem _miPolygons = new("Polygons");
     private readonly ToolStripMenuItem _miSkeleton = new("Skeleton");
     private readonly ToolStripButton _btnCheckUpdates = new("Check for Updates");
+    private readonly ToolStripButton _btnReportIssue = new("Report an Issue");
     private readonly ToolStripButton _btnSettings = new("Settings");
     private readonly SplitContainer _split = new();
     private readonly TreeView _tree = new();
@@ -131,6 +132,7 @@ public sealed class MainForm : Form
             new ToolStripSeparator(),
             _btnCredits,
             _btnSettings,
+            _btnReportIssue,
             _btnCheckUpdates
         });
 
@@ -156,8 +158,10 @@ public sealed class MainForm : Form
 
         _btnCredits.Alignment = ToolStripItemAlignment.Right;
         _btnSettings.Alignment = ToolStripItemAlignment.Right;
+        _btnReportIssue.Alignment = ToolStripItemAlignment.Right;
         _btnCheckUpdates.Alignment = ToolStripItemAlignment.Right;
         _btnCheckUpdates.ToolTipText = "Checks GitHub for a newer version and shows the changelog. Nothing is installed automatically.";
+        _btnReportIssue.ToolTipText = "Open a bug report form and create a pre-filled GitHub issue.";
         _btnSettings.ToolTipText = "Open tool settings.";
         _btnPan.CheckOnClick = true;
         _btnPose.CheckOnClick = true;
@@ -280,6 +284,7 @@ public sealed class MainForm : Form
         _btnReimportSelected.Click += async (_, _) => await ReimportSelectedAsync();
         _btnCredits.Click += (_, _) => ShowCreditsDialog();
         _btnCheckUpdates.Click += async (_, _) => await CheckForUpdatesAsync(silent: false);
+        _btnReportIssue.Click += (_, _) => ShowReportIssueDialog();
         _btnSettings.Click += (_, _) => ShowSettingsDialog();
         _btnCombineParts.CheckedChanged += (_, _) =>
         {
@@ -2788,6 +2793,7 @@ public sealed class MainForm : Form
         _btnPose.Enabled = !busy;
         _btnView.Enabled = !busy;
         _btnCredits.Enabled = !busy;
+        _btnReportIssue.Enabled = !busy;
         _btnCheckUpdates.Enabled = !busy;
         _btnSettings.Enabled = !busy;
         _gameSelector.Enabled = !busy;
@@ -2986,6 +2992,15 @@ public sealed class MainForm : Form
         return File.GetLastWriteTime(Assembly.GetExecutingAssembly().Location);
     }
 
+    private static string GetBuildLabel()
+    {
+#if DEBUG
+        return "DEBUG";
+#else
+        return GetLocalBuildTime().ToString("yyyy-MM-dd HH:mm:ss");
+#endif
+    }
+
     // Keeps the Pan/Pose/View overlay pinned to the bottom-right corner of the preview as it resizes.
     private void PositionViewerOverlay()
     {
@@ -3004,6 +3019,250 @@ public sealed class MainForm : Form
         {
             // Opening the browser is best-effort; ignore failures.
         }
+    }
+
+    private void ShowReportIssueDialog()
+    {
+        var reportTime = DateTime.Now;
+
+        using var dialog = new Form
+        {
+            Text = "Report an Issue",
+            StartPosition = FormStartPosition.CenterParent,
+            FormBorderStyle = FormBorderStyle.Sizable,
+            MinimizeBox = false,
+            ShowInTaskbar = false,
+            ClientSize = new Size(680, 430),
+            MinimumSize = new Size(560, 360),
+            Font = Font,
+        };
+
+        var layout = new TableLayoutPanel
+        {
+            Dock = DockStyle.Fill,
+            ColumnCount = 2,
+            RowCount = 6,
+            Padding = new Padding(14),
+        };
+        layout.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 126));
+        layout.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100));
+        layout.RowStyles.Add(new RowStyle(SizeType.AutoSize));
+        layout.RowStyles.Add(new RowStyle(SizeType.AutoSize));
+        layout.RowStyles.Add(new RowStyle(SizeType.Percent, 100));
+        layout.RowStyles.Add(new RowStyle(SizeType.AutoSize));
+        layout.RowStyles.Add(new RowStyle(SizeType.AutoSize));
+        layout.RowStyles.Add(new RowStyle(SizeType.AutoSize));
+
+        var intro = new Label
+        {
+            Text = "Fill in what happened. The tool will open a pre-filled GitHub issue in your browser.",
+            AutoSize = true,
+            Margin = new Padding(0, 0, 0, 10),
+        };
+        layout.Controls.Add(intro, 0, 0);
+        layout.SetColumnSpan(intro, 2);
+
+        var gameLabel = new Label
+        {
+            Text = "Game:",
+            AutoSize = true,
+            Anchor = AnchorStyles.Left | AnchorStyles.Top,
+            Margin = new Padding(0, 4, 8, 8),
+        };
+        var gameCombo = new ComboBox
+        {
+            Dock = DockStyle.Top,
+            DropDownStyle = ComboBoxStyle.DropDownList,
+            Margin = new Padding(0, 0, 0, 8),
+        };
+        var supportedGameNames = GameConfig.All
+            .Where(game => game.Id != GameId.Generic)
+            .Select(game => game.DisplayName)
+            .ToList();
+        foreach (var gameName in supportedGameNames)
+        {
+            gameCombo.Items.Add(gameName);
+        }
+
+        var selectedGameName = GameConfig.Current.Id == GameId.Generic ? supportedGameNames.FirstOrDefault() : GameConfig.Current.DisplayName;
+        if (selectedGameName is not null)
+        {
+            gameCombo.SelectedItem = selectedGameName;
+            if (gameCombo.SelectedIndex < 0 && gameCombo.Items.Count > 0)
+            {
+                gameCombo.SelectedIndex = 0;
+            }
+        }
+        layout.Controls.Add(gameLabel, 0, 1);
+        layout.Controls.Add(gameCombo, 1, 1);
+
+        var descriptionLabel = new Label
+        {
+            Text = "Description:",
+            AutoSize = true,
+            Anchor = AnchorStyles.Left | AnchorStyles.Top,
+            Margin = new Padding(0, 4, 8, 8),
+        };
+        var descriptionText = new TextBox
+        {
+            Dock = DockStyle.Fill,
+            Multiline = true,
+            ScrollBars = ScrollBars.Vertical,
+            AcceptsReturn = true,
+            AcceptsTab = true,
+            Margin = new Padding(0, 0, 0, 10),
+        };
+        layout.Controls.Add(descriptionLabel, 0, 2);
+        layout.Controls.Add(descriptionText, 1, 2);
+
+        var automaticLabel = new Label
+        {
+            Text = "Auto info:",
+            AutoSize = true,
+            Anchor = AnchorStyles.Left | AnchorStyles.Top,
+            Margin = new Padding(0, 4, 8, 8),
+        };
+        var automaticInfoPanel = new Panel
+        {
+            AutoSize = true,
+            AutoSizeMode = AutoSizeMode.GrowAndShrink,
+            BorderStyle = BorderStyle.FixedSingle,
+            Dock = DockStyle.Top,
+            Padding = new Padding(6),
+            Margin = new Padding(0, 0, 0, 10),
+        };
+        var automaticInfo = new Label
+        {
+            AutoSize = true,
+            Text = BuildIssueAutomaticInfo(reportTime),
+            Margin = new Padding(0),
+            UseMnemonic = false,
+        };
+        automaticInfoPanel.Controls.Add(automaticInfo);
+        layout.Controls.Add(automaticLabel, 0, 3);
+        layout.Controls.Add(automaticInfoPanel, 1, 3);
+
+        var note = new Label
+        {
+            Text = "Note: the GitHub issue will include an Attachments section. Paste screenshots with Ctrl+V or drag files directly into that GitHub section before submitting.",
+            AutoSize = true,
+            Margin = new Padding(0, 0, 0, 12),
+        };
+        layout.Controls.Add(note, 0, 4);
+        layout.SetColumnSpan(note, 2);
+
+        var buttons = new FlowLayoutPanel
+        {
+            Dock = DockStyle.Fill,
+            FlowDirection = FlowDirection.RightToLeft,
+            AutoSize = true,
+            WrapContents = false,
+        };
+        var cancel = new Button { Text = "Cancel", DialogResult = DialogResult.Cancel, AutoSize = true, Margin = new Padding(6, 0, 0, 0) };
+        var submit = new Button { Text = "Open GitHub Issue", AutoSize = true, Margin = new Padding(6, 0, 0, 0) };
+        submit.Click += (_, _) =>
+        {
+            var description = descriptionText.Text.Trim();
+            if (description.Length == 0)
+            {
+                MessageBox.Show(
+                    "Please describe what happened before opening the GitHub issue.",
+                    dialog.Text,
+                    MessageBoxButtons.OK,
+                    MessageBoxIcon.Information);
+                descriptionText.Focus();
+                return;
+            }
+
+            var gameName = (gameCombo.SelectedItem as string ?? "").Trim();
+            var title = $"Bug report: {gameName}";
+            var body = BuildIssueBody(gameName, description, reportTime);
+            OpenUrl(BuildIssueUrl(title, body));
+            dialog.DialogResult = DialogResult.OK;
+            dialog.Close();
+        };
+        buttons.Controls.Add(cancel);
+        buttons.Controls.Add(submit);
+        layout.Controls.Add(buttons, 0, 5);
+        layout.SetColumnSpan(buttons, 2);
+
+        dialog.Controls.Add(layout);
+        dialog.CancelButton = cancel;
+        dialog.ShowDialog(this);
+    }
+
+    private string BuildIssueAutomaticInfo(DateTime reportTime)
+    {
+        var lines = new List<string>
+        {
+            $"Selected game: {GameConfig.Current.DisplayName}",
+            $"Tool version: v{UpdateChecker.CurrentVersion}",
+            $"Build: {GetBuildLabel()}",
+            $"Report time: {reportTime:yyyy-MM-dd HH:mm:ss zzz}",
+            $"Loaded folder: {GetSafeFolderName(_rootFolder)}",
+            $"Current selection: {GetIssueSelectionText()}",
+        };
+
+        return string.Join(Environment.NewLine, lines);
+    }
+
+    private string BuildIssueBody(string gameName, string description, DateTime reportTime)
+    {
+        return $"""
+        ## Game
+        {gameName}
+
+        ## What happened
+        {description}
+
+        ## Attachments
+        Paste screenshots here with Ctrl+V, or drag image/log files into this section before submitting the issue.
+
+        ## Automatic tool information
+        - Selected game in tool: {GameConfig.Current.DisplayName}
+        - Tool version: v{UpdateChecker.CurrentVersion}
+        - Build: {GetBuildLabel()}
+        - Report time: {reportTime:yyyy-MM-dd HH:mm:ss zzz}
+        - Loaded folder: {GetSafeFolderName(_rootFolder)}
+        - Current selection: {GetIssueSelectionText()}
+        """;
+    }
+
+    private string GetIssueSelectionText()
+    {
+        if (_selectedAsset is not null)
+        {
+            return Path.GetFileName(_selectedAsset.MeshPath);
+        }
+
+        if (_selectedGroup is not null)
+        {
+            return _selectedGroup.ToString();
+        }
+
+        return "None";
+    }
+
+    private static string GetSafeFolderName(string? folder)
+    {
+        if (string.IsNullOrWhiteSpace(folder))
+        {
+            return "None";
+        }
+
+        var trimmed = folder.TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar);
+        var name = Path.GetFileName(trimmed);
+        return string.IsNullOrWhiteSpace(name)
+            ? "None"
+            : name;
+    }
+
+    private static string BuildIssueUrl(string title, string body)
+    {
+        const string newIssueUrl = "https://github.com/HeitorSpectre/Telltale-D3DMesh-Editor/issues/new";
+        return newIssueUrl
+            + "?title=" + Uri.EscapeDataString(title)
+            + "&body=" + Uri.EscapeDataString(body);
     }
 
     private void ShowCreditsDialog()
