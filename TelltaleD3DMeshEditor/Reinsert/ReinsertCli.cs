@@ -92,6 +92,14 @@ public static class ReinsertCli
                 Require(args, 5);
                 ReinsertCharacterTextureTests(args[1], args[2], args[3], args[4]);
                 return;
+            case "--reinsert-combined":
+                Require(args, 5);
+                ReinsertCombined(args[1], args[2], args[3], args[4]);
+                return;
+            case "--dump-skeleton-rich":
+                Require(args, 2);
+                DumpSkeletonRich(args[1], args.Length >= 3 ? args[2] : null);
+                return;
             default:
                 Console.WriteLine("Unknown command: " + args[0]);
                 Console.WriteLine("Usage:");
@@ -106,6 +114,7 @@ public static class ReinsertCli
                 Console.WriteLine("  --reinsert-prop <template.d3dmesh> <model.glb|model.gltf> <output.d3dmesh> [--diffuse-atlas]");
                 Console.WriteLine("  --reinsert-character <template.d3dmesh> <template.skl> <model.glb|model.gltf> <output.d3dmesh> [--diffuse-atlas]");
                 Console.WriteLine("  --reinsert-character-texture-tests <template.d3dmesh> <template.skl> <model.glb|model.gltf> <output-folder>");
+                Console.WriteLine("  --reinsert-combined <input-root-folder> <group-name> <model.glb|model.gltf> <output-folder>");
                 return;
         }
     }
@@ -308,6 +317,31 @@ public static class ReinsertCli
             {
                 Console.WriteLine("    ...");
             }
+        }
+    }
+
+    // Full per-joint dump straight from the Toolkit entry (local + rest transforms, bone dir/length,
+    // rotation adjustment, translation scales), optionally filtered by a name substring. This is the
+    // data the game's procedural rigs (eye look-at, head tracking) consume, so a port that breaks one
+    // of these fields is visible here even when the plain local pose looks fine.
+    private static void DumpSkeletonRich(string input, string? nameFilter)
+    {
+        var entries = SkeletonRebuilder.ReadEntryDiagnostics(input);
+        Console.WriteLine($"file       : {Path.GetFileName(input)}");
+        Console.WriteLine($"joints     : {entries.Count}");
+        foreach (var entry in entries)
+        {
+            if (!string.IsNullOrWhiteSpace(nameFilter) &&
+                !entry.Name.Contains(nameFilter, StringComparison.OrdinalIgnoreCase))
+            {
+                continue;
+            }
+
+            Console.WriteLine($"  [{entry.Index,3}] {entry.Name} parent={entry.ParentIndex}");
+            Console.WriteLine($"        local pos=({F(entry.LocalPosition.X)}, {F(entry.LocalPosition.Y)}, {F(entry.LocalPosition.Z)}) quat=({F(entry.LocalRotation.X)}, {F(entry.LocalRotation.Y)}, {F(entry.LocalRotation.Z)}, {F(entry.LocalRotation.W)})");
+            Console.WriteLine($"        rest  pos=({F(entry.RestTranslation.X)}, {F(entry.RestTranslation.Y)}, {F(entry.RestTranslation.Z)}) quat=({F(entry.RestRotation.X)}, {F(entry.RestRotation.Y)}, {F(entry.RestRotation.Z)}, {F(entry.RestRotation.W)})");
+            Console.WriteLine($"        len={F(entry.BoneLength)} dir=({F(entry.BoneDir.X)}, {F(entry.BoneDir.Y)}, {F(entry.BoneDir.Z)}) rotAdj=({F(entry.BoneRotationAdjustment.X)}, {F(entry.BoneRotationAdjustment.Y)}, {F(entry.BoneRotationAdjustment.Z)}, {F(entry.BoneRotationAdjustment.W)})");
+            Console.WriteLine($"        gts=({F(entry.GlobalTranslationScale.X)}, {F(entry.GlobalTranslationScale.Y)}, {F(entry.GlobalTranslationScale.Z)}) lts=({F(entry.LocalTranslationScale.X)}, {F(entry.LocalTranslationScale.Y)}, {F(entry.LocalTranslationScale.Z)}) ats=({F(entry.AnimTranslationScale.X)}, {F(entry.AnimTranslationScale.Y)}, {F(entry.AnimTranslationScale.Z)})");
         }
     }
 
@@ -1692,6 +1726,31 @@ public static class ReinsertCli
 
     private static void PrintAttr(string name, AttrDescriptor attr)
         => Console.WriteLine($"  {name,-8} offset={attr.Offset,3} count={attr.Count,3} format={attr.Format,2}");
+
+    // Runs the same combined-group reimport as the UI (part split, skeleton rebuild, companion
+    // variant ports), so the full character-swap flow can be exercised and validated headlessly.
+    private static void ReinsertCombined(string inputRoot, string groupName, string glb, string outputFolder)
+    {
+        GameConfig.Current = InferGameConfig(inputRoot);
+        var assets = UI.ModelAsset.Discover(inputRoot);
+        var groups = UI.ModelAssetGroup.Discover(assets, inputRoot);
+        var group = groups.FirstOrDefault(candidate => candidate.Name.Equals(groupName, StringComparison.OrdinalIgnoreCase))
+            ?? groups.FirstOrDefault(candidate => candidate.Name.Contains(groupName, StringComparison.OrdinalIgnoreCase))
+            ?? throw new InvalidOperationException(
+                $"No combined group matches '{groupName}'. Available: {string.Join(", ", groups.Select(candidate => candidate.Name).Take(20))}");
+
+        var model = GltfReader.Load(glb);
+        var result = UI.MainForm.ReimportCombinedGroup(
+            group,
+            inputRoot,
+            model,
+            glb,
+            outputFolder,
+            useDiffuseAtlas: false,
+            uncompressedTextures: false);
+        Console.WriteLine($"game        : {GameConfig.Current.DisplayName}");
+        Console.WriteLine(result);
+    }
 
     private static GameConfig InferGameConfig(string path)
     {

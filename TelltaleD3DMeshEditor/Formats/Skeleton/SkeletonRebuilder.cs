@@ -27,10 +27,17 @@ public static class SkeletonRebuilder
     // Reconstructs a .skl from the original plus an edited joint set (e.g. from a reimported GLB),
     // and returns the rebuilt bytes. Unchanged joints keep all their original data, so an unmodified
     // skeleton comes out byte-identical to the game's file; moved/added joints are applied faithfully.
-    public static byte[] RebuildWithEdits(string originalSklPath, SkeletonData edited)
+    // <paramref name="translationScaleDonor"/> (optional) supplies per-bone translation scales from
+    // the imported model's own skeleton, replacing the target's retarget scales bone-by-bone.
+    public static byte[] RebuildWithEdits(string originalSklPath, SkeletonData edited, SkeletonData? translationScaleDonor = null)
     {
         var (skeleton, config, _) = Read(originalSklPath);
         SkeletonMerger.Merge(skeleton, edited);
+        if (translationScaleDonor is not null)
+        {
+            SkeletonMerger.AdoptTranslationScales(skeleton, translationScaleDonor);
+        }
+
         using var output = new MemoryStream();
         Toolkit.Instance.Serialize(skeleton, output, config);
         return output.ToArray();

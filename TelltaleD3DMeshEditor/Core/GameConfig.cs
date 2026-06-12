@@ -74,6 +74,27 @@ public sealed class GameConfig
     // linear filtering when a sampler does not specify filters, which blurs those pixels on export.
     public bool PixelatedGltfTextures { get; init; }
 
+    // Native .skl files keep RestXform/BoneLength/BoneDir at zero; the merger historically filled
+    // them from the local pose on moved joints. MCSM's procedural face rigs (eye look-at) consume
+    // these fields, so invented values displace the eye quads in-game. When enabled, merged joints
+    // keep their original derived fields untouched and only the local pose is updated.
+    public bool PreserveSkeletonDerivedFieldsOnMerge { get; init; }
+
+    // MCSM skeletons carry per-bone translation scales (GlobalTranslationScale/AnimTranslationScale,
+    // e.g. Petra Y=1.17) that retarget canonical animations to the character's proportions. Keeping
+    // the TARGET's scales over the DONOR's bind pose displaces every bone-driven offset (the eye
+    // pivot rises ~5cm and the pupil hides behind the hair fringe). When enabled, a combined
+    // reimport adopts the donor skeleton's scales (read from the donor's own .skl next to the
+    // imported model's source meshes).
+    public bool PortTranslationScalesOnSkeletonMerge { get; init; }
+
+    // MCSM animates lipsync by swapping per-viseme mouth meshes (mouthAA..mouthU). A combined group
+    // only carries the Default viseme, so after a character swap the other viseme files would keep the
+    // old character's UVs over the replaced atlas and the mouth breaks while talking. When enabled,
+    // sibling part files that exist next to the imported model's source meshes (same part suffix) are
+    // ported into the target's matching files during a combined reimport.
+    public bool PortCompanionVariantPartsOnReimport { get; init; }
+
     public static readonly GameConfig Generic = new()
     {
         Id = GameId.Generic,
@@ -90,6 +111,9 @@ public sealed class GameConfig
         InvertHandLineAlphaOnReimport = false,
         TreatAdvObj000TexturesAsBake = true,
         PixelatedGltfTextures = false,
+        PreserveSkeletonDerivedFieldsOnMerge = false,
+        PortTranslationScalesOnSkeletonMerge = false,
+        PortCompanionVariantPartsOnReimport = false,
     };
 
     public static readonly GameConfig WolfAmongUs = new()
@@ -108,6 +132,9 @@ public sealed class GameConfig
         InvertHandLineAlphaOnReimport = false,
         TreatAdvObj000TexturesAsBake = true,
         PixelatedGltfTextures = false,
+        PreserveSkeletonDerivedFieldsOnMerge = false,
+        PortTranslationScalesOnSkeletonMerge = false,
+        PortCompanionVariantPartsOnReimport = false,
     };
 
     public static readonly GameConfig WalkingDeadSeason2 = new()
@@ -126,6 +153,9 @@ public sealed class GameConfig
         InvertHandLineAlphaOnReimport = true,
         TreatAdvObj000TexturesAsBake = true,
         PixelatedGltfTextures = false,
+        PreserveSkeletonDerivedFieldsOnMerge = false,
+        PortTranslationScalesOnSkeletonMerge = false,
+        PortCompanionVariantPartsOnReimport = false,
     };
 
     public static readonly GameConfig MinecraftStoryMode = new()
@@ -144,6 +174,9 @@ public sealed class GameConfig
         InvertHandLineAlphaOnReimport = false,
         TreatAdvObj000TexturesAsBake = false,
         PixelatedGltfTextures = true,
+        PreserveSkeletonDerivedFieldsOnMerge = true,
+        PortTranslationScalesOnSkeletonMerge = true,
+        PortCompanionVariantPartsOnReimport = true,
     };
 
     public static readonly IReadOnlyList<GameConfig> All = [Generic, WolfAmongUs, WalkingDeadSeason2, MinecraftStoryMode];

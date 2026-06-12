@@ -51,6 +51,11 @@ public static class SkeletonMerger
         var outputWorlds = new List<Matrix4x4>(original.Entries.Count + edited.Bones.Count);
         var refreshedEntries = new HashSet<int>();
 
+        // Native skeletons keep RestXform/BoneLength/BoneDir at zero; games whose procedural rigs
+        // (e.g. the MCSM eye look-at) read those fields need them preserved untouched, so a moved
+        // joint only gets its local pose updated there.
+        var preserveDerivedFields = GameConfig.Current.PreserveSkeletonDerivedFieldsOnMerge;
+
         // Update existing joints so their final bind-pose world transform matches the edited rig.
         // This is safer than copying local TRS directly when a GLB has helper nodes or a different
         // joint parent chain, because the game skeleton keeps its original hierarchy.
@@ -66,8 +71,11 @@ public static class SkeletonMerger
                     HasMoved(entry, position, rotation))
                 {
                     entry.LocalPosition = position;
-                    entry.LocalQuat = rotation;
-                    refreshedEntries.Add(i);
+                    entry.LocalQuat = NormalizeRotation(rotation);
+                    if (!preserveDerivedFields)
+                    {
+                        refreshedEntries.Add(i);
+                    }
                 }
             }
 
@@ -95,6 +103,29 @@ public static class SkeletonMerger
 
         RefreshDerivedFields(original, refreshedEntries);
         return original;
+    }
+
+    // Replaces the target skeleton's per-bone translation scales (Global/Local/AnimTranslationScale)
+    // with the donor character's, matched by joint hash. These scales retarget canonical animation
+    // translations to the character's proportions; after a character swap the bind pose is the
+    // donor's, so the donor's scales are the consistent set (e.g. MCSM Petra Y=1.17 over Aiden's
+    // bind raises the eye pivot ~5cm and hides the pupil behind the hair).
+    public static void AdoptTranslationScales(TtkSkeleton target, SkeletonData donor)
+    {
+        var donorByHash = donor.Bones
+            .GroupBy(bone => bone.Hash)
+            .ToDictionary(group => group.Key, group => group.First());
+        foreach (var entry in target.Entries)
+        {
+            if (entry.JointName is null || !donorByHash.TryGetValue(entry.JointName.Crc64, out var bone))
+            {
+                continue;
+            }
+
+            entry.GlobalTranslationScale = bone.GlobalTranslationScale;
+            entry.LocalTranslationScale = bone.LocalTranslationScale;
+            entry.AnimTranslationScale = bone.AnimTranslationScale;
+        }
     }
 
     private static bool TryFindEditedBone(

@@ -1642,7 +1642,7 @@ public sealed class MainForm : Form
         }
     }
 
-    private static string ReimportCombinedGroup(
+    internal static string ReimportCombinedGroup(
         ModelAssetGroup group,
         string inputRoot,
         GltfModel combinedModel,
@@ -1655,7 +1655,7 @@ public sealed class MainForm : Form
         var gameConfig = GameConfig.Current;
         combinedModel = GltfModelPreprocessor.ApplyGameReinsertRules(combinedModel, gameConfig);
         var sourcePrimitives = BuildCombinedSourcePrimitiveMap(group, combinedModel, inputRoot, out var splitModeLine);
-        var combinedSkeleton = BuildCombinedReferenceSkeletonForReimport(group, combinedModel, outputFolder, out var skeletonLine);
+        var combinedSkeleton = BuildCombinedReferenceSkeletonForReimport(group, combinedModel, inputRoot, outputFolder, out var skeletonLine);
         var ok = 0;
         var skipped = 0;
         var invisible = 0;
@@ -1730,6 +1730,17 @@ public sealed class MainForm : Form
                 "Use a model with recognizable part/material names, or extract a Combined model with this tool and keep the primitive extras/source data.");
         }
 
+        // Paths that actually received imported primitives. Group assets without any (written above
+        // as invisible placeholders) are still companion-port candidates: a donor file with the same
+        // part suffix can rebuild them (e.g. the group's mouthNone slot from the donor's mouthNone).
+        var assignedPaths = sourcePrimitives
+            .Where(static pair => pair.Value.Count > 0)
+            .Select(static pair => Path.GetFullPath(pair.Key))
+            .ToHashSet(StringComparer.OrdinalIgnoreCase);
+        var companionParts = gameConfig.PortCompanionVariantPartsOnReimport
+            ? PortCompanionVariantParts(group, combinedModel, inputRoot, combinedSkeleton, outputFolder, gameConfig, assignedPaths, lines)
+            : 0;
+
         return string.Join(
             Environment.NewLine,
             $"Reimported combined group: {group.Name}",
@@ -1737,8 +1748,113 @@ public sealed class MainForm : Form
             $"Output folder: {outputFolder}",
             splitModeLine,
             skeletonLine,
-            $"Parts OK: {ok}/{group.Assets.Count}, invisible: {invisible}, skipped: {skipped}, textures written: {totalTextures}",
+            $"Parts OK: {ok}/{group.Assets.Count}, invisible: {invisible}, skipped: {skipped}, companion parts: {companionParts}, textures written: {totalTextures}",
             string.Join(Environment.NewLine, lines));
+    }
+
+    // Ports the imported character's sibling part files (e.g. MCSM mouth visemes, which live next to
+    // the GLB's source meshes but are never inside the combined GLB) into the target character's
+    // matching files. Without this, the target's untouched viseme files keep their old UVs over the
+    // replaced texture atlas and the mouth breaks whenever the character talks. Donor files are
+    // located via each primitive's extras.sourceMesh path; targets are files in the group's folder
+    // sharing the group's filename prefix that are not part of the combined group itself.
+    private static int PortCompanionVariantParts(
+        ModelAssetGroup group,
+        GltfModel combinedModel,
+        string inputRoot,
+        SkeletonData? referenceSkeleton,
+        string outputFolder,
+        GameConfig gameConfig,
+        IReadOnlySet<string> assignedPaths,
+        List<string> lines)
+    {
+        if (referenceSkeleton is null || referenceSkeleton.Bones.Count == 0)
+        {
+            return 0;
+        }
+
+        // extras.sourceMesh is stored relative to the extraction root, same resolution as the
+        // exact-path split in BuildCombinedSourcePrimitiveMap.
+        var sourcePaths = combinedModel.Primitives
+            .Select(static primitive => primitive.SourceMeshPath)
+            .Where(static path => !string.IsNullOrWhiteSpace(path))
+            .Select(path => Path.GetFullPath(Path.IsPathRooted(path!) ? path! : Path.Combine(inputRoot, path!)))
+            .Distinct(StringComparer.OrdinalIgnoreCase)
+            .Where(File.Exists)
+            .ToList();
+        if (sourcePaths.Count == 0)
+        {
+            return 0;
+        }
+
+        var sourceDir = Path.GetDirectoryName(sourcePaths[0]) ?? "";
+        var sourcePrefix = LongestCommonFilenamePrefix(sourcePaths.Select(Path.GetFileNameWithoutExtension)!);
+        var targetPrefix = LongestCommonFilenamePrefix(group.Assets.Select(static asset => Path.GetFileNameWithoutExtension(asset.MeshPath)));
+        var targetDir = Path.GetDirectoryName(group.Assets[0].MeshPath) ?? "";
+        if (sourcePrefix.Length == 0 || targetPrefix.Length == 0 || targetDir.Length == 0)
+        {
+            return 0;
+        }
+
+        var ported = 0;
+        foreach (var candidate in Directory.EnumerateFiles(targetDir, targetPrefix + "*.d3dmesh"))
+        {
+            var fullCandidate = Path.GetFullPath(candidate);
+            if (assignedPaths.Contains(fullCandidate))
+            {
+                continue;
+            }
+
+            var suffix = Path.GetFileNameWithoutExtension(candidate)[targetPrefix.Length..];
+            if (suffix.Length == 0)
+            {
+                continue;
+            }
+
+            var donor = Path.Combine(sourceDir, sourcePrefix + suffix + ".d3dmesh");
+            if (!File.Exists(donor) && suffix.StartsWith("mouth", StringComparison.OrdinalIgnoreCase))
+            {
+                // A viseme the donor character does not have still flips fast during lipsync; the
+                // donor's neutral mouth is a sane stand-in, stale target UVs over the new atlas are not.
+                donor = new[] { "mouthDefault", "mouthNone" }
+                    .Select(neutral => Path.Combine(sourceDir, sourcePrefix + neutral + ".d3dmesh"))
+                    .FirstOrDefault(File.Exists) ?? donor;
+            }
+
+            if (!File.Exists(donor))
+            {
+                continue;
+            }
+
+            var candidateName = Path.GetFileName(candidate);
+            try
+            {
+                var layout = D3DMeshLayout.Build(File.ReadAllBytes(candidate));
+                var donorMesh = D3DMeshParser.Parse(File.ReadAllBytes(donor));
+                var primitives = DonorPartPrimitiveBuilder.Build(donorMesh, referenceSkeleton);
+                if (primitives.Count == 0)
+                {
+                    continue;
+                }
+
+                var partModel = new GltfModel { Primitives = primitives };
+                var bytes = MeshReinserter.ReinsertGeometry(
+                    layout,
+                    partModel,
+                    diffuseTextureNames: null,
+                    referenceSkeleton,
+                    gameConfig);
+                File.WriteAllBytes(Path.Combine(outputFolder, candidateName), bytes);
+                ported++;
+                lines.Add($"OK {candidateName}: companion part ported from {Path.GetFileName(donor)}.");
+            }
+            catch (Exception ex)
+            {
+                lines.Add($"WARN {candidateName}: companion part not ported ({ex.Message}); the game's original file is left in use.");
+            }
+        }
+
+        return ported;
     }
 
     private static byte[] BuildInvisibleMeshBytes(string templateMeshPath)
@@ -1779,9 +1895,49 @@ public sealed class MainForm : Form
     private static void WriteU32(byte[] bytes, int offset, int value)
         => BinaryPrimitives.WriteUInt32LittleEndian(bytes.AsSpan(offset, 4), unchecked((uint)value));
 
+    // Locates the imported character's own .skl next to its source meshes (resolved from the GLB's
+    // extras.sourceMesh paths), so the rebuild can adopt the donor's per-bone translation scales.
+    private static SkeletonData? LoadDonorSkeletonForScales(GltfModel model, string inputRoot)
+    {
+        if (!GameConfig.Current.PortTranslationScalesOnSkeletonMerge)
+        {
+            return null;
+        }
+
+        var sourcePaths = model.Primitives
+            .Select(static primitive => primitive.SourceMeshPath)
+            .Where(static path => !string.IsNullOrWhiteSpace(path))
+            .Select(path => Path.GetFullPath(Path.IsPathRooted(path!) ? path! : Path.Combine(inputRoot, path!)))
+            .Distinct(StringComparer.OrdinalIgnoreCase)
+            .Where(File.Exists)
+            .ToList();
+        if (sourcePaths.Count == 0)
+        {
+            return null;
+        }
+
+        var sourceDir = Path.GetDirectoryName(sourcePaths[0]) ?? "";
+        var sourcePrefix = LongestCommonFilenamePrefix(sourcePaths.Select(static path => Path.GetFileNameWithoutExtension(path)!));
+        var donorSkl = Path.Combine(sourceDir, sourcePrefix.TrimEnd('_') + ".skl");
+        if (sourcePrefix.Length == 0 || !File.Exists(donorSkl))
+        {
+            return null;
+        }
+
+        try
+        {
+            return SkeletonRebuilder.ParseWithToolkit(donorSkl);
+        }
+        catch
+        {
+            return null;
+        }
+    }
+
     private static SkeletonData? BuildCombinedReferenceSkeletonForReimport(
         ModelAssetGroup group,
         GltfModel model,
+        string inputRoot,
         string outputFolder,
         out string statusLine)
     {
@@ -1818,9 +1974,11 @@ public sealed class MainForm : Form
         {
             var skeletonName = Path.GetFileName(group.SkeletonPath);
             var outputPath = Path.Combine(outputFolder, skeletonName);
-            var skeletonBytes = SkeletonRebuilder.RebuildWithEdits(group.SkeletonPath, model.Skeleton);
+            var scaleDonor = LoadDonorSkeletonForScales(model, inputRoot);
+            var skeletonBytes = SkeletonRebuilder.RebuildWithEdits(group.SkeletonPath, model.Skeleton, scaleDonor);
             File.WriteAllBytes(outputPath, skeletonBytes);
-            statusLine = $"Skeleton: {skeletonName} rebuilt from the original skeleton + imported model ({model.Skeleton.Bones.Count} bones).";
+            var scalesNote = scaleDonor is not null ? " + donor translation scales" : "";
+            statusLine = $"Skeleton: {skeletonName} rebuilt from the original skeleton + imported model ({model.Skeleton.Bones.Count} bones){scalesNote}.";
             return LoadSkeletonOrNull(outputPath, version: 13);
         }
         catch (Exception ex)
@@ -2037,6 +2195,21 @@ public sealed class MainForm : Form
             .ThenByDescending(static target => target.OriginalVertexCount)
             .First();
 
+        // Same-game character swaps name their parts with a shared character prefix plus a part
+        // suffix (skM1_aiden_eyes -> skM1_petra_eyes). Part tokens cannot tell apart parts sharing a
+        // keyword ("eyes" vs "eyelids", the mouth visemes), and the alphabetical tie-break then sends
+        // the iris quad into the eyelids file and leaves the eyes file invisible (white eyes
+        // in-game). Exact part-suffix matches win first; tokens only handle what's left.
+        var targetBySuffix = BuildTargetsByPartSuffix(targets);
+        var sourcePartPrefix = LongestCommonFilenamePrefix(model.Primitives
+            .Where(static primitive => !string.IsNullOrWhiteSpace(primitive.SourceMeshPath))
+            .Select(static primitive => Path.GetFileNameWithoutExtension(primitive.SourceMeshPath!)));
+        var targetPartPrefix = LongestCommonFilenamePrefix(group.Assets.Select(static asset => Path.GetFileNameWithoutExtension(asset.MeshPath)));
+        var targetDir = Path.GetDirectoryName(group.Assets[0].MeshPath) ?? "";
+        var groupPaths = group.Assets
+            .Select(static asset => Path.GetFullPath(asset.MeshPath))
+            .ToHashSet(StringComparer.OrdinalIgnoreCase);
+
         var alreadyAssigned = new HashSet<GltfPrimitive>(result.Values.SelectMany(static primitives => primitives));
         foreach (var primitive in model.Primitives)
         {
@@ -2045,11 +2218,131 @@ public sealed class MainForm : Form
                 continue;
             }
 
-            var target = FindBestCombinedPartTarget(primitive, targets) ?? mainTarget;
+            var target = FindCombinedTargetByPartSuffix(primitive, sourcePartPrefix, targetBySuffix);
+            if (target is null &&
+                ShouldLeavePrimitiveToCompanionPort(primitive, sourcePartPrefix, inputRoot, targetDir, targetPartPrefix, groupPaths))
+            {
+                continue;
+            }
+
+            target ??= FindBestCombinedPartTarget(primitive, targets) ?? mainTarget;
             AddPrimitive(result, target.FullPath, ClonePrimitiveForCombinedPart(primitive));
         }
 
         return result;
+    }
+
+    // A primitive whose part suffix matches a sibling file outside the group (e.g. the GLB carries
+    // mouthDefault while this group's mouth slot is mouthNone) must not fall back onto head/main:
+    // the companion porter rebuilds that sibling file from the primitive's own source mesh, and a
+    // token-based assignment here would bake a second mouth into the head part.
+    private static bool ShouldLeavePrimitiveToCompanionPort(
+        GltfPrimitive primitive,
+        string sourcePartPrefix,
+        string inputRoot,
+        string targetDir,
+        string targetPartPrefix,
+        IReadOnlySet<string> groupPaths)
+    {
+        if (!GameConfig.Current.PortCompanionVariantPartsOnReimport ||
+            sourcePartPrefix.Length == 0 ||
+            targetPartPrefix.Length == 0 ||
+            targetDir.Length == 0 ||
+            string.IsNullOrWhiteSpace(primitive.SourceMeshPath))
+        {
+            return false;
+        }
+
+        var name = Path.GetFileNameWithoutExtension(primitive.SourceMeshPath);
+        if (name.Length <= sourcePartPrefix.Length ||
+            !name.StartsWith(sourcePartPrefix, StringComparison.OrdinalIgnoreCase))
+        {
+            return false;
+        }
+
+        var sibling = Path.Combine(targetDir, targetPartPrefix + name[sourcePartPrefix.Length..] + ".d3dmesh");
+        if (!File.Exists(sibling) || groupPaths.Contains(Path.GetFullPath(sibling)))
+        {
+            return false;
+        }
+
+        var donor = Path.GetFullPath(Path.IsPathRooted(primitive.SourceMeshPath)
+            ? primitive.SourceMeshPath
+            : Path.Combine(inputRoot, primitive.SourceMeshPath));
+        return File.Exists(donor);
+    }
+
+    private static Dictionary<string, CombinedPartTarget> BuildTargetsByPartSuffix(IReadOnlyList<CombinedPartTarget> targets)
+    {
+        var result = new Dictionary<string, CombinedPartTarget>(StringComparer.OrdinalIgnoreCase);
+        var prefix = LongestCommonFilenamePrefix(targets.Select(static target => Path.GetFileNameWithoutExtension(target.FullPath)));
+        if (prefix.Length == 0)
+        {
+            return result;
+        }
+
+        foreach (var target in targets)
+        {
+            var name = Path.GetFileNameWithoutExtension(target.FullPath);
+            if (name.Length > prefix.Length)
+            {
+                result.TryAdd(name[prefix.Length..], target);
+            }
+        }
+
+        return result;
+    }
+
+    private static CombinedPartTarget? FindCombinedTargetByPartSuffix(
+        GltfPrimitive primitive,
+        string sourcePartPrefix,
+        IReadOnlyDictionary<string, CombinedPartTarget> targetBySuffix)
+    {
+        if (sourcePartPrefix.Length == 0 ||
+            targetBySuffix.Count == 0 ||
+            string.IsNullOrWhiteSpace(primitive.SourceMeshPath))
+        {
+            return null;
+        }
+
+        var name = Path.GetFileNameWithoutExtension(primitive.SourceMeshPath);
+        if (name.Length <= sourcePartPrefix.Length ||
+            !name.StartsWith(sourcePartPrefix, StringComparison.OrdinalIgnoreCase))
+        {
+            return null;
+        }
+
+        return targetBySuffix.TryGetValue(name[sourcePartPrefix.Length..], out var target) ? target : null;
+    }
+
+    // Longest case-insensitive common prefix of a set of filenames. With a single name the whole name
+    // is returned, which yields an empty part suffix and naturally disables suffix matching.
+    private static string LongestCommonFilenamePrefix(IEnumerable<string> names)
+    {
+        string? prefix = null;
+        foreach (var name in names)
+        {
+            if (prefix is null)
+            {
+                prefix = name;
+                continue;
+            }
+
+            var max = Math.Min(prefix.Length, name.Length);
+            var length = 0;
+            while (length < max && char.ToLowerInvariant(prefix[length]) == char.ToLowerInvariant(name[length]))
+            {
+                length++;
+            }
+
+            prefix = prefix[..length];
+            if (prefix.Length == 0)
+            {
+                break;
+            }
+        }
+
+        return prefix ?? "";
     }
 
     private static CombinedPartTarget BuildCombinedPartTarget(ModelAsset asset, string inputRoot)

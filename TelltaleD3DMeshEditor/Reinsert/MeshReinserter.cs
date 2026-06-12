@@ -156,7 +156,7 @@ public static class MeshReinserter
             new(layout.BoundsOffset, 24, BuildBoundsBytes(verts)),
             new(layout.SubmeshBlockSizeFieldOffset, 4, U32(layout.SubmeshBlockSize + BuildSubmeshTableSizeDelta(layout, subInfo, preparedTextureSlotsByPrimitive))),
             new(layout.SubmeshCountFieldOffset, 4, U32(subInfo.Length)),
-            new(layout.SubmeshTableOffset, layout.SubmeshTableLength, BuildSubmeshTable(layout, subInfo, preparedTextureSlotsByPrimitive, gameConfig ?? GameConfig.Current)),
+            new(layout.SubmeshTableOffset, layout.SubmeshTableLength, BuildSubmeshTable(layout, subInfo, preparedTextureSlotsByPrimitive, gameConfig ?? GameConfig.Current, verts)),
             new(layout.UvScalesOffset, layout.UvScalesLength, BuildUvScaleBytes(layout, mults)),
             new(layout.FaceCountFieldOffset, 4, U32(faceIndices.Count)),
             new(layout.FaceDataOffset, layout.FaceDataLength, faceBytes),
@@ -172,18 +172,20 @@ public static class MeshReinserter
         var texturePlansBySlot = BuildTextureGroupPlans(layout, subInfo, preparedTextureSlotsByPrimitive);
         if (texturePlansBySlot.Count > 0)
         {
+            var textureEntryBounds = ComputeTextureEntryBounds(layout, subInfo, preparedTextureSlotsByPrimitive, verts);
             patches.Add(new RegionPatch(
                 layout.TextureGroupBlockOffset,
                 layout.TextureGroupBlockLength,
-                BuildTextureGroupBlock(layout, texturePlansBySlot)));
+                BuildTextureGroupBlock(layout, texturePlansBySlot, textureEntryBounds)));
         }
 
-        if (layout.BonePalettes.Count > layout.OriginalBonePaletteCount)
+        var paletteBoneBounds = ComputePaletteBoneBounds(layout, subInfo, verts);
+        if (paletteBoneBounds.Count > 0 || layout.BonePalettes.Count > layout.OriginalBonePaletteCount)
         {
             patches.Add(new RegionPatch(
                 layout.BonePaletteBlockOffset,
                 layout.BonePaletteBlockLength,
-                BuildBonePaletteBlock(layout)));
+                BuildBonePaletteBlock(layout, paletteBoneBounds)));
         }
 
         var result = D3DMeshWriter.Apply(layout, patches);
@@ -908,7 +910,8 @@ public static class MeshReinserter
         D3DMeshLayout layout,
         IReadOnlyList<SubmeshPatchInfo> subInfo,
         IReadOnlyList<IReadOnlyDictionary<string, string>>? textureSlotsByPrimitive,
-        GameConfig gameConfig)
+        GameConfig gameConfig,
+        IReadOnlyList<EncVertex>? verts = null)
     {
         using var ms = new MemoryStream(BuildSubmeshTableLength(layout, subInfo, textureSlotsByPrimitive));
         var texturePlansBySlot = BuildTextureGroupPlans(layout, subInfo, textureSlotsByPrimitive);
@@ -935,6 +938,18 @@ public static class MeshReinserter
                 bonePaletteIndex < layout.BonePalettes.Count)
             {
                 WriteU32(bytes, template.BoneSetFieldOffset - template.EntryOffset, bonePaletteIndex);
+            }
+
+            // The v17/18 submesh entry carries its own bounds right after polyCount (min vec3,
+            // max vec3, u32 kept, center vec3, radius = half diagonal). Keeping the template's box
+            // leaves it around the OLD model's part; the eye quad of a swapped character can land
+            // fully outside it and get culled in-game (invisible pupils). v13/14 entries keep the
+            // template bytes so those games stay byte-identical.
+            if (layout.Version is 17 or 18 &&
+                verts is not null &&
+                TryComputeRangeBox(verts, info.VMin, info.VMax, out var submeshBox))
+            {
+                WriteBoundsBlock(bytes, template.PolygonCountFieldOffset - template.EntryOffset + 4, submeshBox);
             }
 
             if (i >= layout.Submeshes.Count)
@@ -1134,7 +1149,10 @@ public static class MeshReinserter
             layout.Original.AsSpan(template.TextureSlotFieldOffsets[slotIndex], 4));
     }
 
-    private static byte[] BuildTextureGroupBlock(D3DMeshLayout layout, IReadOnlyDictionary<string, List<TextureGroupEntryPlan>> textureNamesBySlot)
+    private static byte[] BuildTextureGroupBlock(
+        D3DMeshLayout layout,
+        IReadOnlyDictionary<string, List<TextureGroupEntryPlan>> textureNamesBySlot,
+        IReadOnlyDictionary<string, BoneBox>? textureEntryBounds = null)
     {
         using var ms = new MemoryStream();
         ms.Write(U32(0));
@@ -1158,6 +1176,17 @@ public static class MeshReinserter
                         : textureName + ".d3dtx");
                     WriteU32(bytes, templateEntry.HashLowFieldOffset - templateEntry.EntryOffset, (int)(hash & 0xFFFFFFFF));
                     WriteU32(bytes, templateEntry.HashHighFieldOffset - templateEntry.EntryOffset, (int)(hash >> 32));
+
+                    // v17/18 texture entries also carry the bounds of the geometry using the
+                    // texture (min/max at +24, u32 kept, center+radius), same culling concern as
+                    // the submesh bounds.
+                    if (textureEntryBounds is not null &&
+                        textureEntryBounds.TryGetValue(slot + "|" + textureName, out var box) &&
+                        bytes.Length >= 68)
+                    {
+                        WriteBoundsBlock(bytes, 24, box);
+                    }
+
                     ms.Write(bytes, 0, bytes.Length);
                 }
 
@@ -1173,22 +1202,202 @@ public static class MeshReinserter
         return result;
     }
 
-    private static byte[] BuildBonePaletteBlock(D3DMeshLayout layout)
+    private readonly record struct BoneBox(
+        float MinX, float MinY, float MinZ,
+        float MaxX, float MaxY, float MaxZ)
+    {
+        public BoneBox Include(float x, float y, float z) => new(
+            Math.Min(MinX, x), Math.Min(MinY, y), Math.Min(MinZ, z),
+            Math.Max(MaxX, x), Math.Max(MaxY, y), Math.Max(MaxZ, z));
+
+        public static BoneBox Empty => new(
+            float.MaxValue, float.MaxValue, float.MaxValue,
+            float.MinValue, float.MinValue, float.MinValue);
+    }
+
+    // Per-bone bounds of the vertices weighted to each palette slot. The game's 56-byte palette
+    // entries carry this AABB + center + radius (half diagonal) for the original geometry; keeping
+    // the template's boxes after a reimport leaves them around the OLD model's body parts. Only the
+    // v17/18 layout is rewritten — the v13/14 games run fine with the template entries untouched and
+    // their outputs must stay byte-identical.
+    private static Dictionary<(int Palette, int LocalBone), BoneBox> ComputePaletteBoneBounds(
+        D3DMeshLayout layout,
+        IReadOnlyList<SubmeshPatchInfo> subInfo,
+        IReadOnlyList<EncVertex> verts)
+    {
+        var result = new Dictionary<(int, int), BoneBox>();
+        if (layout.Version is not (17 or 18))
+        {
+            return result;
+        }
+
+        foreach (var info in subInfo)
+        {
+            if (info.BonePaletteIndex is not { } paletteIndex ||
+                paletteIndex < 0 ||
+                paletteIndex >= layout.BonePalettes.Count)
+            {
+                continue;
+            }
+
+            for (var i = info.VMin; i <= info.VMax && i < verts.Count; i++)
+            {
+                var v = verts[i];
+                foreach (var (bone, weight) in new[] { (v.Bone0, v.W0), (v.Bone1, v.W1), (v.Bone2, v.W2), (v.Bone3, v.W3) })
+                {
+                    if (weight <= 0.000001f)
+                    {
+                        continue;
+                    }
+
+                    var local = Formats.Mesh.BoneIndexConvention.ToPaletteIndex(bone, layout.Version);
+                    if (local < 0 || local >= layout.BonePalettes[paletteIndex].Length)
+                    {
+                        continue;
+                    }
+
+                    var key = (paletteIndex, local);
+                    var box = result.TryGetValue(key, out var existing) ? existing : BoneBox.Empty;
+                    result[key] = box.Include(v.X, v.Y, v.Z);
+                }
+            }
+        }
+
+        return result;
+    }
+
+    private static bool TryComputeRangeBox(IReadOnlyList<EncVertex> verts, int from, int toInclusive, out BoneBox box)
+    {
+        box = BoneBox.Empty;
+        var any = false;
+        for (var i = Math.Max(0, from); i <= toInclusive && i < verts.Count; i++)
+        {
+            box = box.Include(verts[i].X, verts[i].Y, verts[i].Z);
+            any = true;
+        }
+
+        return any;
+    }
+
+    // Writes the recurring Telltale bounds pattern (min vec3, max vec3, u32 kept untouched,
+    // center vec3, radius = half diagonal) used by submesh entries, texture entries and bone
+    // palette entries alike.
+    private static void WriteBoundsBlock(byte[] bytes, int offset, BoneBox box)
+    {
+        var span = bytes.AsSpan(offset);
+        BinaryPrimitives.WriteSingleLittleEndian(span, box.MinX);
+        BinaryPrimitives.WriteSingleLittleEndian(span[4..], box.MinY);
+        BinaryPrimitives.WriteSingleLittleEndian(span[8..], box.MinZ);
+        BinaryPrimitives.WriteSingleLittleEndian(span[12..], box.MaxX);
+        BinaryPrimitives.WriteSingleLittleEndian(span[16..], box.MaxY);
+        BinaryPrimitives.WriteSingleLittleEndian(span[20..], box.MaxZ);
+        BinaryPrimitives.WriteSingleLittleEndian(span[28..], (box.MinX + box.MaxX) * 0.5f);
+        BinaryPrimitives.WriteSingleLittleEndian(span[32..], (box.MinY + box.MaxY) * 0.5f);
+        BinaryPrimitives.WriteSingleLittleEndian(span[36..], (box.MinZ + box.MaxZ) * 0.5f);
+        var dx = box.MaxX - box.MinX;
+        var dy = box.MaxY - box.MinY;
+        var dz = box.MaxZ - box.MinZ;
+        BinaryPrimitives.WriteSingleLittleEndian(span[40..], 0.5f * MathF.Sqrt(dx * dx + dy * dy + dz * dz));
+    }
+
+    // Bounds of the vertices using each (slot, texture) pair, for the texture-group entries of the
+    // v17/18 layout. Same culling concern as the submesh bounds.
+    private static Dictionary<string, BoneBox> ComputeTextureEntryBounds(
+        D3DMeshLayout layout,
+        IReadOnlyList<SubmeshPatchInfo> subInfo,
+        IReadOnlyList<IReadOnlyDictionary<string, string>>? textureSlotsByPrimitive,
+        IReadOnlyList<EncVertex> verts)
+    {
+        var result = new Dictionary<string, BoneBox>(StringComparer.OrdinalIgnoreCase);
+        if (layout.Version is not (17 or 18) || textureSlotsByPrimitive is null)
+        {
+            return result;
+        }
+
+        for (var i = 0; i < subInfo.Count && i < textureSlotsByPrimitive.Count; i++)
+        {
+            if (!TryComputeRangeBox(verts, subInfo[i].VMin, subInfo[i].VMax, out var box))
+            {
+                continue;
+            }
+
+            foreach (var (slot, textureName) in textureSlotsByPrimitive[i])
+            {
+                var key = slot + "|" + textureName;
+                result[key] = result.TryGetValue(key, out var existing)
+                    ? existing.Include(box.MinX, box.MinY, box.MinZ).Include(box.MaxX, box.MaxY, box.MaxZ)
+                    : box;
+            }
+        }
+
+        return result;
+    }
+
+    private static void WriteBoneBoxIntoEntry(byte[] entry, BoneBox box)
+    {
+        // Entry layout after the 8-byte hash: min vec3, max vec3, int (kept), center vec3,
+        // radius (half diagonal), int (kept).
+        var span = entry.AsSpan();
+        BinaryPrimitives.WriteSingleLittleEndian(span[8..], box.MinX);
+        BinaryPrimitives.WriteSingleLittleEndian(span[12..], box.MinY);
+        BinaryPrimitives.WriteSingleLittleEndian(span[16..], box.MinZ);
+        BinaryPrimitives.WriteSingleLittleEndian(span[20..], box.MaxX);
+        BinaryPrimitives.WriteSingleLittleEndian(span[24..], box.MaxY);
+        BinaryPrimitives.WriteSingleLittleEndian(span[28..], box.MaxZ);
+        BinaryPrimitives.WriteSingleLittleEndian(span[36..], (box.MinX + box.MaxX) * 0.5f);
+        BinaryPrimitives.WriteSingleLittleEndian(span[40..], (box.MinY + box.MaxY) * 0.5f);
+        BinaryPrimitives.WriteSingleLittleEndian(span[44..], (box.MinZ + box.MaxZ) * 0.5f);
+        var dx = box.MaxX - box.MinX;
+        var dy = box.MaxY - box.MinY;
+        var dz = box.MaxZ - box.MinZ;
+        BinaryPrimitives.WriteSingleLittleEndian(span[48..], 0.5f * MathF.Sqrt(dx * dx + dy * dy + dz * dz));
+    }
+
+    private static byte[] BuildBonePaletteBlock(
+        D3DMeshLayout layout,
+        IReadOnlyDictionary<(int Palette, int LocalBone), BoneBox> paletteBoneBounds)
     {
         using var ms = new MemoryStream();
-        ms.Write(layout.Original, layout.BonePaletteBlockOffset, layout.BonePaletteBlockLength);
+        var originalBlock = layout.Original.AsSpan(layout.BonePaletteBlockOffset, layout.BonePaletteBlockLength).ToArray();
+
+        // Walk the original palettes and refresh each entry's bounds for bones the new geometry uses;
+        // untouched entries keep their original bytes.
+        var pos = 8;
+        for (var paletteIndex = 0; paletteIndex < layout.OriginalBonePaletteCount && pos + 4 <= originalBlock.Length; paletteIndex++)
+        {
+            var boneCount = (int)BinaryPrimitives.ReadUInt32LittleEndian(originalBlock.AsSpan(pos, 4));
+            pos += 4;
+            for (var bone = 0; bone < boneCount && pos + layout.BonePaletteEntrySize <= originalBlock.Length; bone++)
+            {
+                if (paletteBoneBounds.TryGetValue((paletteIndex, bone), out var box))
+                {
+                    var entry = originalBlock.AsSpan(pos, layout.BonePaletteEntrySize).ToArray();
+                    WriteBoneBoxIntoEntry(entry, box);
+                    entry.CopyTo(originalBlock, pos);
+                }
+
+                pos += layout.BonePaletteEntrySize;
+            }
+        }
+
+        ms.Write(originalBlock, 0, originalBlock.Length);
 
         for (var paletteIndex = layout.OriginalBonePaletteCount; paletteIndex < layout.BonePalettes.Count; paletteIndex++)
         {
             var palette = layout.BonePalettes[paletteIndex];
             ms.Write(U32(palette.Length));
-            foreach (var hash in palette)
+            for (var bone = 0; bone < palette.Length; bone++)
             {
                 var entry = layout.BonePaletteEntryTemplate.Length == layout.BonePaletteEntrySize
                     ? layout.BonePaletteEntryTemplate.ToArray()
                     : new byte[layout.BonePaletteEntrySize];
-                BinaryPrimitives.WriteUInt32LittleEndian(entry.AsSpan(0, 4), unchecked((uint)hash));
-                BinaryPrimitives.WriteUInt32LittleEndian(entry.AsSpan(4, 4), unchecked((uint)(hash >> 32)));
+                BinaryPrimitives.WriteUInt32LittleEndian(entry.AsSpan(0, 4), unchecked((uint)palette[bone]));
+                BinaryPrimitives.WriteUInt32LittleEndian(entry.AsSpan(4, 4), unchecked((uint)(palette[bone] >> 32)));
+                if (paletteBoneBounds.TryGetValue((paletteIndex, bone), out var box))
+                {
+                    WriteBoneBoxIntoEntry(entry, box);
+                }
+
                 ms.Write(entry, 0, entry.Length);
             }
         }
