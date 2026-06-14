@@ -30,6 +30,7 @@
        extract .ttarch / .ttarch2 game containers so users don't have to unpack them manually.
        Referenced from source so it stays linked to the upstream repo via the submodule. -->
   <ItemGroup>
+    <PackageReference Include="SharpCompress" Version="0.49.1" />
     <ProjectReference Include="..\external\TelltaleToolKit\src\TelltaleToolKit\TelltaleToolKit.csproj" />
   </ItemGroup>
 

@@ -54,7 +54,7 @@ public static class UpdateChecker
             var changelog = GetString(root, "body");
             var releaseUrl = GetString(root, "html_url");
 
-            string? downloadUrl = null;
+            var assetUrls = new List<string>();
             if (root.TryGetProperty("assets", out var assets) && assets.ValueKind == JsonValueKind.Array)
             {
                 foreach (var asset in assets.EnumerateArray())
@@ -62,11 +62,14 @@ public static class UpdateChecker
                     var url = GetString(asset, "browser_download_url");
                     if (!string.IsNullOrEmpty(url))
                     {
-                        downloadUrl = url;
-                        break;
+                        assetUrls.Add(url);
                     }
                 }
             }
+
+            var downloadUrl = assetUrls
+                .FirstOrDefault(IsSupportedUpdateArchive)
+                ?? assetUrls.FirstOrDefault();
 
             return new UpdateInfo(
                 tag.Trim(),
@@ -85,6 +88,13 @@ public static class UpdateChecker
         element.TryGetProperty(property, out var value) && value.ValueKind == JsonValueKind.String
             ? value.GetString() ?? ""
             : "";
+
+    private static bool IsSupportedUpdateArchive(string url)
+    {
+        var extension = Path.GetExtension(new Uri(url).LocalPath);
+        return extension.Equals(".zip", StringComparison.OrdinalIgnoreCase) ||
+               extension.Equals(".rar", StringComparison.OrdinalIgnoreCase);
+    }
 
     // True when the release tag parses to a higher version than the running one. Tolerates a leading
     // "v" and single-number tags (e.g. "2" -> "2.0").

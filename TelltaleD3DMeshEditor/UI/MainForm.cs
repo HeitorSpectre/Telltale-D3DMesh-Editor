@@ -162,7 +162,7 @@ public sealed class MainForm : Form
         _btnSettings.Alignment = ToolStripItemAlignment.Right;
         _btnReportIssue.Alignment = ToolStripItemAlignment.Right;
         _btnCheckUpdates.Alignment = ToolStripItemAlignment.Right;
-        _btnCheckUpdates.ToolTipText = "Checks GitHub for a newer version and shows the changelog. Nothing is installed automatically.";
+        _btnCheckUpdates.ToolTipText = "Checks GitHub for a newer version and lets you install it.";
         _btnReportIssue.ToolTipText = "Open a bug report form and create a pre-filled GitHub issue.";
         _btnSettings.ToolTipText = "Open tool settings.";
         _btnPan.CheckOnClick = true;
@@ -3398,8 +3398,8 @@ public sealed class MainForm : Form
     }
 #endif
 
-    // Shows the new version and its changelog, and lets the user download it or open the release page.
-    // Deliberately never downloads or replaces files on its own — the user stays in control.
+    // Shows the new version and its changelog, and lets the user install it or open the release page.
+    // Installation only starts after the user clicks the button and confirms the restart.
     private void ShowUpdateDialog(UpdateInfo info)
     {
         using var dialog = new Form
@@ -3437,7 +3437,7 @@ public sealed class MainForm : Form
         var subtitle = new Label
         {
             Text = $"You have v{UpdateChecker.CurrentVersion}; the latest is v{info.Version}. "
-                 + "Nothing is installed automatically — you choose what to do.",
+                 + "The installer will close the tool, update the files, and reopen it.",
             AutoSize = true,
             Margin = new Padding(0, 0, 0, 8),
         };
@@ -3483,9 +3483,24 @@ public sealed class MainForm : Form
         };
         var close = new Button { Text = "Close", AutoSize = true, DialogResult = DialogResult.Cancel, Margin = new Padding(6, 0, 0, 0) };
         var viewOnGitHub = new Button { Text = "View on GitHub", AutoSize = true, Margin = new Padding(6, 0, 0, 0) };
-        var download = new Button { Text = "Download", AutoSize = true, Margin = new Padding(6, 0, 0, 0) };
+        var download = new Button
+        {
+            Text = string.IsNullOrEmpty(info.DownloadUrl) ? "Open Download" : "Install Update",
+            AutoSize = true,
+            Margin = new Padding(6, 0, 0, 0)
+        };
         viewOnGitHub.Click += (_, _) => OpenUrl(info.ReleaseUrl);
-        download.Click += (_, _) => OpenUrl(string.IsNullOrEmpty(info.DownloadUrl) ? info.ReleaseUrl : info.DownloadUrl!);
+        download.Click += async (_, _) =>
+        {
+            if (string.IsNullOrEmpty(info.DownloadUrl))
+            {
+                OpenUrl(info.ReleaseUrl);
+                return;
+            }
+
+            dialog.Close();
+            await InstallUpdateAsync(info);
+        };
         buttons.Controls.Add(close);
         buttons.Controls.Add(viewOnGitHub);
         buttons.Controls.Add(download);
@@ -3497,6 +3512,42 @@ public sealed class MainForm : Form
         dialog.Controls.Add(layout);
         dialog.CancelButton = close;
         dialog.ShowDialog(this);
+    }
+
+    private async Task InstallUpdateAsync(UpdateInfo info)
+    {
+        var answer = MessageBox.Show(
+            $"Install {info.Title} now?\n\nThe tool will download the release, close, replace its files, and reopen automatically.",
+            Text,
+            MessageBoxButtons.YesNo,
+            MessageBoxIcon.Question,
+            MessageBoxDefaultButton.Button1);
+        if (answer != DialogResult.Yes)
+        {
+            return;
+        }
+
+        SetBusy(true);
+        try
+        {
+            SetStatusText($"Installing update {info.Version}...");
+            var progress = new Progress<(int Done, int Total, string Label)>(p =>
+                SetProgress(p.Done, p.Total, p.Label));
+            await SelfUpdater.DownloadExtractAndRestartAsync(info, progress);
+            SetStatusText("Restarting to apply update...");
+            Application.Exit();
+        }
+        catch (Exception ex)
+        {
+            SetStatusText("Update failed.");
+            MessageBox.Show(
+                $"Could not install the update automatically.\n\n{ex.Message}\n\nYou can still download it manually from GitHub.",
+                Text,
+                MessageBoxButtons.OK,
+                MessageBoxIcon.Error);
+            OpenUrl(info.ReleaseUrl);
+            SetBusy(false);
+        }
     }
 
     // Reads the UTC build timestamp stamped into the assembly at compile time and converts it to the
