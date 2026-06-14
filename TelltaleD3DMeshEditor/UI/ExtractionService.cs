@@ -1,5 +1,6 @@
 using System.Drawing.Imaging;
 using System.Text;
+using TelltaleD3DMeshEditor.Core;
 using TelltaleD3DMeshEditor.Export;
 using TelltaleD3DMeshEditor.Formats.Mesh;
 using TelltaleD3DMeshEditor.Formats.Skeleton;
@@ -120,15 +121,13 @@ public static class ExtractionService
 
     private static void WriteCompleteAsset(ModelAsset asset, string inputRoot, string outputPath, ExportFormat format)
     {
-        var mesh = D3DMeshParser.Parse(File.ReadAllBytes(asset.MeshPath));
+        var mesh = WithSourceMetadata(D3DMeshParser.Parse(File.ReadAllBytes(asset.MeshPath)), inputRoot, asset.MeshPath);
         var textureSets = TextureResolver.ResolveForMesh(inputRoot, asset.MeshPath, mesh);
         // Faithful export: diffuse and lines/detail textures remain separate, matching Telltale materials.
         var baseColorByName = BaseColorExporter.BuildRawDiffuse(mesh, textureSets);
         var auxiliaryTextures = BuildAuxiliaryTexturePngsForExport(mesh, inputRoot, asset.MeshPath, baseColorByName.Keys);
 
-        SkeletonData? skeleton = asset.SkeletonPath is not null
-            ? SkeletonLoader.Load(asset.SkeletonPath, version: 13)
-            : null;
+        var skeleton = LoadOptionalSkeleton(asset.SkeletonPath, mesh.Version);
 
         if (format == ExportFormat.Glb)
         {
@@ -138,6 +137,44 @@ public static class ExtractionService
         {
             GltfSeparateWriter.WriteCompleteAssetGltf(mesh, skeleton, baseColorByName, outputPath, auxiliaryTextures);
         }
+    }
+
+    private static MeshData WithSourceMetadata(MeshData mesh, string inputRoot, string meshPath)
+    {
+        var sourceMesh = Path.GetRelativePath(inputRoot, meshPath);
+        var result = new MeshData
+        {
+            Name = mesh.Name,
+            Version = mesh.Version,
+        };
+        foreach (var palette in mesh.BonePalettes)
+        {
+            result.BonePalettes.Add((ulong[])palette.Clone());
+        }
+
+        for (var i = 0; i < mesh.Submeshes.Count; i++)
+        {
+            var source = mesh.Submeshes[i];
+            var copy = new SubmeshData
+            {
+                Name = source.Name,
+                MaterialName = source.MaterialName,
+                BonePaletteIndex = source.BonePaletteIndex,
+                RigidBoneIndex = source.RigidBoneIndex,
+                SourceMeshPath = string.IsNullOrWhiteSpace(source.SourceMeshPath) ? sourceMesh : source.SourceMeshPath,
+                SourceSubmeshIndex = source.SourceSubmeshIndex >= 0 ? source.SourceSubmeshIndex : i,
+            };
+            foreach (var texture in source.TextureNames)
+            {
+                copy.TextureNames[texture.Key] = texture.Value;
+            }
+
+            copy.Vertices.AddRange(source.Vertices);
+            copy.Faces.AddRange(source.Faces);
+            result.Submeshes.Add(copy);
+        }
+
+        return result;
     }
 
     private static void WriteCompleteAssetGroup(ModelAssetGroup group, string inputRoot, string outputPath, ExportFormat format)
@@ -213,6 +250,7 @@ public static class ExtractionService
                     Name = $"{sourceStem}/{source.Name}",
                     MaterialName = source.MaterialName,
                     BonePaletteIndex = paletteIndex,
+                    RigidBoneIndex = source.RigidBoneIndex,
                     SourceMeshPath = sourceMesh,
                     SourceSubmeshIndex = s,
                 };
@@ -235,11 +273,28 @@ public static class ExtractionService
             }
         }
 
-        SkeletonData? skeleton = File.Exists(group.SkeletonPath)
-            ? SkeletonLoader.Load(group.SkeletonPath, version: 13)
-            : null;
+        var skeleton = LoadOptionalSkeleton(
+            File.Exists(group.SkeletonPath) ? group.SkeletonPath : null,
+            combinedMesh.Version);
 
         return new CombinedAsset(combinedMesh, skeleton, combinedTextures);
+    }
+
+    private static SkeletonData? LoadOptionalSkeleton(string? skeletonPath, int meshVersion)
+    {
+        if (string.IsNullOrWhiteSpace(skeletonPath))
+        {
+            return null;
+        }
+
+        try
+        {
+            return SkeletonLoader.Load(skeletonPath, meshVersion);
+        }
+        catch when (GameConfig.Current.IsBackToTheFuture)
+        {
+            return null;
+        }
     }
 
     // Per-part outward nudge for decal wounds, keyed by full mesh path. The base nudge is a small

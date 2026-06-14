@@ -56,8 +56,8 @@ public static class StrippedLineTextureRecovery
                 LoadTemplateImage(cache, folder, primitive.RecoveredDetailLineTextureName!) is { } lineImage)
             {
                 EnsureSlotDictionaries(primitive, ref textureSlots, ref referencedTextures);
-                textureSlots["detail_diffuse"] = lineImage;
-                referencedTextures["detail_diffuse"] = lineImage;
+                textureSlots!["detail_diffuse"] = lineImage;
+                referencedTextures!["detail_diffuse"] = lineImage;
             }
 
             if (!HasBumpSlot(primitive) &&
@@ -65,8 +65,8 @@ public static class StrippedLineTextureRecovery
                 LoadTemplateImage(cache, folder, bumpName) is { } bumpImage)
             {
                 EnsureSlotDictionaries(primitive, ref textureSlots, ref referencedTextures);
-                textureSlots["bump"] = bumpImage;
-                referencedTextures["bump"] = bumpImage;
+                textureSlots!["bump"] = bumpImage;
+                referencedTextures!["bump"] = bumpImage;
             }
 
             if (textureSlots is null)

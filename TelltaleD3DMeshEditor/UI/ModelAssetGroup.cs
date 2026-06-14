@@ -1,3 +1,5 @@
+using TelltaleD3DMeshEditor.Core;
+
 namespace TelltaleD3DMeshEditor.UI;
 
 // Virtual extraction group for meshes that belong together in the same source folder.
@@ -325,6 +327,11 @@ public sealed class ModelAssetGroup
         }
 
         var skeletonStem = stem;
+
+        if (GameConfig.Current.IsBackToTheFuture)
+        {
+            return [];
+        }
 
         // The Wither Storm is a single giant creature whose parts (three heads, eyelids, mouths, armour,
         // command block, growths, debris, tentacles) all coexist in one rig. The generic slot classifier

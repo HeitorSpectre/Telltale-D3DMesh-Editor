@@ -10,7 +10,7 @@ public static class SkeletonLoader
         {
             try
             {
-                return SkeletonRebuilder.ParseWithToolkit(skeletonPath);
+                return ValidateLoadedSkeleton(SkeletonRebuilder.ParseWithToolkit(skeletonPath));
             }
             catch
             {
@@ -20,11 +20,11 @@ public static class SkeletonLoader
 
         try
         {
-            return SkeletonParser.Parse(File.ReadAllBytes(skeletonPath), version);
+            return ValidateLoadedSkeleton(SkeletonParser.Parse(File.ReadAllBytes(skeletonPath), version));
         }
         catch
         {
-            return SkeletonRebuilder.ParseWithToolkit(skeletonPath);
+            return ValidateLoadedSkeleton(SkeletonRebuilder.ParseWithToolkit(skeletonPath));
         }
     }
 
@@ -32,4 +32,28 @@ public static class SkeletonLoader
         => GameConfig.Current.Id == GameId.MinecraftStoryMode ||
            skeletonPath.Contains("MCSM", StringComparison.OrdinalIgnoreCase) ||
            skeletonPath.Contains("Minecraft", StringComparison.OrdinalIgnoreCase);
+
+    private static SkeletonData ValidateLoadedSkeleton(SkeletonData skeleton)
+    {
+        if (LooksLikeMisalignedLegacySkeleton(skeleton))
+        {
+            throw new InvalidDataException("Skeleton layout is not supported by the available Telltale skeleton readers.");
+        }
+
+        return skeleton;
+    }
+
+    private static bool LooksLikeMisalignedLegacySkeleton(SkeletonData skeleton)
+    {
+        if (skeleton.Bones.Count == 0)
+        {
+            return false;
+        }
+
+        return skeleton.Bones.All(bone =>
+            bone.Hash == 0 &&
+            Math.Abs(bone.X) <= 0.000001f &&
+            Math.Abs(bone.Y) <= 0.000001f &&
+            Math.Abs(bone.Z) <= 0.000001f);
+    }
 }

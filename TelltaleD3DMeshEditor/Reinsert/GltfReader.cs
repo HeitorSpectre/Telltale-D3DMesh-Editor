@@ -1,4 +1,6 @@
 using System.Buffers.Binary;
+using System.Drawing;
+using System.Drawing.Imaging;
 using System.Globalization;
 using System.Numerics;
 using System.Text;
@@ -1237,9 +1239,12 @@ public static class GltfReader
         var result = new Dictionary<string, GltfImage>(StringComparer.OrdinalIgnoreCase);
 
         // First preserve exact Telltale slots from GLTFs exported by this tool.
-        if (material.TryGetProperty("extras", out var extras) &&
-            extras.TryGetProperty("telltaleTextures", out var telltaleTextures) &&
-            telltaleTextures.ValueKind == JsonValueKind.Object)
+        var telltaleTextures = default(JsonElement);
+        var hasTelltaleTextures =
+            material.TryGetProperty("extras", out var extras) &&
+            extras.TryGetProperty("telltaleTextures", out telltaleTextures) &&
+            telltaleTextures.ValueKind == JsonValueKind.Object;
+        if (hasTelltaleTextures)
         {
             foreach (var slotProperty in telltaleTextures.EnumerateObject())
             {
@@ -1275,6 +1280,11 @@ public static class GltfReader
         if (material.TryGetProperty("pbrMetallicRoughness", out var pbr))
         {
             AddTexture(result, "diffuse", pbr, "baseColorTexture", ctx);
+            if (!result.ContainsKey("diffuse") && !hasTelltaleTextures)
+            {
+                result["diffuse"] = BuildSolidBaseColorImage(material, pbr);
+            }
+
             if (includePbrExtras)
             {
                 AddTexture(result, "metallicRoughness", pbr, "metallicRoughnessTexture", ctx);
@@ -1289,6 +1299,63 @@ public static class GltfReader
         }
 
         return result;
+    }
+
+    private static GltfImage BuildSolidBaseColorImage(JsonElement material, JsonElement pbr)
+    {
+        var rgba = ReadBaseColorFactor(pbr);
+        var r = ToByte(rgba.X);
+        var g = ToByte(rgba.Y);
+        var b = ToByte(rgba.Z);
+        var a = ToByte(rgba.W);
+        var materialName = material.TryGetProperty("name", out var nameElem) &&
+                           nameElem.ValueKind == JsonValueKind.String
+            ? SanitizeName(nameElem.GetString())
+            : "material";
+        var imageName = $"{materialName}_baseColor_{r:X2}{g:X2}{b:X2}{a:X2}.png";
+        using var bitmap = new Bitmap(1, 1, PixelFormat.Format32bppArgb);
+        bitmap.SetPixel(0, 0, Color.FromArgb(a, r, g, b));
+        using var stream = new MemoryStream();
+        bitmap.Save(stream, ImageFormat.Png);
+        return new GltfImage
+        {
+            Name = imageName,
+            Data = stream.ToArray(),
+            MimeType = "image/png",
+        };
+    }
+
+    private static Vector4 ReadBaseColorFactor(JsonElement pbr)
+    {
+        if (!pbr.TryGetProperty("baseColorFactor", out var factor) ||
+            factor.ValueKind != JsonValueKind.Array ||
+            factor.GetArrayLength() < 3)
+        {
+            return Vector4.One;
+        }
+
+        var values = factor.EnumerateArray().Select(element => element.GetSingle()).ToArray();
+        return new Vector4(
+            values.Length > 0 ? values[0] : 1f,
+            values.Length > 1 ? values[1] : 1f,
+            values.Length > 2 ? values[2] : 1f,
+            values.Length > 3 ? values[3] : 1f);
+    }
+
+    private static byte ToByte(float value)
+        => (byte)Math.Clamp((int)MathF.Round(value * 255f), 0, 255);
+
+    private static string SanitizeName(string? value)
+    {
+        if (string.IsNullOrWhiteSpace(value))
+        {
+            return "material";
+        }
+
+        var invalid = Path.GetInvalidFileNameChars();
+        var chars = value.Select(ch => ch > 0x7F || invalid.Contains(ch) ? '_' : ch).ToArray();
+        var sanitized = new string(chars).Trim('_');
+        return string.IsNullOrWhiteSpace(sanitized) ? "material" : sanitized;
     }
 
     private static void AddTexture(Dictionary<string, GltfImage> result, string slot, JsonElement owner, string property, ParseContext ctx)

@@ -10,7 +10,8 @@ public sealed record GltfDiffuseAtlasOptions(
     int Padding = 4,
     int MaxSize = 8192,
     string AtlasName = "diffuse_atlas",
-    string? NormalAtlasName = null);
+    string? NormalAtlasName = null,
+    bool PackSharedPartsTextures = false);
 
 public sealed record GltfDiffuseAtlasResult(
     GltfModel Model,
@@ -34,7 +35,7 @@ public static class GltfDiffuseAtlasPacker
         // Pack detail/lines at their native resolution first (no downscale). Only if that overflows the
         // max atlas size do we fall back to matching detail to the diffuse size — so big line maps keep
         // their resolution in the common case, while huge models still pack instead of failing.
-        var sourceImages = CollectAtlasImages(model, matchDetailToDiffuse: false);
+        var sourceImages = CollectAtlasImages(model, matchDetailToDiffuse: false, options.PackSharedPartsTextures);
         if (sourceImages.Count <= 1)
         {
             return NotApplied(model, sourceImages.Count, options.AtlasName);
@@ -55,7 +56,7 @@ public static class GltfDiffuseAtlasPacker
             }
 
             matchedDetailToDiffuse = true;
-            decoded = DecodeImages(CollectAtlasImages(model, matchDetailToDiffuse: true));
+            decoded = DecodeImages(CollectAtlasImages(model, matchDetailToDiffuse: true, options.PackSharedPartsTextures));
             placements = PackRectangles(decoded, Math.Max(0, options.Padding), options.MaxSize);
         }
 
@@ -73,7 +74,7 @@ public static class GltfDiffuseAtlasPacker
             // atlas. Instead build a PARALLEL normal-map atlas with identical placements: each material's
             // normal map sits at the exact spot its diffuse occupies in the diffuse atlas, so the same
             // remapped UV0 samples the matching normal map. Unused/detail areas stay flat normal.
-            var bumpByDiffuseKey = CollectBumpByDiffuseKey(model);
+            var bumpByDiffuseKey = CollectBumpByDiffuseKey(model, options.PackSharedPartsTextures);
             GltfImage? normalAtlasImage = null;
             if (bumpByDiffuseKey.Count > 0)
             {
@@ -97,7 +98,7 @@ public static class GltfDiffuseAtlasPacker
             {
                 var primitive = model.Primitives[primitiveIndex];
                 if (!primitive.TextureSlots.TryGetValue("diffuse", out var diffuseImage) ||
-                    IsGameProvidedTexture(diffuseImage.Name) ||
+                    IsGameProvidedTexture(diffuseImage.Name, options.PackSharedPartsTextures) ||
                     primitive.Uv0 is null ||
                     !placements.TryGetValue(DiffuseAtlasKey(primitive), out var placement))
                 {
@@ -133,13 +134,14 @@ public static class GltfDiffuseAtlasPacker
                     referencedTextures["diffuse"] = atlasImage;
                 }
 
-                RemoveDetailSlots(textureSlots);
-                RemoveDetailSlots(referencedTextures);
                 if (FindDetailTexture(primitive) is { } detail &&
+                    ShouldPackDetailTexture(diffuseImage, detail.Image) &&
                     SelectDetailUv(primitive) is { } detailSourceUv &&
                     detailSourceUv.Length == primitive.VertexCount &&
                     placements.TryGetValue(DetailAtlasKey(detail.Image, diffuseImage), out var detailPlacement))
                 {
+                    RemoveDetailSlots(textureSlots);
+                    RemoveDetailSlots(referencedTextures);
                     var detailAtlasUv = RemapUvsToPlacement(detailSourceUv, detailPlacement, atlas.Width, atlas.Height, out var detailWrapped);
                     uv1 = detailAtlasUv;
                     uv2 = detailAtlasUv;
@@ -188,7 +190,7 @@ public static class GltfDiffuseAtlasPacker
     private static GltfDiffuseAtlasResult NotApplied(GltfModel model, int sourceTextureCount, string atlasName)
         => new(model, Applied: false, sourceTextureCount, 0, 0, atlasName, []);
 
-    private static List<AtlasSourceImage> CollectAtlasImages(GltfModel model, bool matchDetailToDiffuse)
+    private static List<AtlasSourceImage> CollectAtlasImages(GltfModel model, bool matchDetailToDiffuse, bool packSharedPartsTextures)
     {
         var result = new List<AtlasSourceImage>();
         var seen = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
@@ -196,7 +198,7 @@ public static class GltfDiffuseAtlasPacker
         {
             if (primitive.TextureSlots.TryGetValue("diffuse", out var diffuse) &&
                 primitive.Uv0 is not null &&
-                !IsGameProvidedTexture(diffuse.Name))
+                !IsGameProvidedTexture(diffuse.Name, packSharedPartsTextures))
             {
                 var diffuseKey = DiffuseAtlasKey(diffuse);
                 if (seen.Add(diffuseKey))
@@ -204,7 +206,8 @@ public static class GltfDiffuseAtlasPacker
                     result.Add(new AtlasSourceImage(diffuseKey, diffuse, PreserveAlpha: ShouldPreserveDiffuseAlpha(diffuse.Name)));
                 }
 
-                if (FindDetailTexture(primitive) is { } detail)
+                if (FindDetailTexture(primitive) is { } detail &&
+                    ShouldPackDetailTexture(diffuse, detail.Image))
                 {
                     var detailKey = DetailAtlasKey(detail.Image, diffuse);
                     if (seen.Add(detailKey))
@@ -230,14 +233,14 @@ public static class GltfDiffuseAtlasPacker
 
     // Maps each unique diffuse (by its atlas key) to a normal-map image, so the normal atlas can place
     // that normal map at the same spot the diffuse occupies in the diffuse atlas.
-    private static Dictionary<string, GltfImage> CollectBumpByDiffuseKey(GltfModel model)
+    private static Dictionary<string, GltfImage> CollectBumpByDiffuseKey(GltfModel model, bool packSharedPartsTextures)
     {
         var map = new Dictionary<string, GltfImage>(StringComparer.OrdinalIgnoreCase);
         foreach (var primitive in model.Primitives)
         {
             if (primitive.TextureSlots.TryGetValue("diffuse", out var diffuse) &&
                 primitive.Uv0 is not null &&
-                !IsGameProvidedTexture(diffuse.Name) &&
+                !IsGameProvidedTexture(diffuse.Name, packSharedPartsTextures) &&
                 TryGetBumpSlot(primitive, out var bumpSlot))
             {
                 map.TryAdd(DiffuseAtlasKey(diffuse), primitive.TextureSlots[bumpSlot]);
@@ -409,6 +412,23 @@ public static class GltfDiffuseAtlasPacker
                lower.Contains("ink_lines", StringComparison.Ordinal) ||
                lower.EndsWith("_detail", StringComparison.Ordinal) ||
                lower.Contains("_detail_", StringComparison.Ordinal);
+    }
+
+    private static bool ShouldPackDetailTexture(GltfImage diffuse, GltfImage detail)
+    {
+        var diffuseStem = Path.GetFileNameWithoutExtension(diffuse.Name).ToLowerInvariant();
+        var detailStem = Path.GetFileNameWithoutExtension(detail.Name).ToLowerInvariant();
+
+        // TWAU mouth/tongue shaders expect the mouth line texture to stay as the original A8 detail map.
+        // Packing it into the color atlas makes detail_diffuse point at a BC color texture and tints the tongue.
+        if (diffuseStem.Contains("mouth", StringComparison.Ordinal) &&
+            detailStem.Contains("mouth", StringComparison.Ordinal) &&
+            IsDetailOrLineTextureName(detail.Name))
+        {
+            return false;
+        }
+
+        return true;
     }
 
     private static Vector2[]? SelectDetailUv(GltfPrimitive primitive)
@@ -901,7 +921,7 @@ public static class GltfDiffuseAtlasPacker
     private static string DetailAtlasKey(GltfImage image, GltfImage diffuse)
         => "detail:" + ImageKey(image) + ":match:" + ImageKey(diffuse);
 
-    private static bool IsGameProvidedTexture(string? name)
+    private static bool IsGameProvidedTexture(string? name, bool packSharedPartsTextures)
     {
         if (string.IsNullOrWhiteSpace(name))
         {
@@ -909,9 +929,18 @@ public static class GltfDiffuseAtlasPacker
         }
 
         var stem = Path.GetFileNameWithoutExtension(name).ToLowerInvariant();
-        return stem.StartsWith("color_", StringComparison.Ordinal) ||
-               stem.StartsWith("map_", StringComparison.Ordinal) ||
-               stem.StartsWith("sk_sharedparts", StringComparison.Ordinal) ||
+        if (stem.StartsWith("color_", StringComparison.Ordinal) ||
+            stem.StartsWith("map_", StringComparison.Ordinal))
+        {
+            return true;
+        }
+
+        if (packSharedPartsTextures)
+        {
+            return false;
+        }
+
+        return stem.StartsWith("sk_sharedparts", StringComparison.Ordinal) ||
                stem.StartsWith("bmap_sk_sharedparts", StringComparison.Ordinal);
     }
 

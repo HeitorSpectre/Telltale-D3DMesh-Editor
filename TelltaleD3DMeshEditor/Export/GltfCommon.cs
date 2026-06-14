@@ -117,8 +117,14 @@ internal static class GltfCommon
 
     public static ushort RemapJoint(int rawBone, int meshVersion, IReadOnlyList<ulong>? palette, IReadOnlyDictionary<ulong, int> boneIndexByHash)
     {
-        if (palette is null || palette.Count == 0) return 0;
         var local = Formats.Mesh.BoneIndexConvention.ToPaletteIndex(rawBone, meshVersion);
+        if (palette is null || palette.Count == 0)
+        {
+            return meshVersion == 1 && local >= 0 && local < boneIndexByHash.Count
+                ? (ushort)local
+                : (ushort)0;
+        }
+
         if (local < 0 || local >= palette.Count) return 0;
         return boneIndexByHash.TryGetValue(palette[local], out var idx) ? (ushort)idx : (ushort)0;
     }

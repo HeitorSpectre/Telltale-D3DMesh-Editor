@@ -34,6 +34,7 @@ public sealed class SubmeshData
     public string Name { get; init; } = "";
     public string? MaterialName { get; init; }
     public int BonePaletteIndex { get; init; }
+    public int RigidBoneIndex { get; init; } = -1;
     public string? SourceMeshPath { get; init; }
     public int SourceSubmeshIndex { get; init; } = -1;
     public Dictionary<string, string> TextureNames { get; } = new(StringComparer.OrdinalIgnoreCase);

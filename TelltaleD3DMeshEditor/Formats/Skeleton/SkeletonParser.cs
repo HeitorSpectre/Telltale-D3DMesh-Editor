@@ -10,6 +10,11 @@ public static class SkeletonParser
     public static SkeletonData Parse(byte[] data, int version)
     {
         var header = MetaStreamHeader.Parse(data);
+        if (version <= 1 && header.Version == "MTRE")
+        {
+            return BackToTheFutureSkeletonParser.Parse(data, header.DataOffset);
+        }
+
         var reader = new DataReader(data);
         if (header.DataOffset > 0)
         {

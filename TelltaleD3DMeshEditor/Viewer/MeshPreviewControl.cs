@@ -21,7 +21,6 @@ public sealed class MeshPreviewControl : Control
     private const float DefaultPitch = 0.25f;
     private const float DefaultZoom = 1.0f;
     private const float DepthTieEpsilon = 0.00005f;
-    private const string EmptyPreviewText = "Select a .d3dmesh, .d3dtx and .skl file to preview";
 
     private MeshData? _mesh;
     private SkeletonData? _skeleton;
@@ -44,9 +43,11 @@ public sealed class MeshPreviewControl : Control
     private bool _poseMode;
     private bool _showDragDropHint;
     private Image? _dragDropImage;
+    private Image? _emptyBackgroundImage;
     private int _selectedBone = -1;
     private readonly Dictionary<int, Vector3> _boneOffsets = new();
     private readonly Dictionary<int, Quaternion> _boneRotations = new();
+    private Dictionary<int, int>? _rigidBoneMap;
 
     public MeshPreviewControl()
     {
@@ -67,6 +68,7 @@ public sealed class MeshPreviewControl : Control
         _sizeInfo = mesh is null ? "" : BuildSizeInfo(mesh);
         _boneOffsets.Clear();
         _boneRotations.Clear();
+        _rigidBoneMap = null;
         _selectedBone = -1;
         // Reset the camera to the default view so the new model does not inherit the previous orientation.
         _yaw = DefaultYaw;
@@ -81,6 +83,7 @@ public sealed class MeshPreviewControl : Control
         {
             _meshBitmap?.Dispose();
             _dragDropImage?.Dispose();
+            _emptyBackgroundImage?.Dispose();
         }
 
         base.Dispose(disposing);
@@ -297,6 +300,11 @@ public sealed class MeshPreviewControl : Control
 
         if (_mesh is null)
         {
+            if (!_showDragDropHint)
+            {
+                DrawEmptyPreviewBackground(g);
+            }
+
             DrawEmptyPreview(g);
             return;
         }
@@ -392,51 +400,69 @@ public sealed class MeshPreviewControl : Control
         var hasPose = _boneOffsets.Count > 0 || _boneRotations.Count > 0;
         var posedBoneMatrices = _skeleton is not null && hasPose ? BuildBoneWorldMatrices(_skeleton, _boneOffsets, _boneRotations) : baseBoneMatrices;
 
-        for (var submeshIndex = 0; submeshIndex < _mesh!.Submeshes.Count; submeshIndex++)
+        for (var pass = 0; pass < 2; pass++)
         {
-            var submesh = _mesh.Submeshes[submeshIndex];
-            if (IsNullPreviewMaterial(submesh))
+            var transparentPass = pass == 1;
+            var submeshOrder = Enumerable.Range(0, _mesh!.Submeshes.Count);
+            if (transparentPass)
             {
-                continue;
+                submeshOrder = submeshOrder
+                    .OrderBy(index => EstimateSubmeshDepth(_mesh.Submeshes[index], transform))
+                    .ToList();
             }
 
-            _textures.TryGetValue(submeshIndex, out var textures);
-            var boneMap = BuildBoneMap(submesh);
-            var renderVertices = new RenderVertex[submesh.Vertices.Count];
-            for (var i = 0; i < submesh.Vertices.Count; i++)
+            foreach (var submeshIndex in submeshOrder)
             {
-                var vertex = submesh.Vertices[i];
-                var skinned = ApplySkinning(vertex, boneMap, baseBoneMatrices, posedBoneMatrices);
-                var view = Vector3.Transform(skinned, transform);
-                var screen = Project(view, scale, center);
-                var normal = Vector3.TransformNormal(ToNormal(vertex), transform);
-                if (normal.LengthSquared() < 0.000001f)
-                {
-                    normal = Vector3.UnitZ;
-                }
-                else
-                {
-                    normal = Vector3.Normalize(normal);
-                }
-
-                var shade = Math.Clamp(0.58f + MathF.Abs(Vector3.Dot(normal, light)) * 0.42f, 0.50f, 1.0f);
-                var (detailU, detailV) = SelectDetailUv(vertex);
-                var (bakeU, bakeV) = SelectBakeUv(vertex);
-                var (shadowU, shadowV) = SelectShadowUv(vertex);
-                renderVertices[i] = new RenderVertex(
-                    screen.X, screen.Y, view.Z, shade,
-                    vertex.U, vertex.V, detailU, detailV, bakeU, bakeV, shadowU, shadowV,
-                    vertex.ColorR, vertex.ColorG, vertex.ColorB, vertex.ColorA);
-            }
-
-            foreach (var (a, b, c) in submesh.Faces)
-            {
-                if ((uint)a >= renderVertices.Length || (uint)b >= renderVertices.Length || (uint)c >= renderVertices.Length)
+                var submesh = _mesh.Submeshes[submeshIndex];
+                if (IsNullPreviewMaterial(submesh))
                 {
                     continue;
                 }
 
-                RasterizeTriangle(renderVertices[a], renderVertices[b], renderVertices[c], textures, pixels, depth, width, height);
+                _textures.TryGetValue(submeshIndex, out var textures);
+                if (IsTransparentPreviewMaterial(textures) != transparentPass)
+                {
+                    continue;
+                }
+
+                var boneMap = BuildBoneMap(submesh);
+                var rigidPose = BuildRigidPoseMatrix(submesh, boneMap, baseBoneMatrices, posedBoneMatrices);
+                var renderVertices = new RenderVertex[submesh.Vertices.Count];
+                for (var i = 0; i < submesh.Vertices.Count; i++)
+                {
+                    var vertex = submesh.Vertices[i];
+                    var posed = ApplyPose(vertex, rigidPose, boneMap, baseBoneMatrices, posedBoneMatrices);
+                    var view = Vector3.Transform(posed, transform);
+                    var screen = Project(view, scale, center);
+                    var normal = Vector3.TransformNormal(ApplyPoseNormal(vertex, rigidPose), transform);
+                    if (normal.LengthSquared() < 0.000001f)
+                    {
+                        normal = Vector3.UnitZ;
+                    }
+                    else
+                    {
+                        normal = Vector3.Normalize(normal);
+                    }
+
+                    var shade = Math.Clamp(0.58f + MathF.Abs(Vector3.Dot(normal, light)) * 0.42f, 0.50f, 1.0f);
+                    var (detailU, detailV) = SelectDetailUv(vertex);
+                    var (bakeU, bakeV) = SelectBakeUv(vertex);
+                    var (shadowU, shadowV) = SelectShadowUv(vertex);
+                    renderVertices[i] = new RenderVertex(
+                        screen.X, screen.Y, view.Z, shade,
+                        vertex.U, vertex.V, detailU, detailV, bakeU, bakeV, shadowU, shadowV,
+                        vertex.ColorR, vertex.ColorG, vertex.ColorB, vertex.ColorA);
+                }
+
+                foreach (var (a, b, c) in submesh.Faces)
+                {
+                    if ((uint)a >= renderVertices.Length || (uint)b >= renderVertices.Length || (uint)c >= renderVertices.Length)
+                    {
+                        continue;
+                    }
+
+                    RasterizeTriangle(renderVertices[a], renderVertices[b], renderVertices[c], textures, pixels, depth, width, height, writeDepth: !transparentPass);
+                }
             }
         }
 
@@ -467,10 +493,11 @@ public sealed class MeshPreviewControl : Control
             }
 
             var boneMap = BuildBoneMap(submesh);
+            var rigidPose = BuildRigidPoseMatrix(submesh, boneMap, baseBoneMatrices, posedBoneMatrices);
             var points = new PointF[submesh.Vertices.Count];
             for (var i = 0; i < submesh.Vertices.Count; i++)
             {
-                points[i] = Project(ApplySkinning(submesh.Vertices[i], boneMap, baseBoneMatrices, posedBoneMatrices), transform, scale, center);
+                points[i] = Project(ApplyPose(submesh.Vertices[i], rigidPose, boneMap, baseBoneMatrices, posedBoneMatrices), transform, scale, center);
             }
 
             foreach (var (a, b, c) in submesh.Faces)
@@ -485,7 +512,29 @@ public sealed class MeshPreviewControl : Control
         }
     }
 
-    private static void RasterizeTriangle(RenderVertex a, RenderVertex b, RenderVertex c, MaterialTextureSet? textures, int[] pixels, float[] depth, int width, int height)
+    private static bool IsTransparentPreviewMaterial(MaterialTextureSet? textures)
+    {
+        return textures is not null &&
+               (textures.Diffuse?.AverageAlpha ?? 1f) < 0.95f;
+    }
+
+    private static float EstimateSubmeshDepth(SubmeshData submesh, Matrix4x4 transform)
+    {
+        if (submesh.Vertices.Count == 0)
+        {
+            return 0f;
+        }
+
+        var sum = 0f;
+        foreach (var vertex in submesh.Vertices)
+        {
+            sum += Vector3.Transform(new Vector3(vertex.X, vertex.Y, vertex.Z), transform).Z;
+        }
+
+        return sum / submesh.Vertices.Count;
+    }
+
+    private static void RasterizeTriangle(RenderVertex a, RenderVertex b, RenderVertex c, MaterialTextureSet? textures, int[] pixels, float[] depth, int width, int height, bool writeDepth)
     {
         var area = Edge(a.X, a.Y, b.X, b.Y, c.X, c.Y);
         if (MathF.Abs(area) < 0.00001f)
@@ -578,7 +627,10 @@ public sealed class MeshPreviewControl : Control
                     color = BlendOver(color, pixels[index], pixelAlpha);
                 }
 
-                depth[index] = z;
+                if (writeDepth)
+                {
+                    depth[index] = z;
+                }
                 pixels[index] = color;
             }
         }
@@ -767,7 +819,28 @@ public sealed class MeshPreviewControl : Control
 
     private int[]? BuildBoneMap(SubmeshData submesh)
     {
-        if (_mesh is null || _skeleton is null || _mesh.BonePalettes.Count == 0)
+        if (_mesh is null || _skeleton is null)
+        {
+            return null;
+        }
+
+        if (_mesh.BonePalettes.Count == 0 && _mesh.Version == 1)
+        {
+            if (!HasExplicitSkinningData(submesh))
+            {
+                return null;
+            }
+
+            var directMap = new int[_skeleton.Bones.Count];
+            for (var i = 0; i < directMap.Length; i++)
+            {
+                directMap[i] = i;
+            }
+
+            return directMap;
+        }
+
+        if (_mesh.BonePalettes.Count == 0)
         {
             return null;
         }
@@ -787,6 +860,26 @@ public sealed class MeshPreviewControl : Control
         }
 
         return map;
+    }
+
+    private static bool HasExplicitSkinningData(SubmeshData submesh)
+    {
+        foreach (var vertex in submesh.Vertices)
+        {
+            if (vertex.Bone0 != 0 ||
+                vertex.Bone1 != 0 ||
+                vertex.Bone2 != 0 ||
+                vertex.Bone3 != 0 ||
+                MathF.Abs(vertex.Weight0 - 1f) > 0.000001f ||
+                MathF.Abs(vertex.Weight1) > 0.000001f ||
+                MathF.Abs(vertex.Weight2) > 0.000001f ||
+                MathF.Abs(vertex.Weight3) > 0.000001f)
+            {
+                return true;
+            }
+        }
+
+        return false;
     }
 
     private Vector3 ApplySkinning(VertexData vertex, int[]? boneMap, Matrix4x4[]? baseMatrices, Matrix4x4[]? posedMatrices)
@@ -811,6 +904,205 @@ public sealed class MeshPreviewControl : Control
         }
 
         return result / total;
+    }
+
+    private Vector3 ApplyPose(
+        VertexData vertex,
+        Matrix4x4? rigidPose,
+        int[]? boneMap,
+        Matrix4x4[]? baseMatrices,
+        Matrix4x4[]? posedMatrices)
+    {
+        var original = ToVector(vertex);
+        if (rigidPose is Matrix4x4 rigid)
+        {
+            return Vector3.Transform(original, rigid);
+        }
+
+        return ApplySkinning(vertex, boneMap, baseMatrices, posedMatrices);
+    }
+
+    private static Vector3 ApplyPoseNormal(VertexData vertex, Matrix4x4? rigidPose)
+    {
+        var normal = ToNormal(vertex);
+        if (rigidPose is not Matrix4x4 rigid)
+        {
+            return normal;
+        }
+
+        rigid.M41 = 0f;
+        rigid.M42 = 0f;
+        rigid.M43 = 0f;
+        return Vector3.TransformNormal(normal, rigid);
+    }
+
+    private Matrix4x4? BuildRigidPoseMatrix(
+        SubmeshData submesh,
+        int[]? boneMap,
+        Matrix4x4[]? baseMatrices,
+        Matrix4x4[]? posedMatrices)
+    {
+        if (_mesh is null ||
+            _skeleton is null ||
+            _mesh.Version != 1 ||
+            submesh.RigidBoneIndex < 0 ||
+            boneMap is not null ||
+            baseMatrices is null ||
+            posedMatrices is null ||
+            ReferenceEquals(baseMatrices, posedMatrices))
+        {
+            return null;
+        }
+
+        var skeletonBone = ResolveRigidSkeletonBone(submesh.RigidBoneIndex, baseMatrices);
+        if (skeletonBone < 0 || skeletonBone >= baseMatrices.Length || skeletonBone >= posedMatrices.Length)
+        {
+            return null;
+        }
+
+        return Matrix4x4.Invert(baseMatrices[skeletonBone], out var inverseBase)
+            ? inverseBase * posedMatrices[skeletonBone]
+            : null;
+    }
+
+    private int ResolveRigidSkeletonBone(int rigidBoneIndex, Matrix4x4[] baseMatrices)
+    {
+        if (_mesh is null || _skeleton is null || rigidBoneIndex < 0)
+        {
+            return -1;
+        }
+
+        _rigidBoneMap ??= BuildRigidBoneMap(baseMatrices);
+        return _rigidBoneMap.TryGetValue(rigidBoneIndex, out var skeletonBone) ? skeletonBone : -1;
+    }
+
+    private Dictionary<int, int> BuildRigidBoneMap(Matrix4x4[] baseMatrices)
+    {
+        var map = new Dictionary<int, int>();
+        if (_mesh is null || _skeleton is null)
+        {
+            return map;
+        }
+
+        foreach (var group in _mesh.Submeshes
+                     .Where(submesh => submesh.RigidBoneIndex >= 0 && submesh.Vertices.Count > 0)
+                     .GroupBy(submesh => submesh.RigidBoneIndex))
+        {
+            if (_mesh.Version == 1 && group.Key == 0 && TryFindVehicleBodyBone(out var bodyBone))
+            {
+                map[group.Key] = bodyBone;
+                continue;
+            }
+
+            map[group.Key] = FindNearestSkeletonBone(GetSubmeshGroupCenter(group), baseMatrices, skipRoot: group.Key > 0);
+        }
+
+        return map;
+    }
+
+    private int FindNearestSkeletonBone(Vector3 center, Matrix4x4[] baseMatrices, bool skipRoot)
+    {
+        if (_skeleton is null)
+        {
+            return -1;
+        }
+
+        var bestIndex = -1;
+        var bestDistance = float.MaxValue;
+        for (var i = 0; i < _skeleton.Bones.Count && i < baseMatrices.Length; i++)
+        {
+            if (skipRoot && IsBttfStaticRootBone(i))
+            {
+                continue;
+            }
+
+            var bonePosition = Vector3.Transform(Vector3.Zero, baseMatrices[i]);
+            var distance = Vector3.DistanceSquared(center, bonePosition);
+            if (distance < bestDistance)
+            {
+                bestDistance = distance;
+                bestIndex = i;
+            }
+        }
+
+        return bestIndex;
+    }
+
+    private bool IsBttfStaticRootBone(int boneIndex)
+    {
+        if (_mesh?.Version != 1 || _skeleton is null || boneIndex < 0 || boneIndex >= _skeleton.Bones.Count)
+        {
+            return false;
+        }
+
+        if (boneIndex == 0)
+        {
+            return true;
+        }
+
+        return _skeleton.Bones[boneIndex].Name.Equals("root", StringComparison.OrdinalIgnoreCase);
+    }
+
+    private bool TryFindVehicleBodyBone(out int bodyBone)
+    {
+        bodyBone = -1;
+        if (_skeleton is null || !HasVehicleWheelBones())
+        {
+            return false;
+        }
+
+        for (var i = 0; i < _skeleton.Bones.Count; i++)
+        {
+            if (_skeleton.Bones[i].Name.Equals("body", StringComparison.OrdinalIgnoreCase))
+            {
+                bodyBone = i;
+                return true;
+            }
+        }
+
+        bodyBone = 0;
+        return _skeleton.Bones.Count > 0;
+    }
+
+    private bool HasVehicleWheelBones()
+    {
+        if (_skeleton is null)
+        {
+            return false;
+        }
+
+        var wheelCount = 0;
+        foreach (var bone in _skeleton.Bones)
+        {
+            if (bone.Name.Contains("wheel", StringComparison.OrdinalIgnoreCase))
+            {
+                wheelCount++;
+            }
+        }
+
+        return wheelCount >= 2;
+    }
+
+    private static Vector3 GetSubmeshCenter(SubmeshData submesh)
+        => GetSubmeshGroupCenter([submesh]);
+
+    private static Vector3 GetSubmeshGroupCenter(IEnumerable<SubmeshData> submeshes)
+    {
+        var min = new Vector3(float.MaxValue);
+        var max = new Vector3(float.MinValue);
+        var any = false;
+        foreach (var submesh in submeshes)
+        {
+            foreach (var vertex in submesh.Vertices)
+            {
+                var p = ToVector(vertex);
+                min = Vector3.Min(min, p);
+                max = Vector3.Max(max, p);
+                any = true;
+            }
+        }
+
+        return any ? (min + max) * 0.5f : Vector3.Zero;
     }
 
     private static void AccumulateSkinned(
@@ -1263,30 +1555,76 @@ public sealed class MeshPreviewControl : Control
 
     private void DrawEmptyPreview(Graphics g)
     {
-        using var brush = new SolidBrush(Color.FromArgb(235, 245, 245, 245));
-        var textSize = g.MeasureString(EmptyPreviewText, Font);
-        var textX = (Width - textSize.Width) * 0.5f;
-        var textY = (Height - textSize.Height) * 0.5f;
-
-        if (_showDragDropHint && TryGetDragDropImage() is { } image)
+        if (!_showDragDropHint || TryGetDragDropImage() is not { } image)
         {
-            var maxImageWidth = Math.Min(220f, Width * 0.42f);
-            var maxImageHeight = Math.Min(150f, Height * 0.28f);
-            var scale = Math.Min(maxImageWidth / image.Width, maxImageHeight / image.Height);
-            scale = Math.Min(scale, 1f);
-
-            var imageWidth = image.Width * scale;
-            var imageHeight = image.Height * scale;
-            var gap = 18f;
-            var groupHeight = imageHeight + gap + textSize.Height;
-            var imageX = (Width - imageWidth) * 0.5f;
-            var imageY = (Height - groupHeight) * 0.5f;
-
-            g.DrawImage(image, imageX, imageY, imageWidth, imageHeight);
-            textY = imageY + imageHeight + gap;
+            return;
         }
 
-        g.DrawString(EmptyPreviewText, Font, brush, textX, textY);
+        var imageRect = GetDragDropRectangle(image);
+        var previousInterpolation = g.InterpolationMode;
+        var previousPixelOffset = g.PixelOffsetMode;
+        g.InterpolationMode = InterpolationMode.HighQualityBicubic;
+        g.PixelOffsetMode = PixelOffsetMode.HighQuality;
+        g.DrawImage(image, imageRect);
+        g.InterpolationMode = previousInterpolation;
+        g.PixelOffsetMode = previousPixelOffset;
+    }
+
+    private void DrawEmptyPreviewBackground(Graphics g)
+    {
+        if (TryGetEmptyBackgroundImage() is not { } image || Width <= 0 || Height <= 0)
+        {
+            return;
+        }
+
+        var imageRect = GetEmptyBackgroundRectangle(image);
+
+        var previousInterpolation = g.InterpolationMode;
+        var previousPixelOffset = g.PixelOffsetMode;
+        g.InterpolationMode = InterpolationMode.HighQualityBicubic;
+        g.PixelOffsetMode = PixelOffsetMode.HighQuality;
+        g.DrawImage(image, imageRect);
+        g.InterpolationMode = previousInterpolation;
+        g.PixelOffsetMode = previousPixelOffset;
+    }
+
+    private RectangleF GetEmptyBackgroundRectangle(Image image)
+    {
+        var maxImageWidth = Width * 0.46f;
+        var maxImageHeight = Height * 0.58f;
+        var scale = Math.Min(maxImageWidth / image.Width, maxImageHeight / image.Height);
+        scale = Math.Min(scale, 1f);
+        var imageWidth = image.Width * scale;
+        var imageHeight = image.Height * scale;
+        var imageX = (Width - imageWidth) * 0.5f;
+        var imageY = (Height - imageHeight) * 0.5f;
+
+        return new RectangleF(imageX, imageY, imageWidth, imageHeight);
+    }
+
+    private RectangleF GetDragDropRectangle(Image image)
+    {
+        var maxImageWidth = Math.Min(220f, Width * 0.42f);
+        var maxImageHeight = Math.Min(150f, Height * 0.28f);
+        var scale = Math.Min(maxImageWidth / image.Width, maxImageHeight / image.Height);
+        scale = Math.Min(scale, 1f);
+        var imageWidth = image.Width * scale;
+        var imageHeight = image.Height * scale;
+
+        var centerX = Width * 0.5f;
+        var centerY = Height * 0.5f;
+        if (TryGetEmptyBackgroundImage() is { } backgroundImage)
+        {
+            var backgroundRect = GetEmptyBackgroundRectangle(backgroundImage);
+            centerX = backgroundRect.Left + backgroundRect.Width * 0.5f;
+            centerY = backgroundRect.Top + backgroundRect.Height * 0.5f;
+        }
+
+        return new RectangleF(
+            centerX - imageWidth * 0.5f,
+            centerY - imageHeight * 0.5f,
+            imageWidth,
+            imageHeight);
     }
 
     private Image? TryGetDragDropImage()
@@ -1308,6 +1646,32 @@ public sealed class MeshPreviewControl : Control
             using var loaded = Image.FromStream(stream);
             _dragDropImage = new Bitmap(loaded);
             return _dragDropImage;
+        }
+        catch
+        {
+            return null;
+        }
+    }
+
+    private Image? TryGetEmptyBackgroundImage()
+    {
+        if (_emptyBackgroundImage is not null)
+        {
+            return _emptyBackgroundImage;
+        }
+
+        var assembly = Assembly.GetExecutingAssembly();
+        using var stream = assembly.GetManifestResourceStream("TelltaleD3DMeshEditor.Resources.Images.LogoBackground.png");
+        if (stream is null)
+        {
+            return null;
+        }
+
+        try
+        {
+            using var loaded = Image.FromStream(stream);
+            _emptyBackgroundImage = new Bitmap(loaded);
+            return _emptyBackgroundImage;
         }
         catch
         {
@@ -1359,13 +1723,15 @@ public sealed class MeshPreviewControl : Control
 
     private static bool IsNullPreviewMaterial(SubmeshData submesh)
     {
-        return IsColorNull(submesh.MaterialName)
-            || (submesh.TextureNames.TryGetValue("diffuse", out var diffuse) && IsColorNull(diffuse));
+        return IsHiddenHelperPreviewMaterial(submesh.MaterialName)
+            || (submesh.TextureNames.TryGetValue("diffuse", out var diffuse) && IsHiddenHelperPreviewMaterial(diffuse));
     }
 
-    private static bool IsColorNull(string? textureName)
+    private static bool IsHiddenHelperPreviewMaterial(string? textureName)
     {
-        return string.Equals(NormalizeTextureName(textureName), "color_000", StringComparison.OrdinalIgnoreCase);
+        var name = NormalizeTextureName(textureName);
+        return string.Equals(name, "color_000", StringComparison.OrdinalIgnoreCase) ||
+               string.Equals(name, "map_1px_alpha", StringComparison.OrdinalIgnoreCase);
     }
 
     private static string NormalizeTextureName(string? textureName)

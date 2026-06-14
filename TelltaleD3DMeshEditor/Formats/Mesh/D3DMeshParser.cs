@@ -43,9 +43,21 @@ public static class D3DMeshParser
 
         var name = reader.ReadAscii((int)nameLength);
         var version = reader.ReadInt32();
-        if (version < 2)
+        if (version < 1)
         {
             throw new NotSupportedException($"D3DMESH version {version} is not wired into this extractor yet.");
+        }
+
+        if (version == 1)
+        {
+            try
+            {
+                return BackToTheFutureMeshParser.Parse(data, name, reader.Position);
+            }
+            catch (NotSupportedException)
+            {
+                return TelltaleToolkitMeshParser.ParseOldMesh(data, name);
+            }
         }
 
         return ParseMsvMesh(reader, name, version);
@@ -62,7 +74,7 @@ public static class D3DMeshParser
             return ParseV18(reader, name, version);
         }
 
-        reader.Skip(version >= 13 ? 4 : 5);
+        reader.Skip(version == 1 ? 1 : version >= 13 ? 4 : 5);
         reader.ReadVec3();
         reader.ReadVec3();
 
@@ -207,7 +219,7 @@ public static class D3DMeshParser
             rawFaces.Add((reader.ReadUInt16(), reader.ReadUInt16(), reader.ReadUInt16()));
         }
 
-        var vertices = ReadVertices(reader, uv1X, uv1Y, uv2X, uv2Y, uv3X, uv3Y, uv4X, uv4Y);
+        var vertices = ReadVertices(reader, uv1X, uv1Y, uv2X, uv2Y, uv3X, uv3Y, uv4X, uv4Y, signedFormat4Weights: version <= 2);
         if (vertices.Count == 0)
         {
             throw new InvalidDataException("No vertices found.");
@@ -632,7 +644,8 @@ public static class D3DMeshParser
         float uv3X,
         float uv3Y,
         float uv4X,
-        float uv4Y)
+        float uv4Y,
+        bool signedFormat4Weights)
     {
         var vertexCount = checked((int)reader.ReadUInt32());
         var vertexStride = checked((int)reader.ReadUInt32());
@@ -693,7 +706,7 @@ public static class D3DMeshParser
                 v4 = v3;
             }
             var (bone0, bone1, bone2, bone3) = ReadBones(reader, attrs["bones"].Format);
-            var (weight0, weight1, weight2, weight3) = ReadWeights(reader, attrs["weights"].Format);
+            var (weight0, weight1, weight2, weight3) = ReadWeights(reader, attrs["weights"].Format, signedFormat4Weights);
             var (colorR, colorG, colorB, colorA) = ReadColor(reader, attrs["colors"].Format);
             var unknown1Value = ReadUnknown(reader, attrs["unknown1"].Format);
 
@@ -848,7 +861,7 @@ public static class D3DMeshParser
             reader.Seek(vertexStart + (int)bones.Offset);
             var (bone0, bone1, bone2, bone3) = ReadBones(reader, bones.Format);
             reader.Seek(vertexStart + (int)weights.Offset);
-            var (weight0, weight1, weight2, weight3) = ReadWeights(reader, weights.Format);
+            var (weight0, weight1, weight2, weight3) = ReadWeights(reader, weights.Format, signedFormat4: false);
             reader.Seek(vertexStart + (int)colors.Offset);
             var (colorR, colorG, colorB, colorA) = ReadColor(reader, colors.Format);
             reader.Seek(vertexStart + (int)unknown1.Offset);
@@ -1345,7 +1358,7 @@ public static class D3DMeshParser
         }
     }
 
-    private static (float Weight0, float Weight1, float Weight2, float Weight3) ReadWeights(DataReader reader, uint format)
+    private static (float Weight0, float Weight1, float Weight2, float Weight3) ReadWeights(DataReader reader, uint format, bool signedFormat4)
     {
         switch (format)
         {
@@ -1360,6 +1373,20 @@ public static class D3DMeshParser
                     return NormalizeWeights(w0, w1, w2, w3);
                 }
             case 4:
+                if (signedFormat4)
+                {
+                    return NormalizeWeights(
+                        reader.ReadInt16() / 32767f,
+                        reader.ReadInt16() / 32767f,
+                        reader.ReadInt16() / 32767f,
+                        reader.ReadInt16() / 32767f);
+                }
+
+                return NormalizeWeights(
+                    reader.ReadUInt16() / 65535f,
+                    reader.ReadUInt16() / 65535f,
+                    reader.ReadUInt16() / 65535f,
+                    reader.ReadUInt16() / 65535f);
             case 5:
                 return NormalizeWeights(
                     reader.ReadUInt16() / 65535f,

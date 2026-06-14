@@ -18,9 +18,12 @@ public sealed record AppPreferences
         WriteIndented = true,
     };
 
-    public static string PreferencesPath => Path.Combine(
+    public static string AppDataFolder => Path.Combine(
         Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
-        "TelltaleD3DMeshEditor",
+        "TelltaleD3DMeshEditor");
+
+    public static string PreferencesPath => Path.Combine(
+        AppDataFolder,
         "settings.json");
 
     public static AppPreferences Load()

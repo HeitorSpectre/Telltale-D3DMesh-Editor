@@ -80,6 +80,10 @@ public static class ReinsertCli
                 Require(args, 4);
                 RewriteTexture(args[1], args[2], args[3], args.Length > 4 && args[4] == "--uncompressed");
                 return;
+            case "--extract-asset":
+                Require(args, 3);
+                ExtractAsset(args[1], args[2], args.Length >= 4 ? args[3] : null);
+                return;
             case "--reinsert-prop":
                 Require(args, 4);
                 ReinsertProp(args[1], args[2], args[3], HasFlag(args, "--diffuse-atlas"));
@@ -94,7 +98,7 @@ public static class ReinsertCli
                 return;
             case "--reinsert-combined":
                 Require(args, 5);
-                ReinsertCombined(args[1], args[2], args[3], args[4]);
+                ReinsertCombined(args[1], args[2], args[3], args[4], HasFlag(args, "--diffuse-atlas"));
                 return;
             case "--dump-skeleton-rich":
                 Require(args, 2);
@@ -111,10 +115,11 @@ public static class ReinsertCli
                 Console.WriteLine("  --dump-skeleton-summary <folder> [--recursive]");
                 Console.WriteLine("  --dump-texture-formats <texture.d3dtx|texture.dds|folder> [--recursive]");
                 Console.WriteLine("  --rewrite-texture <template.d3dtx> <image.png> <output.d3dtx>");
+                Console.WriteLine("  --extract-asset <mesh.d3dmesh> <output.glb|output.gltf> [skeleton.skl]");
                 Console.WriteLine("  --reinsert-prop <template.d3dmesh> <model.glb|model.gltf> <output.d3dmesh> [--diffuse-atlas]");
                 Console.WriteLine("  --reinsert-character <template.d3dmesh> <template.skl> <model.glb|model.gltf> <output.d3dmesh> [--diffuse-atlas]");
                 Console.WriteLine("  --reinsert-character-texture-tests <template.d3dmesh> <template.skl> <model.glb|model.gltf> <output-folder>");
-                Console.WriteLine("  --reinsert-combined <input-root-folder> <group-name> <model.glb|model.gltf> <output-folder>");
+                Console.WriteLine("  --reinsert-combined <input-root-folder> <group-name> <model.glb|model.gltf> <output-folder> [--diffuse-atlas]");
                 return;
         }
     }
@@ -198,10 +203,12 @@ public static class ReinsertCli
         var mesh = D3DMeshParser.Parse(File.ReadAllBytes(input));
         Console.WriteLine($"file       : {Path.GetFileName(input)}");
         Console.WriteLine($"submeshes  : {mesh.Submeshes.Count}");
+        Console.WriteLine($"vertices   : {mesh.VertexCount}");
+        Console.WriteLine($"faces      : {mesh.FaceCount}");
         for (var i = 0; i < mesh.Submeshes.Count; i++)
         {
             var submesh = mesh.Submeshes[i];
-            Console.WriteLine($"  submesh {i}: {submesh.Name}");
+            Console.WriteLine($"  submesh {i}: {submesh.Name} ({submesh.Vertices.Count} verts, {submesh.Faces.Count} faces)");
             foreach (var pair in submesh.TextureNames.OrderBy(pair => pair.Key, StringComparer.OrdinalIgnoreCase))
             {
                 Console.WriteLine($"    {pair.Key,-15} {pair.Value}");
@@ -263,13 +270,12 @@ public static class ReinsertCli
     private static void DumpBonePalettes(string input, string? skeletonPath)
     {
         var data = File.ReadAllBytes(input);
-        var layout = D3DMeshLayout.Build(data);
         var mesh = D3DMeshParser.Parse(data);
         Dictionary<ulong, string>? namesByHash = null;
         Dictionary<ulong, Vector3>? positionsByHash = null;
         if (!string.IsNullOrWhiteSpace(skeletonPath) && File.Exists(skeletonPath))
         {
-            var skeleton = SkeletonLoader.Load(skeletonPath, layout.Version);
+            var skeleton = SkeletonLoader.Load(skeletonPath, mesh.Version);
             namesByHash = skeleton.Bones
                 .GroupBy(bone => bone.Hash)
                 .ToDictionary(group => group.Key, group => group.First().Name);
@@ -359,7 +365,15 @@ public static class ReinsertCli
             var version = 13;
             if (!string.IsNullOrWhiteSpace(meshPath) && File.Exists(meshPath))
             {
-                version = D3DMeshLayout.Build(File.ReadAllBytes(meshPath)).Version;
+                var meshData = File.ReadAllBytes(meshPath);
+                try
+                {
+                    version = D3DMeshLayout.Build(meshData).Version;
+                }
+                catch (NotSupportedException)
+                {
+                    version = D3DMeshParser.Parse(meshData).Version;
+                }
             }
 
             skeleton = SkeletonLoader.Load(input, version);
@@ -557,6 +571,40 @@ public static class ReinsertCli
             _ => "image/png",
         };
 
+    private static void ExtractAsset(string meshPath, string outputPath, string? skeletonPath)
+    {
+        GameConfig.Current = InferGameConfig(meshPath);
+        var fullMeshPath = Path.GetFullPath(meshPath);
+        var resolvedSkeletonPath = ResolveExtractSkeletonPath(fullMeshPath, skeletonPath);
+        var inputRoot = Path.GetDirectoryName(fullMeshPath) ?? ".";
+        var format = Path.GetExtension(outputPath).Equals(".gltf", StringComparison.OrdinalIgnoreCase)
+            ? UI.ExportFormat.GltfSeparate
+            : UI.ExportFormat.Glb;
+
+        var asset = UI.ModelAsset.FromPaths(fullMeshPath, resolvedSkeletonPath);
+        UI.ExtractionService.ExtractAssetToPath(asset, inputRoot, outputPath, format);
+
+        Console.WriteLine($"extracted   : {outputPath}");
+        Console.WriteLine($"template    : {Path.GetFileName(meshPath)}");
+        Console.WriteLine($"skeleton    : {(resolvedSkeletonPath is null ? "(none)" : Path.GetFileName(resolvedSkeletonPath))}");
+        Console.WriteLine($"game        : {GameConfig.Current.DisplayName}");
+        if (format == UI.ExportFormat.Glb)
+        {
+            DumpGlb(outputPath);
+        }
+    }
+
+    private static string? ResolveExtractSkeletonPath(string meshPath, string? skeletonPath)
+    {
+        if (!string.IsNullOrWhiteSpace(skeletonPath))
+        {
+            return Path.GetFullPath(skeletonPath);
+        }
+
+        var sameStem = Path.ChangeExtension(meshPath, ".skl");
+        return File.Exists(sameStem) ? sameStem : null;
+    }
+
     private static void ReinsertProp(string template, string glb, string output, bool useDiffuseAtlas)
     {
         Directory.CreateDirectory(Path.GetDirectoryName(Path.GetFullPath(output)) ?? ".");
@@ -573,7 +621,7 @@ public static class ReinsertCli
         {
             model = CharacterLineAtlasFix.InvertCharacterLineAlpha(model, gameConfig);
         }
-        var atlas = ApplyDiffuseAtlasIfRequested(model, useDiffuseAtlas, template);
+        var atlas = ApplyDiffuseAtlasIfRequested(model, useDiffuseAtlas, template, gameConfig);
         model = atlas.Model;
         var textureOptions = BuildReinsertTextureOptions(useDiffuseAtlas);
         var textures = ReinsertTextureService.WriteAllReferencedTextures(model, template, output, gameConfig, textureOptions);
@@ -618,7 +666,7 @@ public static class ReinsertCli
         {
             model = CharacterLineAtlasFix.InvertCharacterLineAlpha(model, gameConfig);
         }
-        var atlas = ApplyDiffuseAtlasIfRequested(model, useDiffuseAtlas, template);
+        var atlas = ApplyDiffuseAtlasIfRequested(model, useDiffuseAtlas, template, gameConfig);
         model = atlas.Model;
         var textureOptions = BuildReinsertTextureOptions(useDiffuseAtlas);
         var textures = ReinsertTextureService.WriteAllReferencedTextures(model, template, output, gameConfig, textureOptions);
@@ -681,17 +729,18 @@ public static class ReinsertCli
     // Name the atlas after existing template textures (the body/head diffuse + its normal) instead of the
     // generic "diffuse_atlas", so the atlas and its normal companion reuse real texture names the game already
     // references. Never a lines/detail map (ResolveAtlasTextureNames enforces it).
-    private static GltfDiffuseAtlasResult ApplyDiffuseAtlasIfRequested(GltfModel model, bool useDiffuseAtlas, string templateMeshPath)
+    private static GltfDiffuseAtlasResult ApplyDiffuseAtlasIfRequested(GltfModel model, bool useDiffuseAtlas, string templateMeshPath, GameConfig gameConfig)
         => useDiffuseAtlas
-            ? GltfDiffuseAtlasPacker.Pack(model, BuildAtlasOptions(templateMeshPath))
+            ? GltfDiffuseAtlasPacker.Pack(model, BuildAtlasOptions(templateMeshPath, gameConfig))
             : new GltfDiffuseAtlasResult(model, Applied: false, SourceTextureCount: 0, AtlasWidth: 0, AtlasHeight: 0, AtlasName: "", Warnings: []);
 
-    private static GltfDiffuseAtlasOptions BuildAtlasOptions(string templateMeshPath)
+    private static GltfDiffuseAtlasOptions BuildAtlasOptions(string templateMeshPath, GameConfig gameConfig)
     {
         var names = ReinsertTextureService.ResolveAtlasTextureNames(templateMeshPath);
+        var packSharedPartsTextures = true;
         return names is null
-            ? new GltfDiffuseAtlasOptions()
-            : new GltfDiffuseAtlasOptions(AtlasName: names.Diffuse, NormalAtlasName: names.Normal);
+            ? new GltfDiffuseAtlasOptions(PackSharedPartsTextures: packSharedPartsTextures)
+            : new GltfDiffuseAtlasOptions(AtlasName: names.Diffuse, NormalAtlasName: names.Normal, PackSharedPartsTextures: packSharedPartsTextures);
     }
 
     private static void PrintAtlasSummary(GltfDiffuseAtlasResult atlas)
@@ -1729,7 +1778,7 @@ public static class ReinsertCli
 
     // Runs the same combined-group reimport as the UI (part split, skeleton rebuild, companion
     // variant ports), so the full character-swap flow can be exercised and validated headlessly.
-    private static void ReinsertCombined(string inputRoot, string groupName, string glb, string outputFolder)
+    private static void ReinsertCombined(string inputRoot, string groupName, string glb, string outputFolder, bool useDiffuseAtlas)
     {
         GameConfig.Current = InferGameConfig(inputRoot);
         var assets = UI.ModelAsset.Discover(inputRoot);
@@ -1746,7 +1795,7 @@ public static class ReinsertCli
             model,
             glb,
             outputFolder,
-            useDiffuseAtlas: false,
+            useDiffuseAtlas,
             uncompressedTextures: false);
         Console.WriteLine($"game        : {GameConfig.Current.DisplayName}");
         Console.WriteLine(result);
@@ -1775,8 +1824,48 @@ public static class ReinsertCli
             return GameConfig.MinecraftStoryMode;
         }
 
+        if (text.Contains("BTTF", StringComparison.OrdinalIgnoreCase) ||
+            text.Contains("Back to the Future", StringComparison.OrdinalIgnoreCase) ||
+            text.Contains("BackToTheFuture", StringComparison.OrdinalIgnoreCase))
+        {
+            return InferBackToTheFutureConfig(text);
+        }
+
         return GameConfig.Current;
     }
+
+    private static GameConfig InferBackToTheFutureConfig(string text)
+    {
+        if (ContainsEpisodeMarker(text, 1, "101"))
+        {
+            return GameConfig.BackToTheFutureEpisode1;
+        }
+        if (ContainsEpisodeMarker(text, 2, "102"))
+        {
+            return GameConfig.BackToTheFutureEpisode2;
+        }
+        if (ContainsEpisodeMarker(text, 3, "103"))
+        {
+            return GameConfig.BackToTheFutureEpisode3;
+        }
+        if (ContainsEpisodeMarker(text, 4, "104"))
+        {
+            return GameConfig.BackToTheFutureEpisode4;
+        }
+        if (ContainsEpisodeMarker(text, 5, "105"))
+        {
+            return GameConfig.BackToTheFutureEpisode5;
+        }
+
+        return GameConfig.BackToTheFuture;
+    }
+
+    private static bool ContainsEpisodeMarker(string text, int episode, string archiveId)
+        => text.Contains($"Ep{episode}", StringComparison.OrdinalIgnoreCase) ||
+           text.Contains($"Episode {episode}", StringComparison.OrdinalIgnoreCase) ||
+           text.Contains($"Episode{episode}", StringComparison.OrdinalIgnoreCase) ||
+           text.Contains($"BTTF{archiveId}", StringComparison.OrdinalIgnoreCase) ||
+           text.Contains($"BackToTheFuture{archiveId}", StringComparison.OrdinalIgnoreCase);
 
     private static (float MinX, float MinY, float MinZ, float MaxX, float MaxY, float MaxZ) GetBounds(GltfModel model)
     {

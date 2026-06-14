@@ -220,10 +220,18 @@ internal static class AssetGltfBuilder
                 if (textureIndexByName.TryGetValue(renderDiffuseName, out var texIndex))
                 {
                     pbr["baseColorTexture"] = new Dictionary<string, object> { ["index"] = texIndex };
-                    if (lowAlphaByName.TryGetValue(diffuseName, out var low) && low)
+                    var isBttfBlendAlpha = IsBackToTheFutureBlendAlphaMaterial(submesh, materialName, diffuseName);
+                    if ((lowAlphaByName.TryGetValue(diffuseName, out var low) && low) || isBttfBlendAlpha)
                     {
-                        materialDict["alphaMode"] = "MASK";
-                        materialDict["alphaCutoff"] = 0.5f;
+                        if (isBttfBlendAlpha)
+                        {
+                            materialDict["alphaMode"] = "BLEND";
+                        }
+                        else
+                        {
+                            materialDict["alphaMode"] = "MASK";
+                            materialDict["alphaCutoff"] = 0.5f;
+                        }
                         materialDict["doubleSided"] = true;
                     }
                 }
@@ -560,6 +568,50 @@ internal static class AssetGltfBuilder
             .OrderBy(pair => pair.Key, StringComparer.OrdinalIgnoreCase)
             .Select(pair => $"{pair.Key}={pair.Value}");
         return materialName + "|" + string.Join("|", slots);
+    }
+
+    private static bool IsBackToTheFutureBlendAlphaMaterial(SubmeshData submesh, string materialName, string diffuseName)
+    {
+        if (!GameConfig.Current.IsBackToTheFuture)
+        {
+            return false;
+        }
+
+        var names = submesh.TextureNames.Values
+            .Append(materialName)
+            .Append(diffuseName)
+            .Append(submesh.Name)
+            .Select(NormalizeTextureStem)
+            .Where(name => !string.IsNullOrWhiteSpace(name))
+            .ToList();
+        return names.Any(IsBackToTheFutureGlassName);
+    }
+
+    private static bool IsBackToTheFutureGlassName(string name)
+    {
+        if (name.Contains("glass", StringComparison.OrdinalIgnoreCase))
+        {
+            return true;
+        }
+
+        return name.Contains("window", StringComparison.OrdinalIgnoreCase) &&
+               !name.Contains("windowframe", StringComparison.OrdinalIgnoreCase) &&
+               !name.Contains("windowtrim", StringComparison.OrdinalIgnoreCase) &&
+               !name.Contains("window_frame", StringComparison.OrdinalIgnoreCase) &&
+               !name.Contains("window_trim", StringComparison.OrdinalIgnoreCase);
+    }
+
+    private static string NormalizeTextureStem(string value)
+    {
+        var stem = Path.GetFileNameWithoutExtension(value);
+        while (stem.EndsWith(".d3dtx", StringComparison.OrdinalIgnoreCase) ||
+               stem.EndsWith(".dds", StringComparison.OrdinalIgnoreCase) ||
+               stem.EndsWith(".png", StringComparison.OrdinalIgnoreCase))
+        {
+            stem = Path.GetFileNameWithoutExtension(stem);
+        }
+
+        return stem;
     }
 
     private static byte[] BuildTangents(SubmeshData submesh)

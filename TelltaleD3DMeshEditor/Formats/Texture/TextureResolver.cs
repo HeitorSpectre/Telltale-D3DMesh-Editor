@@ -53,6 +53,8 @@ public static class TextureResolver
             };
 
             ApplyCompanionAlpha(set, diffuse, textureFiles, loaded, diffuseReferences);
+            ApplyBackToTheFutureDiffuseAlpha(set, diffuse, mesh.Submeshes[i]);
+            ApplyBackToTheFutureGlassAlpha(set, mesh.Submeshes[i]);
 
             if (set.Count > 0)
             {
@@ -183,9 +185,101 @@ public static class TextureResolver
         }
         catch
         {
+            if (TryCreateSolidColorTexture(path, out texture))
+            {
+                return true;
+            }
+
             texture = null!;
             return false;
         }
+    }
+
+    private static bool TryCreateSolidColorTexture(string path, out TextureImage texture)
+    {
+        texture = null!;
+        var stem = NormalizeStem(Path.GetFileNameWithoutExtension(path));
+        if (!stem.StartsWith("color_", StringComparison.OrdinalIgnoreCase) ||
+            stem.Length < "color_".Length + 6)
+        {
+            return false;
+        }
+
+        var hex = stem["color_".Length..];
+        if (hex.Length > 6)
+        {
+            hex = hex[..6];
+        }
+
+        if (!int.TryParse(hex, System.Globalization.NumberStyles.HexNumber, null, out var rgb))
+        {
+            return false;
+        }
+
+        texture = new TextureImage(1, 1, [unchecked((int)(0xFF000000u | (uint)rgb))], path);
+        return true;
+    }
+
+    private static void ApplyBackToTheFutureDiffuseAlpha(
+        MaterialTextureSet set,
+        TextureCandidate? diffuse,
+        SubmeshData submesh)
+    {
+        if (!GameConfig.Current.IsBackToTheFuture || set.Diffuse is null || set.Diffuse.AverageAlpha < 0.99f)
+        {
+            return;
+        }
+
+        var names = submesh.TextureNames.Values
+            .Append(submesh.MaterialName ?? "")
+            .Append(submesh.Name)
+            .Append(diffuse is null ? "" : Path.GetFileNameWithoutExtension(diffuse.Value.Path))
+            .Select(NormalizeStem);
+        if (!names.Any(IsAlphaMaskDiffuseName))
+        {
+            return;
+        }
+
+        set.Diffuse = AlphaFromIntensity(set.Diffuse);
+    }
+
+    private static TextureImage AlphaFromIntensity(TextureImage source)
+    {
+        var pixels = new int[source.Pixels.Length];
+        for (var i = 0; i < source.Pixels.Length; i++)
+        {
+            var argb = source.Pixels[i];
+            var r = (argb >> 16) & 0xFF;
+            var g = (argb >> 8) & 0xFF;
+            var b = argb & 0xFF;
+            var intensity = Math.Max(r, Math.Max(g, b));
+            var alpha = Math.Clamp((int)MathF.Round((intensity - 8) * 4.2f), 0, 255);
+            pixels[i] = (argb & 0x00FFFFFF) | (alpha << 24);
+        }
+
+        return new TextureImage(source.Width, source.Height, pixels, source.SourcePath);
+    }
+
+    private static TextureImage WithUniformAlpha(TextureImage source, float alpha)
+    {
+        var byteAlpha = Math.Clamp((int)MathF.Round(alpha * 255f), 0, 255);
+        var pixels = new int[source.Pixels.Length];
+        for (var i = 0; i < source.Pixels.Length; i++)
+        {
+            var originalAlpha = (source.Pixels[i] >> 24) & 0xFF;
+            var finalAlpha = Math.Min(originalAlpha, byteAlpha);
+            pixels[i] = (source.Pixels[i] & 0x00FFFFFF) | (finalAlpha << 24);
+        }
+
+        return new TextureImage(source.Width, source.Height, pixels, source.SourcePath);
+    }
+
+    private static bool IsAlphaMaskDiffuseName(string name)
+    {
+        return name.EndsWith("_alpha", StringComparison.OrdinalIgnoreCase) ||
+               name.EndsWith("_alp", StringComparison.OrdinalIgnoreCase) ||
+               name.Contains("_alpha_", StringComparison.OrdinalIgnoreCase) ||
+               name.Contains("_alp_", StringComparison.OrdinalIgnoreCase);
     }
 
     private static IEnumerable<string> EnumerateTextureFiles(string inputRoot, string meshPath)
@@ -231,6 +325,13 @@ public static class TextureResolver
             if (submesh.TextureNames.TryGetValue(slot, out var name) &&
                 TryFindExactTexture(name, allFiles, out var exact))
             {
+                if (role == TextureRole.Diffuse &&
+                    exact.Role == TextureRole.Normal &&
+                    TryFindDiffuseSiblingForNormal(exact, allFiles, out var diffuseSibling))
+                {
+                    return diffuseSibling;
+                }
+
                 return exact;
             }
         }
@@ -277,6 +378,116 @@ public static class TextureResolver
         }
 
         return null;
+    }
+
+    private static bool TryFindDiffuseSiblingForNormal(
+        TextureCandidate normal,
+        IReadOnlyList<TextureCandidate> files,
+        out TextureCandidate diffuse)
+    {
+        diffuse = default;
+        var stem = NormalizeStem(Path.GetFileNameWithoutExtension(normal.Path));
+        string[] suffixes = ["_nm", "_nrm", "_normal"];
+        foreach (var suffix in suffixes)
+        {
+            if (!stem.EndsWith(suffix, StringComparison.OrdinalIgnoreCase))
+            {
+                continue;
+            }
+
+            var baseStem = stem[..^suffix.Length];
+            foreach (var file in files)
+            {
+                if (file.Role != TextureRole.Diffuse)
+                {
+                    continue;
+                }
+
+                var candidateStem = NormalizeStem(Path.GetFileNameWithoutExtension(file.Path));
+                if (candidateStem.Equals(baseStem, StringComparison.OrdinalIgnoreCase))
+                {
+                    diffuse = file;
+                    return true;
+                }
+            }
+        }
+
+        return false;
+    }
+
+    private static void ApplyBackToTheFutureGlassAlpha(MaterialTextureSet set, SubmeshData submesh)
+    {
+        if (!GameConfig.Current.IsBackToTheFuture || set.Diffuse is null)
+        {
+            return;
+        }
+
+        var names = submesh.TextureNames.Values
+            .Append(submesh.MaterialName ?? "")
+            .Append(submesh.Name)
+            .Select(NormalizeStem)
+            .Where(name => !string.IsNullOrWhiteSpace(name))
+            .ToList();
+        var hasGlassName = names.Any(IsGlassLikeName);
+
+        if (hasGlassName)
+        {
+            set.Diffuse = WithGlassPixelAlpha(set.Diffuse, 0.68f);
+        }
+    }
+
+    private static TextureImage WithGlassPixelAlpha(TextureImage source, float glassAlpha)
+    {
+        var byteAlpha = Math.Clamp((int)MathF.Round(glassAlpha * 255f), 0, 255);
+        var pixels = new int[source.Pixels.Length];
+        for (var i = 0; i < source.Pixels.Length; i++)
+        {
+            var argb = source.Pixels[i];
+            var originalAlpha = (argb >> 24) & 0xFF;
+            var finalAlpha = IsLikelyGlassPixel(argb)
+                ? Math.Min(originalAlpha, byteAlpha)
+                : originalAlpha;
+            pixels[i] = (argb & 0x00FFFFFF) | (finalAlpha << 24);
+        }
+
+        return new TextureImage(source.Width, source.Height, pixels, source.SourcePath);
+    }
+
+    private static bool IsLikelyGlassPixel(int argb)
+    {
+        var r = (argb >> 16) & 0xFF;
+        var g = (argb >> 8) & 0xFF;
+        var b = argb & 0xFF;
+        var max = Math.Max(r, Math.Max(g, b));
+        var min = Math.Min(r, Math.Min(g, b));
+        if (max < 42)
+        {
+            return false;
+        }
+
+        var coolBlueGlass = b >= r + 8 && g >= r - 5;
+        var paleNeutralGlass = max > 92 && max - min < 72 && b >= r - 14 && g >= r - 18;
+        if (coolBlueGlass || paleNeutralGlass)
+        {
+            return true;
+        }
+
+        var warmWoodOrStone = r > b + 12 && g >= b - 6;
+        return !warmWoodOrStone && b >= r - 6 && g >= r - 10 && max > 55;
+    }
+
+    private static bool IsGlassLikeName(string name)
+    {
+        if (name.Contains("glass", StringComparison.OrdinalIgnoreCase))
+        {
+            return true;
+        }
+
+        return name.Contains("window", StringComparison.OrdinalIgnoreCase) &&
+               !name.Contains("windowframe", StringComparison.OrdinalIgnoreCase) &&
+               !name.Contains("windowtrim", StringComparison.OrdinalIgnoreCase) &&
+               !name.Contains("window_frame", StringComparison.OrdinalIgnoreCase) &&
+               !name.Contains("window_trim", StringComparison.OrdinalIgnoreCase);
     }
 
     private static bool TryFindExactTexture(string value, IReadOnlyList<TextureCandidate> files, out TextureCandidate candidate)

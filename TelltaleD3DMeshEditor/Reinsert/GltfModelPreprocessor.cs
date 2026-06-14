@@ -10,10 +10,13 @@ public static class GltfModelPreprocessor
         "color_000",
     };
 
-    public static GltfModel ApplyGameReinsertRules(GltfModel model, GameConfig? gameConfig)
+    public static GltfModel ApplyGameReinsertRules(
+        GltfModel model,
+        GameConfig? gameConfig,
+        bool preserveEyeHelperPrimitives = false)
     {
         gameConfig ??= GameConfig.Current;
-        if (!gameConfig.RemoveEyeHelperPrimitivesOnReimport)
+        if (!gameConfig.RemoveEyeHelperPrimitivesOnReimport || preserveEyeHelperPrimitives)
         {
             return model;
         }

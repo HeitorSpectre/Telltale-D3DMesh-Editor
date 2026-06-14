@@ -29,6 +29,11 @@ public static class D3dtxWriter
 
     private static byte[] BuildFromTemplate(byte[] template, int[] pixels, int width, int height, string textureFileName, bool forceUncompressed = false)
     {
+        if (template.Length >= 4 && Encoding.ASCII.GetString(template, 0, 4) == "ERTM")
+        {
+            return BuildLegacyErtmFromTemplate(template, pixels, width, height);
+        }
+
         var tex = TtgTexture.Parse(template);
         var hasAlpha = HasMeaningfulAlpha(pixels);
         // When uncompressed output is requested, keep an already-uncompressed template format as-is
@@ -64,6 +69,84 @@ public static class D3dtxWriter
         tex.Mips = BuildTtgMipRecords(tex, mipPayloads);
 
         return tex.Write();
+    }
+
+    private static byte[] BuildLegacyErtmFromTemplate(byte[] template, int[] pixels, int width, int height)
+    {
+        var info = ReadLegacyErtmTextureInfo(template);
+        var format = info.Format == Dxt5Format || HasMeaningfulAlpha(pixels)
+            ? Dxt5Format
+            : Dxt1Format;
+        var mipCount = Math.Min(CountTtgMips(width, height, format), Math.Max(1, info.MipCount));
+        var mipPayloads = BuildMipPayloads(pixels, width, height, mipCount, format);
+        var payloadLength = mipPayloads.Sum(mip => mip.Length);
+        var result = new byte[info.PixelStart + payloadLength];
+        Buffer.BlockCopy(template, 0, result, 0, Math.Min(template.Length, info.PixelStart));
+
+        BinaryPrimitives.WriteUInt32LittleEndian(result.AsSpan(info.DxtOffset - 4, 4), checked((uint)mipPayloads.Count));
+        var fourCc = format == Dxt5Format ? "DXT5" : "DXT1";
+        Encoding.ASCII.GetBytes(fourCc, result.AsSpan(info.DxtOffset, 4));
+        BinaryPrimitives.WriteInt32LittleEndian(result.AsSpan(info.DxtOffset + 4, 4), width);
+        BinaryPrimitives.WriteInt32LittleEndian(result.AsSpan(info.DxtOffset + 8, 4), height);
+
+        var cursor = info.PixelStart;
+        foreach (var mip in mipPayloads)
+        {
+            Buffer.BlockCopy(mip, 0, result, cursor, mip.Length);
+            cursor += mip.Length;
+        }
+
+        return result;
+    }
+
+    private static LegacyErtmTextureInfo ReadLegacyErtmTextureInfo(byte[] data)
+    {
+        var dxtOffset = IndexOf(data, "DXT1");
+        var format = Dxt1Format;
+        var blockBytes = 8;
+        var dxt3Offset = IndexOf(data, "DXT3");
+        var dxt5Offset = IndexOf(data, "DXT5");
+        if (dxtOffset < 0 || (dxt3Offset >= 0 && dxt3Offset < dxtOffset))
+        {
+            dxtOffset = dxt3Offset;
+            format = Dxt5Format;
+            blockBytes = 16;
+        }
+
+        if (dxtOffset < 0 || (dxt5Offset >= 0 && dxt5Offset < dxtOffset))
+        {
+            dxtOffset = dxt5Offset;
+            format = Dxt5Format;
+            blockBytes = 16;
+        }
+
+        if (dxtOffset < 4)
+        {
+            throw new NotSupportedException("Legacy ERTM D3DTX texture does not contain a supported DXT payload.");
+        }
+
+        var mipCount = checked((int)BinaryPrimitives.ReadUInt32LittleEndian(data.AsSpan(dxtOffset - 4, 4)));
+        var texWidth = BinaryPrimitives.ReadInt32LittleEndian(data.AsSpan(dxtOffset + 4, 4));
+        var texHeight = BinaryPrimitives.ReadInt32LittleEndian(data.AsSpan(dxtOffset + 8, 4));
+        if (texWidth <= 0 || texHeight <= 0 || texWidth > 8192 || texHeight > 8192 || mipCount <= 0 || mipCount > 32)
+        {
+            throw new InvalidDataException($"Invalid legacy D3DTX dimensions or mip count: {texWidth}x{texHeight}, mips={mipCount}.");
+        }
+
+        var pixelLength = LegacyMipChainSize(texWidth, texHeight, blockBytes, mipCount);
+        if (pixelLength > data.Length || data.Length - pixelLength < dxtOffset)
+        {
+            pixelLength = MipSizeOf(texWidth, texHeight, blockBytes);
+            mipCount = 1;
+        }
+
+        var pixelStart = data.Length - pixelLength;
+        if (pixelStart < 0 || pixelStart >= data.Length)
+        {
+            throw new InvalidDataException("Legacy D3DTX pixel payload is outside the file.");
+        }
+
+        return new LegacyErtmTextureInfo(dxtOffset, pixelStart, mipCount, format);
     }
 
     private static List<byte[]> BuildMipPayloads(int[] pixels, int width, int height, int mipCount, uint format)
@@ -489,6 +572,48 @@ public static class D3dtxWriter
 
     private static int MipSizeOf(int width, int height, int blockBytes) =>
         Math.Max(1, (width + 3) / 4) * Math.Max(1, (height + 3) / 4) * blockBytes;
+
+    private static int LegacyMipChainSize(int width, int height, int blockBytes, int mipCount)
+    {
+        var total = 0;
+        for (var mip = 0; mip < mipCount; mip++)
+        {
+            total = checked(total + MipSizeOf(width, height, blockBytes));
+            if (width == 1 && height == 1)
+            {
+                break;
+            }
+
+            width = Math.Max(1, width / 2);
+            height = Math.Max(1, height / 2);
+        }
+
+        return total;
+    }
+
+    private static int IndexOf(byte[] data, string value)
+    {
+        var needle = Encoding.ASCII.GetBytes(value);
+        for (var i = 0; i <= data.Length - needle.Length; i++)
+        {
+            var match = true;
+            for (var j = 0; j < needle.Length; j++)
+            {
+                if (data[i + j] != needle[j])
+                {
+                    match = false;
+                    break;
+                }
+            }
+
+            if (match)
+            {
+                return i;
+            }
+        }
+
+        return -1;
+    }
 
     private static bool IsBlockCompressedFormat(uint format)
         => format is Dxt1Format or Dxt5Format or 0x41 or 0x43 or 0x44 or 0x45 or 0x46 or 0x47;
@@ -954,4 +1079,6 @@ public static class D3dtxWriter
         public int BlockSize { get; set; }
         public byte[] Block { get; set; } = [];
     }
+
+    private readonly record struct LegacyErtmTextureInfo(int DxtOffset, int PixelStart, int MipCount, uint Format);
 }

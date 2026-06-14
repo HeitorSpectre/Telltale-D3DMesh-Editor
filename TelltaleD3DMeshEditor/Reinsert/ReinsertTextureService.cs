@@ -171,11 +171,6 @@ public static class ReinsertTextureService
                 }
 
                 var semanticSlotName = ResolveSemanticTemplateName(primitive, image.Name, normalizedSlot, semanticTemplateNames, gameConfig);
-                if (ShouldSkipUnmappedSecondaryTexture(gameConfig, nameMode, normalizedSlot, semanticSlotName))
-                {
-                    continue;
-                }
-
                 if (TryResolveGameProvidedTextureName(templateMeshPath, semanticSlotName ?? image.Name, out var slotGameProvidedName))
                 {
                     CopyGameProvidedTextureIfAvailable(templateMeshPath, outputFolder, slotGameProvidedName, writtenNames);
@@ -234,6 +229,11 @@ public static class ReinsertTextureService
                     out var bodySkinHeadLineTextureName))
                 {
                     slots[normalizedSlot] = bodySkinHeadLineTextureName;
+                    continue;
+                }
+
+                if (ShouldSkipUnmappedSecondaryTexture(gameConfig, nameMode, normalizedSlot, semanticSlotName))
+                {
                     continue;
                 }
 
@@ -342,8 +342,9 @@ public static class ReinsertTextureService
             return;
         }
 
-        slots[slot] = bumpName;
-        if (writtenNames.Contains(bumpName, StringComparer.OrdinalIgnoreCase))
+        var normalizedBumpName = StripKnownTextureExtension(Path.GetFileName(bumpName));
+        slots[slot] = normalizedBumpName;
+        if (writtenNames.Contains(normalizedBumpName, StringComparer.OrdinalIgnoreCase))
         {
             return;
         }
@@ -354,13 +355,13 @@ public static class ReinsertTextureService
             return;
         }
 
-        var outputTexturePath = Path.Combine(outputFolder, bumpName + ".d3dtx");
+        var outputTexturePath = Path.Combine(outputFolder, normalizedBumpName + ".d3dtx");
         if (!Path.GetFullPath(sourceTexturePath).Equals(Path.GetFullPath(outputTexturePath), StringComparison.OrdinalIgnoreCase))
         {
             D3dtxWriter.WriteRenamedCopy(File.ReadAllBytes(sourceTexturePath), outputTexturePath);
         }
 
-        writtenNames.Add(bumpName);
+        writtenNames.Add(normalizedBumpName);
     }
 
     private static void RecoverTemplateGradientSlot(
@@ -612,7 +613,7 @@ public static class ReinsertTextureService
             return false;
         }
 
-        return gameConfig?.Id != GameId.WolfAmongUs;
+        return true;
     }
 
     private static bool IsSourceBodyPrimitive(GltfPrimitive primitive)
@@ -818,6 +819,7 @@ public static class ReinsertTextureService
                     preserveTemplateName: true);
                 var outputTexturePath = Path.Combine(outputFolder, textureName + ".d3dtx");
                 WriteTexturePreservingTemplate(fallbackTemplateBytes, primitive.BaseColor, sourceTexturePath, outputTexturePath, sourceImageMatches);
+
                 written[imageKey] = textureName;
             }
 
@@ -827,12 +829,9 @@ public static class ReinsertTextureService
         return result;
     }
 
-    // Resolves the names the packed atlas should reuse so its .d3dtx carries a real texture name the game
-    // already references — never a lines/detail map. The diffuse name is an existing diffuse map (body first,
-    // then head, …). The normal name is ANY existing normal map (_nm) in the template, picked independently of
-    // the diffuse — a mismatched surface is fine. When the template has no normal map at all, Normal is left
-    // null so the caller adds one ("<diffuse>_nm"). Returns null when the template exposes no usable diffuse,
-    // letting the caller keep its own default name.
+    // Resolves the diffuse name the packed atlas should reuse so its .d3dtx carries a real texture name the
+    // game already references - never a lines/detail map. The normal atlas uses a compatible original
+    // normal-map name from the same texture family when one exists, otherwise it falls back to "<diffuse>_nm".
     public static AtlasTextureNames? ResolveAtlasTextureNames(string templateMeshPath)
     {
         MeshData? templateMesh;
@@ -847,9 +846,6 @@ public static class ReinsertTextureService
 
         string? bestDiffuse = null;
         var bestDiffusePriority = int.MaxValue;
-        string? bestNormal = null;
-        var bestNormalPriority = int.MaxValue;
-
         foreach (var submesh in templateMesh?.Submeshes ?? [])
         {
             var diffuse = UsableSlotTextureName(submesh, "diffuse", requireNormalMap: false);
@@ -860,17 +856,6 @@ public static class ReinsertTextureService
                 {
                     bestDiffuse = diffuse;
                     bestDiffusePriority = diffusePriority;
-                }
-            }
-
-            var normal = UsableSlotTextureName(submesh, "bump", requireNormalMap: true);
-            if (normal is not null)
-            {
-                var normalPriority = OriginalReplacementTexturePriority(normal);
-                if (normalPriority < bestNormalPriority)
-                {
-                    bestNormal = normal;
-                    bestNormalPriority = normalPriority;
                 }
             }
         }
@@ -891,7 +876,79 @@ public static class ReinsertTextureService
 
         return new AtlasTextureNames(
             SanitizeName(bestDiffuse),
-            bestNormal is null ? null : SanitizeName(bestNormal));
+            ResolveCompatibleAtlasNormalName(templateMesh, bestDiffuse));
+    }
+
+    private static string? ResolveCompatibleAtlasNormalName(MeshData? templateMesh, string atlasDiffuseName)
+    {
+        if (templateMesh is null)
+        {
+            return null;
+        }
+
+        var atlasDiffuseStem = StripKnownTextureExtension(Path.GetFileName(atlasDiffuseName));
+        var atlasFamily = TextureFamilyKey(atlasDiffuseStem);
+        string? bestNormal = null;
+        var bestPriority = int.MaxValue;
+
+        foreach (var submesh in templateMesh.Submeshes)
+        {
+            var normal = UsableSlotTextureName(submesh, "bump", requireNormalMap: true);
+            if (normal is null)
+            {
+                continue;
+            }
+
+            var normalBase = StripNormalSuffix(normal);
+            if (normalBase.Equals(atlasDiffuseStem, StringComparison.OrdinalIgnoreCase))
+            {
+                return SanitizeName(normal);
+            }
+
+            if (string.IsNullOrWhiteSpace(atlasFamily) ||
+                !TextureFamilyKey(normalBase).Equals(atlasFamily, StringComparison.OrdinalIgnoreCase))
+            {
+                continue;
+            }
+
+            var priority = OriginalReplacementTexturePriority(normalBase);
+            if (priority < bestPriority)
+            {
+                bestNormal = normal;
+                bestPriority = priority;
+            }
+        }
+
+        return bestNormal is null ? null : SanitizeName(bestNormal);
+    }
+
+    private static string StripNormalSuffix(string textureName)
+    {
+        var stem = StripKnownTextureExtension(Path.GetFileName(textureName));
+        return stem.EndsWith("_nm", StringComparison.OrdinalIgnoreCase)
+            ? stem[..^3]
+            : stem.EndsWith("_normal", StringComparison.OrdinalIgnoreCase)
+                ? stem[..^7]
+                : stem;
+    }
+
+    private static string TextureFamilyKey(string textureName)
+    {
+        var stem = StripKnownTextureExtension(Path.GetFileName(textureName)).ToLowerInvariant();
+        foreach (var suffix in new[]
+                 {
+                     "_hair_alpha", "_eyelashesmale", "_eyelashes", "_eyebrown",
+                     "_haircap", "_alphahair", "_detail", "_body", "_head",
+                     "_hands", "_hand", "_hair", "_mouth", "_eye"
+                 })
+        {
+            if (stem.EndsWith(suffix, StringComparison.Ordinal))
+            {
+                return stem[..^suffix.Length];
+            }
+        }
+
+        return stem;
     }
 
     // A submesh's texture name for a slot, only when it is a real, reusable name and not a lines/detail map.
@@ -1024,6 +1081,16 @@ public static class ReinsertTextureService
             ? File.ReadAllBytes(sourceTexturePath)
             : fallbackTemplateBytes;
         D3dtxWriter.WriteFromImageBytes(templateBytes, image, outputTexturePath, forceUncompressed);
+    }
+
+    private static void CopyTextureVerbatim(string sourceTexturePath, string outputTexturePath)
+    {
+        if (Path.GetFullPath(sourceTexturePath).Equals(Path.GetFullPath(outputTexturePath), StringComparison.OrdinalIgnoreCase))
+        {
+            return;
+        }
+
+        D3dtxWriter.WriteRenamedCopy(File.ReadAllBytes(sourceTexturePath), outputTexturePath);
     }
 
     private static string ChooseOutputTextureName(
@@ -1234,9 +1301,28 @@ public static class ReinsertTextureService
             return null;
         }
 
-        return semanticTemplateNames.TryGetValue(SemanticKey(semantic, slot), out var templateName)
-            ? templateName
-            : null;
+        if (semanticTemplateNames.TryGetValue(SemanticKey(semantic, slot), out var templateName))
+        {
+            return templateName;
+        }
+
+        foreach (var fallbackSemantic in FallbackSemantics(semantic))
+        {
+            if (semanticTemplateNames.TryGetValue(SemanticKey(fallbackSemantic, slot), out templateName))
+            {
+                return templateName;
+            }
+        }
+
+        return null;
+    }
+
+    private static IEnumerable<string> FallbackSemantics(string semantic)
+    {
+        if (semantic.Equals("teeth", StringComparison.OrdinalIgnoreCase))
+        {
+            yield return "mouth";
+        }
     }
 
     private static string? ResolvePrimitiveSemantic(GltfPrimitive primitive, GameConfig? gameConfig)
@@ -1264,6 +1350,11 @@ public static class ReinsertTextureService
     private static string? ClassifySemantic(string text, bool template, GameConfig? gameConfig)
     {
         var lower = text.ToLowerInvariant();
+        if (lower.Contains("eyelash") || lower.Contains("eyelashes"))
+        {
+            return "eyelashes";
+        }
+
         if (lower.Contains("eye"))
         {
             return "eye";
@@ -1274,9 +1365,19 @@ public static class ReinsertTextureService
             return "mouth";
         }
 
+        if (lower.Contains("teeth") || lower.Contains("tooth"))
+        {
+            return "teeth";
+        }
+
         if (lower.Contains("alphahair") || lower.Contains("hair"))
         {
             return "hair";
+        }
+
+        if (lower.Contains("face"))
+        {
+            return "face";
         }
 
         if (gameConfig?.Id == GameId.WolfAmongUs && lower.Contains("hand"))
