@@ -160,6 +160,11 @@ public static class TextureLoader
         }
 
         var data = File.ReadAllBytes(path);
+        if (IsLegacyErtm(data))
+        {
+            return LoadLegacyErtmD3dtx(data, path);
+        }
+
         var info = ReadD3dtxInfo(data);
         // 0x10 = A8 (1 byte/pixel, uncompressed); the others are block-compressed (DXT).
         var mip0Size = info.Format == 0x10
@@ -192,6 +197,11 @@ public static class TextureLoader
         }
 
         var data = File.ReadAllBytes(path);
+        if (IsLegacyErtm(data))
+        {
+            return InspectLegacyErtmD3dtx(data);
+        }
+
         var info = ReadD3dtxInfo(data);
         return new TextureFormatInfo(
             "D3DTX",
@@ -293,6 +303,85 @@ public static class TextureLoader
         {
             return null;
         }
+    }
+
+    private static TextureImage LoadLegacyErtmD3dtx(byte[] data, string path)
+    {
+        var info = ReadLegacyErtmD3dtxInfo(data);
+        var pixels = info.Format switch
+        {
+            0x40 => DecodeDxt1(data, info.PixelStart, info.Width, info.Height),
+            0x41 => DecodeDxt3(data, info.PixelStart, info.Width, info.Height),
+            0x42 => DecodeDxt5(data, info.PixelStart, info.Width, info.Height),
+            _ => throw new NotSupportedException($"Unsupported legacy D3DTX texture format 0x{info.Format:X}."),
+        };
+
+        return new TextureImage(info.Width, info.Height, pixels, path);
+    }
+
+    private static TextureFormatInfo InspectLegacyErtmD3dtx(byte[] data)
+    {
+        var info = ReadLegacyErtmD3dtxInfo(data);
+        return new TextureFormatInfo(
+            "D3DTX",
+            D3dtxFormatName(info.Format),
+            info.Format,
+            "Unknown",
+            info.Width,
+            info.Height,
+            1,
+            [new TextureRegionInfo(0, 0, info.MipCount, info.PixelLength, 0, info.PixelLength, info.Width, info.Height)]);
+    }
+
+    private static D3dtxInfo ReadLegacyErtmD3dtxInfo(byte[] data)
+    {
+        var dxtOffset = IndexOf(data, "DXT1");
+        var format = 0x40u;
+        var blockBytes = 8;
+        var dxt3Offset = IndexOf(data, "DXT3");
+        var dxt5Offset = IndexOf(data, "DXT5");
+        if (dxtOffset < 0 || (dxt3Offset >= 0 && dxt3Offset < dxtOffset))
+        {
+            dxtOffset = dxt3Offset;
+            format = 0x41;
+            blockBytes = 16;
+        }
+
+        if (dxtOffset < 0 || (dxt5Offset >= 0 && dxt5Offset < dxtOffset))
+        {
+            dxtOffset = dxt5Offset;
+            format = 0x42;
+            blockBytes = 16;
+        }
+
+        if (dxtOffset < 4)
+        {
+            throw new NotSupportedException("Legacy ERTM D3DTX texture does not contain a supported DXT payload.");
+        }
+
+        var mipCount = checked((int)ReadUInt(data, dxtOffset - 4));
+        var width = ReadInt(data, dxtOffset + 4);
+        var height = ReadInt(data, dxtOffset + 8);
+        if (width <= 0 || height <= 0 || width > 8192 || height > 8192 || mipCount <= 0 || mipCount > 32)
+        {
+            throw new InvalidDataException($"Invalid legacy D3DTX dimensions or mip count: {width}x{height}, mips={mipCount}.");
+        }
+
+        var baseMipLength = MipSizeOf(width, height, blockBytes);
+        var pixelLength = LegacyMipChainSize(width, height, blockBytes, mipCount);
+        if (pixelLength > data.Length || data.Length - pixelLength < dxtOffset)
+        {
+            pixelLength = baseMipLength;
+            mipCount = 1;
+        }
+
+        var pixelStart = data.Length - pixelLength;
+        if (pixelStart < 0 || pixelStart >= data.Length)
+        {
+            throw new InvalidDataException("Legacy D3DTX pixel payload is outside the file.");
+        }
+
+        return new D3dtxInfo(width, height, mipCount, format, blockBytes, pixelStart, pixelLength);
     }
 
     private static (int Width, int Height) GetModernRegionDimensions(T3Texture texture, T3Texture.RegionStreamHeader region)
@@ -525,6 +614,50 @@ public static class TextureLoader
         return pixels;
     }
 
+    private static int[] DecodeDxt3(byte[] data, int offset, int width, int height)
+    {
+        var pixels = new int[width * height];
+        var pos = offset;
+        for (var by = 0; by < height; by += 4)
+        {
+            for (var bx = 0; bx < width; bx += 4)
+            {
+                ulong alphaBits = 0;
+                for (var i = 0; i < 8; i++)
+                {
+                    alphaBits |= (ulong)data[pos + i] << (8 * i);
+                }
+
+                var c0 = BinaryPrimitives.ReadUInt16LittleEndian(data.AsSpan(pos + 8));
+                var c1 = BinaryPrimitives.ReadUInt16LittleEndian(data.AsSpan(pos + 10));
+                var colorBits = BinaryPrimitives.ReadUInt32LittleEndian(data.AsSpan(pos + 12));
+                pos += 16;
+
+                var colors = BuildDxt5Colors(c0, c1);
+                for (var y = 0; y < 4; y++)
+                {
+                    for (var x = 0; x < 4; x++)
+                    {
+                        var pixel = y * 4 + x;
+                        var tx = bx + x;
+                        var ty = by + y;
+                        if (tx >= width || ty >= height)
+                        {
+                            continue;
+                        }
+
+                        var colorIndex = (int)((colorBits >> (2 * pixel)) & 0x3);
+                        var alpha = (int)((alphaBits >> (4 * pixel)) & 0xF) * 17;
+                        var color = Color.FromArgb(colors[colorIndex]);
+                        pixels[ty * width + tx] = Color.FromArgb(alpha, color.R, color.G, color.B).ToArgb();
+                    }
+                }
+            }
+        }
+
+        return pixels;
+    }
+
     private static int[] DecodeA8(byte[] data, int offset, int width, int height)
     {
         var pixels = new int[width * height];
@@ -706,6 +839,45 @@ public static class TextureLoader
     private static string ReadFourCc(byte[] data, int offset) => new(data.Skip(offset).Take(4).Select(b => (char)b).ToArray());
     private static int MipSizeOf(int width, int height, int blockBytes) =>
         Math.Max(1, (width + 3) / 4) * Math.Max(1, (height + 3) / 4) * blockBytes;
+
+    private static int LegacyMipChainSize(int width, int height, int blockBytes, int mipCount)
+    {
+        var total = 0;
+        for (var mip = 0; mip < mipCount; mip++)
+        {
+            total = checked(total + MipSizeOf(width, height, blockBytes));
+            if (width == 1 && height == 1)
+            {
+                break;
+            }
+
+            width = Math.Max(1, width / 2);
+            height = Math.Max(1, height / 2);
+        }
+
+        return total;
+    }
+
+    private static bool IsLegacyErtm(byte[] data)
+        => data.Length >= 4 &&
+           data[0] == (byte)'E' &&
+           data[1] == (byte)'R' &&
+           data[2] == (byte)'T' &&
+           data[3] == (byte)'M';
+
+    private static int IndexOf(byte[] data, string value)
+    {
+        var needle = System.Text.Encoding.ASCII.GetBytes(value);
+        for (var i = 0; i <= data.Length - needle.Length; i++)
+        {
+            if (data.AsSpan(i, needle.Length).SequenceEqual(needle))
+            {
+                return i;
+            }
+        }
+
+        return -1;
+    }
 
     private static string D3dtxFormatName(uint format) => format switch
     {

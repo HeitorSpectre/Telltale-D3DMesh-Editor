@@ -1,6 +1,7 @@
 using System.Diagnostics;
 using System.Buffers.Binary;
 using System.Globalization;
+using System.Numerics;
 using System.Reflection;
 using TelltaleD3DMeshEditor.Core;
 using TelltaleD3DMeshEditor.Formats.Archives;
@@ -31,6 +32,7 @@ public sealed class MainForm : Form
     private readonly ToolStripButton _btnDiffuseAtlas = new("Texture Atlas");
     private readonly ToolStripButton _btnCombineParts = new("Combine Parts");
     private readonly ToolStripDropDownButton _gameSelector = new();
+    private readonly Dictionary<GameId, Image> _gameMenuImages = new();
     private readonly Button _btnReload = new() { Text = "Reload" };
     private readonly ToolStripButton _btnPan = new("Pan");
     private readonly ToolStripButton _btnPose = new("Pose");
@@ -188,12 +190,7 @@ public sealed class MainForm : Form
         });
 
         _gameSelector.ToolTipText = "Selects which Telltale game's texture/model rules to apply. The Wolf Among Us behaves exactly as before.";
-        foreach (var game in GameConfig.All)
-        {
-            var item = new ToolStripMenuItem(game.DisplayName) { Tag = game };
-            item.Click += async (_, _) => await SelectGameAsync(game);
-            _gameSelector.DropDownItems.Add(item);
-        }
+        BuildGameSelectorMenu();
 
         UpdateGameSelector();
 
@@ -230,12 +227,22 @@ public sealed class MainForm : Form
         _progress.Visible = false;
         _progressLabel.Visible = false;
         _progress.AutoSize = false;
-        _progress.Size = new Size(160, 14);
+        _progress.Size = new Size(150, 14);
+        _progressLabel.AutoSize = false;
+        _progressLabel.Width = 140;
+        _progressLabel.TextAlign = ContentAlignment.MiddleRight;
+        _progressLabel.AutoToolTip = true;
+        _statusLabel.Spring = true;
+        _statusLabel.TextAlign = ContentAlignment.MiddleLeft;
+        _statusLabel.AutoToolTip = true;
+        _detailLabel.AutoSize = false;
+        _detailLabel.Width = 230;
+        _detailLabel.TextAlign = ContentAlignment.MiddleRight;
+        _detailLabel.AutoToolTip = true;
         _statusStrip.Items.Add(_statusLabel);
-        _statusStrip.Items.Add(new ToolStripStatusLabel { Spring = true });
+        _statusStrip.Items.Add(_detailLabel);
         _statusStrip.Items.Add(_progressLabel);
         _statusStrip.Items.Add(_progress);
-        _statusStrip.Items.Add(_detailLabel);
 
         Controls.Add(_split);
         Controls.Add(_toolStrip);
@@ -564,8 +571,8 @@ public sealed class MainForm : Form
         _btnCombineParts.Enabled = false;
         _btnReload.Enabled = false;
         _searchText.Enabled = false;
-        _statusLabel.Text = "Open a folder containing .d3dmesh, .skl and .d3dtx files to begin.";
-        _detailLabel.Text = "";
+        SetStatusText("Open a folder containing .d3dmesh, .skl and .d3dtx files to begin.");
+        SetDetailText("");
     }
 
     private static string BuildLoadedDetailText(int modelCount, int groupCount)
@@ -573,6 +580,18 @@ public sealed class MainForm : Form
         var models = modelCount == 1 ? "1 model" : $"{modelCount} models";
         var groups = groupCount == 1 ? "1 combined group" : $"{groupCount} combined groups";
         return $"{models} | {groups}";
+    }
+
+    private void SetStatusText(string text)
+    {
+        _statusLabel.Text = text;
+        _statusLabel.ToolTipText = text;
+    }
+
+    private void SetDetailText(string text)
+    {
+        _detailLabel.Text = text;
+        _detailLabel.ToolTipText = text;
     }
 
     private async Task OpenFolderDialogAsync()
@@ -637,14 +656,19 @@ public sealed class MainForm : Form
 
         await RunWithUiLockAsync(async () =>
         {
-            _statusLabel.Text = archivePaths.Length == 1
+            SetStatusText(archivePaths.Length == 1
                 ? "Extracting archive..."
-                : $"Extracting {archivePaths.Length} archives...";
+                : $"Extracting {archivePaths.Length} archives...");
 
+            IProgress<int> archiveProgress = new Progress<int>(done =>
+                SetProgress(done, archivePaths.Length, $"Extracting archive {Math.Min(done + 1, archivePaths.Length)}/{archivePaths.Length}..."));
             await Task.Run(() =>
             {
-                foreach (var archivePath in archivePaths)
+                for (var i = 0; i < archivePaths.Length; i++)
                 {
+                    var archivePath = archivePaths[i];
+                    archiveProgress.Report(i);
+
                     // Single archive: extract straight into its own folder. Multiple: one subfolder
                     // per section (Boot, Fables101, ...) so same-scene archives merge together.
                     var destFolder = single
@@ -660,6 +684,8 @@ public sealed class MainForm : Form
                     {
                         failures.Add($"{Path.GetFileName(archivePath)}: {ex.Message}");
                     }
+
+                    archiveProgress.Report(i + 1);
                 }
             });
 
@@ -689,9 +715,107 @@ public sealed class MainForm : Form
     private void UpdateGameSelector()
     {
         _gameSelector.Text = $"Game: {GameConfig.Current.DisplayName}";
-        foreach (var item in _gameSelector.DropDownItems.OfType<ToolStripMenuItem>())
+        UpdateGameSelectorChecks(_gameSelector.DropDownItems);
+    }
+
+    private void BuildGameSelectorMenu()
+    {
+        _gameSelector.DropDownItems.Clear();
+        foreach (var game in GameConfig.All)
         {
-            item.Checked = ReferenceEquals(item.Tag, GameConfig.Current);
+            if (game.Id is GameId.BackToTheFutureEpisode1 or
+                GameId.BackToTheFutureEpisode2 or
+                GameId.BackToTheFutureEpisode3 or
+                GameId.BackToTheFutureEpisode4 or
+                GameId.BackToTheFutureEpisode5)
+            {
+                continue;
+            }
+
+            var item = CreateGameMenuItem(game);
+            if (game.Id == GameId.BackToTheFuture)
+            {
+                item.DropDownItems.Add(CreateGameMenuItem(GameConfig.BackToTheFutureEpisode1));
+                item.DropDownItems.Add(CreateGameMenuItem(GameConfig.BackToTheFutureEpisode2));
+                item.DropDownItems.Add(CreateGameMenuItem(GameConfig.BackToTheFutureEpisode3));
+                item.DropDownItems.Add(CreateGameMenuItem(GameConfig.BackToTheFutureEpisode4));
+                item.DropDownItems.Add(CreateGameMenuItem(GameConfig.BackToTheFutureEpisode5));
+            }
+
+            _gameSelector.DropDownItems.Add(item);
+        }
+    }
+
+    private ToolStripMenuItem CreateGameMenuItem(GameConfig game)
+    {
+        var item = new ToolStripMenuItem(game.DisplayName) { Tag = game };
+        if (TryGetGameMenuImage(game.Id, out var image))
+        {
+            item.Image = image;
+            item.ImageScaling = ToolStripItemImageScaling.None;
+        }
+
+        item.Click += async (_, _) => await SelectGameAsync(game);
+        return item;
+    }
+
+    private bool TryGetGameMenuImage(GameId id, out Image image)
+    {
+        image = null!;
+        var resourceName = id switch
+        {
+            GameId.BackToTheFutureEpisode1 => "BTTF101",
+            GameId.BackToTheFutureEpisode2 => "BTTF102",
+            GameId.BackToTheFutureEpisode3 => "BTTF103",
+            GameId.BackToTheFutureEpisode4 => "BTTF104",
+            GameId.BackToTheFutureEpisode5 => "BTTF105",
+            _ => ""
+        };
+        if (string.IsNullOrEmpty(resourceName))
+        {
+            return false;
+        }
+
+        if (_gameMenuImages.TryGetValue(id, out image!))
+        {
+            return true;
+        }
+
+        using var stream = Assembly.GetExecutingAssembly()
+            .GetManifestResourceStream($"TelltaleD3DMeshEditor.Resources.Images.{resourceName}.png");
+        if (stream is null)
+        {
+            return false;
+        }
+
+        using var loaded = Image.FromStream(stream);
+        image = CreateMenuThumbnail(loaded, 28);
+        _gameMenuImages[id] = image;
+        return true;
+    }
+
+    private static Bitmap CreateMenuThumbnail(Image source, int size)
+    {
+        var thumbnail = new Bitmap(size, size, System.Drawing.Imaging.PixelFormat.Format32bppPArgb);
+        using var graphics = Graphics.FromImage(thumbnail);
+        graphics.Clear(Color.Transparent);
+        graphics.CompositingMode = System.Drawing.Drawing2D.CompositingMode.SourceOver;
+        graphics.CompositingQuality = System.Drawing.Drawing2D.CompositingQuality.HighQuality;
+        graphics.InterpolationMode = System.Drawing.Drawing2D.InterpolationMode.HighQualityBicubic;
+        graphics.PixelOffsetMode = System.Drawing.Drawing2D.PixelOffsetMode.HighQuality;
+        graphics.SmoothingMode = System.Drawing.Drawing2D.SmoothingMode.HighQuality;
+        graphics.DrawImage(source, new Rectangle(0, 0, size, size));
+        return thumbnail;
+    }
+
+    private static void UpdateGameSelectorChecks(ToolStripItemCollection items)
+    {
+        foreach (var item in items.OfType<ToolStripMenuItem>())
+        {
+            item.Checked = item.Tag is GameConfig game &&
+                (ReferenceEquals(game, GameConfig.Current) ||
+                 (game.Id == GameId.BackToTheFuture && GameConfig.Current.IsBackToTheFuture));
+            UpdateGameSelectorChecks(item.DropDownItems);
         }
     }
 
@@ -740,13 +864,14 @@ public sealed class MainForm : Form
         SetBusy(true);
         try
         {
+            SetProgress(0, 1000, "Reading folder... 0%");
             var progress = new Progress<double>(fraction =>
                 SetProgress((int)(fraction * 1000), 1000, $"Reading folder... {(int)(fraction * 100)}%"));
             await ReloadAssetsAsync(folder, progress);
         }
         catch (Exception ex)
         {
-            _statusLabel.Text = "Error.";
+            SetStatusText("Error.");
             var logPath = ErrorLog.Write(ex, "Folder load failed");
             MessageBox.Show(
                 $"Could not load the folder. A detailed log was written to:\n{logPath}\n\n{ex.Message}",
@@ -769,6 +894,7 @@ public sealed class MainForm : Form
         _selectedAsset = null;
         _selectedGroup = null;
         _preview.SetScene(null, null);
+        progress?.Report(0);
 
         var (assets, groups) = await Task.Run(() =>
         {
@@ -776,6 +902,7 @@ public sealed class MainForm : Form
             var grouped = ModelAssetGroup.Discover(discovered, folder, SubRange(progress, 0.7, 1.0));
             return (discovered, grouped);
         });
+        progress?.Report(1);
 
         _assets = assets;
         _assetGroups = groups;
@@ -794,10 +921,10 @@ public sealed class MainForm : Form
         _btnCombineParts.Enabled = _assets.Count > 0;
         _btnExtractSelected.Enabled = false;
         _btnReimportSelected.Enabled = false;
-        _detailLabel.Text = BuildLoadedDetailText(_assets.Count, _btnCombineParts.Checked ? _assetGroups.Count : 0);
-        _statusLabel.Text = _assets.Count == 0
+        SetDetailText(BuildLoadedDetailText(_assets.Count, _btnCombineParts.Checked ? _assetGroups.Count : 0));
+        SetStatusText(_assets.Count == 0
             ? "No .d3dmesh files were found in this folder."
-            : $"Loaded: {folder}";
+            : BuildLoadedFolderStatus(folder));
     }
 
     // Forwards a 0..1 sub-progress into a [start, end] slice of an overall 0..1 progress. Forwards
@@ -889,22 +1016,22 @@ public sealed class MainForm : Form
             ResetTreeViewport(root, preferFirstResult: !string.IsNullOrEmpty(query));
         }
 
-        _detailLabel.Text = string.IsNullOrEmpty(query)
+        SetDetailText(string.IsNullOrEmpty(query)
             ? BuildLoadedDetailText(_assets.Count, visibleGroups.Count)
-            : $"{visibleAssets.Count} of {_assets.Count} models | {visibleGroups.Count} of {_assetGroups.Count} groups";
+            : $"{visibleAssets.Count} of {_assets.Count} models | {visibleGroups.Count} of {_assetGroups.Count} groups");
         if ((_assets.Count > 0 || _assetGroups.Count > 0) && visibleAssets.Count == 0 && visibleGroups.Count == 0)
         {
-            _statusLabel.Text = $"No files match \"{query}\".";
+            SetStatusText($"No files match \"{query}\".");
         }
         else if (!string.IsNullOrEmpty(query))
         {
-            _statusLabel.Text = $"Search: \"{query}\"";
+            SetStatusText($"Search: \"{query}\"");
         }
         else
         {
-            _statusLabel.Text = _assets.Count == 0
+            SetStatusText(_assets.Count == 0
                 ? "No .d3dmesh files were found in this folder."
-                : $"Loaded: {_rootFolder}";
+                : BuildLoadedFolderStatus(_rootFolder));
         }
 
         EnsureTreePanelWidth();
@@ -917,14 +1044,14 @@ public sealed class MainForm : Form
         var node = FindNodeByMeshPath(_tree.Nodes, fullPath);
         if (node is null)
         {
-            _statusLabel.Text = $"Loaded folder, but could not select: {Path.GetFileName(meshPath)}";
+            SetStatusText($"Loaded folder, but could not select: {Path.GetFileName(meshPath)}");
             return;
         }
 
         ExpandParents(node);
         ApplyTreeSelection(node, additive: false, range: false);
         node.EnsureVisible();
-        _statusLabel.Text = $"Opened: {meshPath}";
+        SetStatusText($"Opened: {Path.GetFileName(meshPath)}");
     }
 
     private static TreeNode? FindNodeByMeshPath(TreeNodeCollection nodes, string meshPath)
@@ -1309,7 +1436,7 @@ public sealed class MainForm : Form
             _selectedGroup = null;
             _btnExtractSelected.Enabled = false;
             _btnReimportSelected.Enabled = false;
-            _detailLabel.Text = BuildLoadedDetailText(_assets.Count, _assetGroups.Count);
+            SetDetailText(BuildLoadedDetailText(_assets.Count, _assetGroups.Count));
             return;
         }
 
@@ -1391,22 +1518,22 @@ public sealed class MainForm : Form
             SkeletonData? skeleton = null;
             if (asset.SkeletonPath is not null)
             {
-                skeleton = SkeletonLoader.Load(asset.SkeletonPath, version: 13);
+                skeleton = SkeletonLoader.Load(asset.SkeletonPath, mesh.Version);
             }
 
             var textures = _rootFolder is null
                 ? new Dictionary<int, MaterialTextureSet>()
                 : TextureResolver.ResolveForMesh(_rootFolder, asset.MeshPath, mesh);
             _preview.SetScene(mesh, skeleton, textures);
-            _statusLabel.Text = "Preview ready.";
+            SetStatusText("Preview ready.");
             var textureCount = textures.Values.Sum(set => set.Count);
-            _detailLabel.Text = $"textures: {textureCount}";
+            SetDetailText($"textures: {textureCount}");
         }
         catch (Exception ex)
         {
             _preview.SetScene(null, null);
-            _statusLabel.Text = $"Preview error: {Path.GetFileName(asset.MeshPath)}";
-            _detailLabel.Text = ex.Message;
+            SetStatusText($"Preview error: {Path.GetFileName(asset.MeshPath)}");
+            SetDetailText(ex.Message);
         }
     }
 
@@ -1421,15 +1548,15 @@ public sealed class MainForm : Form
 
             var previewAsset = ExtractionService.BuildPreviewAsset(group, _rootFolder);
             _preview.SetScene(previewAsset.Mesh, previewAsset.Skeleton, previewAsset.Textures);
-            _statusLabel.Text = "Combined preview ready.";
+            SetStatusText("Combined preview ready.");
             var textureCount = previewAsset.Textures.Values.Sum(set => set.Count);
-            _detailLabel.Text = $"parts: {group.Assets.Count} | textures: {textureCount}";
+            SetDetailText($"parts: {group.Assets.Count} | textures: {textureCount}");
         }
         catch (Exception ex)
         {
             _preview.SetScene(null, null);
-            _statusLabel.Text = $"Preview error: {group}";
-            _detailLabel.Text = ex.Message;
+            SetStatusText($"Preview error: {group}");
+            SetDetailText(ex.Message);
         }
     }
 
@@ -1558,7 +1685,7 @@ public sealed class MainForm : Form
             var total = assets.Count;
             var progress = new Progress<string>(line =>
             {
-                _statusLabel.Text = line;
+                SetStatusText(line);
                 SetProgress(++done, total, $"Extracting {Math.Min(done, total)}/{total}...");
             });
             var summary = await Task.Run(() => ExtractionService.ExtractAll(assets, root, output, format, progress));
@@ -1653,26 +1780,29 @@ public sealed class MainForm : Form
     private static string ReimportSingleAsset(ModelAsset asset, string input, string output, bool useDiffuseAtlas, bool uncompressedTextures)
     {
         var gameConfig = GameConfig.Current;
-        var layout = D3DMeshLayout.Build(File.ReadAllBytes(asset.MeshPath));
+        var templateBytes = File.ReadAllBytes(asset.MeshPath);
         var model = GltfModelPreprocessor.ApplyGameReinsertRules(GltfReader.Load(input), gameConfig);
+        var effectiveUseDiffuseAtlas = useDiffuseAtlas;
         // With the atlas active, the line/normal textures must be present as image bytes to be packed, so
         // reload them from the template folder before atlasing (Blender strips them). Off the atlas path
         // the line and normal map are rebound by name in ReinsertTextureService, reusing the game's files.
-        if (useDiffuseAtlas)
+        if (effectiveUseDiffuseAtlas)
         {
             model = StrippedLineTextureRecovery.RestoreStrippedTextures(model, asset.MeshPath);
         }
         // With the atlas active, line textures are baked into the atlas and their detail slots are dropped,
         // so normal detail-write inversion cannot run. Apply game-specific line alpha fixes before packing.
-        if (useDiffuseAtlas &&
+        if (effectiveUseDiffuseAtlas &&
             (gameConfig.InvertHeadLineAlphaOnReimport || gameConfig.InvertBodyLineAlphaOnReimport || gameConfig.InvertHandLineAlphaOnReimport))
         {
             model = CharacterLineAtlasFix.InvertCharacterLineAlpha(model, gameConfig);
         }
-        var atlas = ApplyDiffuseAtlasIfRequested(model, useDiffuseAtlas, asset.MeshPath);
+        var atlas = ApplyDiffuseAtlasIfRequested(model, effectiveUseDiffuseAtlas, asset.MeshPath);
         model = atlas.Model;
+
+        var layout = D3DMeshLayout.Build(templateBytes);
         var skeleton = LoadSkeletonOrNull(asset.SkeletonPath, layout.Version);
-        var textureOptions = BuildReinsertTextureOptions(useDiffuseAtlas, uncompressedTextures);
+        var textureOptions = BuildReinsertTextureOptions(effectiveUseDiffuseAtlas, uncompressedTextures);
         var textures = ReinsertTextureService.WriteAllReferencedTextures(model, asset.MeshPath, output, gameConfig, textureOptions);
         var bytes = MeshReinserter.ReinsertGeometry(layout, model, textures, skeleton, gameConfig);
         File.WriteAllBytes(output, bytes);
@@ -1685,7 +1815,7 @@ public sealed class MainForm : Form
         var textureLine = textureCount > 0
             ? $"\nTextures: {textureCount} .d3dtx file(s) written next to the output mesh."
             : "";
-        var skeletonLine = RebuildSkeletonForReimport(asset, model, output);
+        var skeletonLine = RebuildSkeletonForReimport(asset, model, output, layout.Version);
         var atlasLine = BuildAtlasStatusLine(atlas);
 
         return $"Reimported: {Path.GetFileName(asset.MeshPath)}\nInput: {input}\nOutput: {output}{textureLine}{atlasLine}{skeletonLine}\n{status}";
@@ -1696,7 +1826,7 @@ public sealed class MainForm : Form
     // untouched skeleton stays byte-identical). Prop targets intentionally stay geometry-only: a
     // skinned GLB can be used as a static prop, but the target should not gain a brand-new .skl.
     // Returns a status line (empty when the GLB carries no skin or the target has no skeleton).
-    private static string RebuildSkeletonForReimport(ModelAsset asset, GltfModel model, string output)
+    private static string RebuildSkeletonForReimport(ModelAsset asset, GltfModel model, string output, int skeletonVersion)
     {
         if (model.Skeleton is null || model.Skeleton.Bones.Count == 0)
         {
@@ -1719,6 +1849,19 @@ public sealed class MainForm : Form
             var skeletonName = Path.GetFileName(asset.SkeletonPath);
             var skeletonOutput = Path.Combine(outputDir, skeletonName);
 
+            if (TryNormalizeAxisConvertedSkeletonForReimport(
+                    asset.SkeletonPath,
+                    skeletonVersion,
+                    model.Skeleton,
+                    out _,
+                    out var normalizedSkeleton,
+                    out var keptStatus))
+            {
+                var normalizedSkeletonBytes = SkeletonRebuilder.RebuildWithEdits(asset.SkeletonPath, normalizedSkeleton);
+                File.WriteAllBytes(skeletonOutput, normalizedSkeletonBytes);
+                return "\n" + keptStatus;
+            }
+
             var skeletonBytes = SkeletonRebuilder.RebuildWithEdits(asset.SkeletonPath, model.Skeleton);
             File.WriteAllBytes(skeletonOutput, skeletonBytes);
             return $"\nSkeleton: {skeletonName} rebuilt from the original skeleton + your edits ({model.Skeleton.Bones.Count} bones).";
@@ -1740,7 +1883,10 @@ public sealed class MainForm : Form
     {
         Directory.CreateDirectory(outputFolder);
         var gameConfig = GameConfig.Current;
-        combinedModel = GltfModelPreprocessor.ApplyGameReinsertRules(combinedModel, gameConfig);
+        combinedModel = GltfModelPreprocessor.ApplyGameReinsertRules(
+            combinedModel,
+            gameConfig,
+            preserveEyeHelperPrimitives: ShouldPreserveCombinedEyeHelperPrimitives(combinedModel, gameConfig));
         var sourcePrimitives = BuildCombinedSourcePrimitiveMap(group, combinedModel, inputRoot, out var splitModeLine);
         var combinedSkeleton = BuildCombinedReferenceSkeletonForReimport(group, combinedModel, inputRoot, outputFolder, out var skeletonLine);
         var ok = 0;
@@ -2061,12 +2207,29 @@ public sealed class MainForm : Form
         {
             var skeletonName = Path.GetFileName(group.SkeletonPath);
             var outputPath = Path.Combine(outputFolder, skeletonName);
+            if (TryNormalizeAxisConvertedSkeletonForReimport(
+                    group.SkeletonPath,
+                    version: 13,
+                    model.Skeleton,
+                    out var originalSkeleton,
+                    out var normalizedSkeleton,
+                    out statusLine))
+            {
+                var normalizedSkeletonBytes = SkeletonRebuilder.RebuildWithEdits(group.SkeletonPath, normalizedSkeleton);
+                File.WriteAllBytes(outputPath, normalizedSkeletonBytes);
+                return LoadSkeletonOrNull(outputPath, version: 13) ?? originalSkeleton;
+            }
+
             var scaleDonor = LoadDonorSkeletonForScales(model, inputRoot);
             var skeletonBytes = SkeletonRebuilder.RebuildWithEdits(group.SkeletonPath, model.Skeleton, scaleDonor);
             File.WriteAllBytes(outputPath, skeletonBytes);
+            var rebuiltSkeleton = LoadSkeletonOrNull(outputPath, version: 13);
             var scalesNote = scaleDonor is not null ? " + donor translation scales" : "";
-            statusLine = $"Skeleton: {skeletonName} rebuilt from the original skeleton + imported model ({model.Skeleton.Bones.Count} bones){scalesNote}.";
-            return LoadSkeletonOrNull(outputPath, version: 13);
+            var boneCountLine = rebuiltSkeleton is null
+                ? $"{model.Skeleton.Bones.Count} imported bones"
+                : $"{rebuiltSkeleton.Bones.Count} final bones, {model.Skeleton.Bones.Count} imported bones";
+            statusLine = $"Skeleton: {skeletonName} rebuilt from the original skeleton + imported model ({boneCountLine}){scalesNote}.";
+            return rebuiltSkeleton;
         }
         catch (Exception ex)
         {
@@ -2074,6 +2237,229 @@ public sealed class MainForm : Form
             return LoadSkeletonOrNull(group.SkeletonPath, version: 13);
         }
     }
+
+    private static bool TryNormalizeAxisConvertedSkeletonForReimport(
+        string skeletonPath,
+        int version,
+        SkeletonData imported,
+        out SkeletonData? originalSkeleton,
+        out SkeletonData normalizedSkeleton,
+        out string statusLine)
+    {
+        originalSkeleton = LoadSkeletonOrNull(skeletonPath, version);
+        normalizedSkeleton = imported;
+        statusLine = "";
+        if (originalSkeleton is null ||
+            originalSkeleton.Bones.Count == 0 ||
+            imported.Bones.Count == 0 ||
+            !LooksLikeAxisConvertedRestPose(originalSkeleton, imported))
+        {
+            return false;
+        }
+
+        normalizedSkeleton = NormalizeAxisConvertedSkeleton(originalSkeleton, imported);
+        statusLine =
+            $"Skeleton: rebuilt {Path.GetFileName(skeletonPath)} after normalizing Blender's rewritten local bone axes against the original skeleton.";
+        return true;
+    }
+
+    private static SkeletonData NormalizeAxisConvertedSkeleton(SkeletonData original, SkeletonData imported)
+    {
+        var importedByName = imported.Bones
+            .Select((bone, index) => (bone, index))
+            .Where(item => !string.IsNullOrWhiteSpace(item.bone.Name))
+            .GroupBy(item => item.bone.Name, StringComparer.OrdinalIgnoreCase)
+            .Where(group => group.Count() == 1)
+            .ToDictionary(group => group.Key, group => group.First().index, StringComparer.OrdinalIgnoreCase);
+        var originalWorld = BuildSkeletonWorldPositions(original);
+        var importedWorld = BuildSkeletonWorldPositions(imported);
+        var normalized = new SkeletonData();
+        var normalizedWorld = new Matrix4x4[original.Bones.Count];
+
+        for (var i = 0; i < original.Bones.Count; i++)
+        {
+            var originalBone = original.Bones[i];
+            var targetWorldPosition = !string.IsNullOrWhiteSpace(originalBone.Name) &&
+                                      importedByName.TryGetValue(originalBone.Name, out var importedIndex)
+                ? importedWorld[importedIndex]
+                : originalWorld[i];
+
+            var localPosition = new Vector3(originalBone.X, originalBone.Y, originalBone.Z);
+            if (originalBone.ParentIndex >= 0 &&
+                originalBone.ParentIndex < normalizedWorld.Length &&
+                Matrix4x4.Invert(normalizedWorld[originalBone.ParentIndex], out var inverseParent))
+            {
+                localPosition = Vector3.Transform(targetWorldPosition, inverseParent);
+            }
+            else if (originalBone.ParentIndex < 0)
+            {
+                localPosition = targetWorldPosition;
+            }
+
+            var localRotation = NormalizeQuaternionOrIdentity(new Quaternion(
+                originalBone.Qx,
+                originalBone.Qy,
+                originalBone.Qz,
+                originalBone.Qw));
+            var normalizedBone = originalBone with
+            {
+                X = localPosition.X,
+                Y = localPosition.Y,
+                Z = localPosition.Z,
+                Qx = localRotation.X,
+                Qy = localRotation.Y,
+                Qz = localRotation.Z,
+                Qw = localRotation.W,
+            };
+            normalized.Bones.Add(normalizedBone);
+
+            var local = Matrix4x4.CreateFromQuaternion(localRotation) *
+                        Matrix4x4.CreateTranslation(localPosition);
+            normalizedWorld[i] = originalBone.ParentIndex >= 0 && originalBone.ParentIndex < normalizedWorld.Length
+                ? local * normalizedWorld[originalBone.ParentIndex]
+                : local;
+        }
+
+        return normalized;
+    }
+
+    private static bool LooksLikeAxisConvertedRestPose(SkeletonData original, SkeletonData imported)
+    {
+        const float WorldPositionTolerance = 0.0025f;
+        const float AverageWorldPositionTolerance = 0.015f;
+        const float LocalTranslationDelta = 0.005f;
+        const float LocalRotationDeltaRadians = 0.2f;
+
+        var originalByName = original.Bones
+            .Select((bone, index) => (bone, index))
+            .Where(item => !string.IsNullOrWhiteSpace(item.bone.Name))
+            .GroupBy(item => item.bone.Name, StringComparer.OrdinalIgnoreCase)
+            .Where(group => group.Count() == 1)
+            .ToDictionary(group => group.Key, group => group.First().index, StringComparer.OrdinalIgnoreCase);
+        if (originalByName.Count == 0)
+        {
+            return false;
+        }
+
+        var originalWorld = BuildSkeletonWorldPositions(original);
+        var importedWorld = BuildSkeletonWorldPositions(imported);
+        var matched = 0;
+        var closeWorld = 0;
+        var localTranslationChanged = 0;
+        var localRotationChanged = 0;
+        var totalWorldDistance = 0f;
+
+        for (var importedIndex = 0; importedIndex < imported.Bones.Count; importedIndex++)
+        {
+            var importedBone = imported.Bones[importedIndex];
+            if (string.IsNullOrWhiteSpace(importedBone.Name) ||
+                !originalByName.TryGetValue(importedBone.Name, out var originalIndex))
+            {
+                continue;
+            }
+
+            matched++;
+            var originalBone = original.Bones[originalIndex];
+            var worldDistance = Vector3.Distance(originalWorld[originalIndex], importedWorld[importedIndex]);
+            totalWorldDistance += worldDistance;
+            if (worldDistance <= WorldPositionTolerance)
+            {
+                closeWorld++;
+            }
+
+            var localDistance = Vector3.Distance(
+                new Vector3(originalBone.X, originalBone.Y, originalBone.Z),
+                new Vector3(importedBone.X, importedBone.Y, importedBone.Z));
+            if (localDistance >= LocalTranslationDelta)
+            {
+                localTranslationChanged++;
+            }
+
+            if (QuaternionDistanceRadians(
+                    new Quaternion(originalBone.Qx, originalBone.Qy, originalBone.Qz, originalBone.Qw),
+                    new Quaternion(importedBone.Qx, importedBone.Qy, importedBone.Qz, importedBone.Qw)) >= LocalRotationDeltaRadians)
+            {
+                localRotationChanged++;
+            }
+        }
+
+        if (matched < Math.Min(20, original.Bones.Count * 3 / 4))
+        {
+            return false;
+        }
+
+        var averageWorldDistance = totalWorldDistance / matched;
+        var sameRestPose =
+            closeWorld >= matched * 3 / 5 &&
+            averageWorldDistance <= AverageWorldPositionTolerance;
+        if (!sameRestPose)
+        {
+            return false;
+        }
+
+        var divergentLocalCount = localTranslationChanged + localRotationChanged;
+        return divergentLocalCount >= Math.Max(6, matched / 8);
+    }
+
+    private static Vector3[] BuildSkeletonWorldPositions(SkeletonData skeleton)
+    {
+        var matrices = new Matrix4x4[skeleton.Bones.Count];
+        var state = new byte[skeleton.Bones.Count];
+        for (var i = 0; i < skeleton.Bones.Count; i++)
+        {
+            BuildSkeletonWorldMatrix(skeleton, i, matrices, state);
+        }
+
+        var result = new Vector3[skeleton.Bones.Count];
+        for (var i = 0; i < result.Length; i++)
+        {
+            result[i] = Vector3.Transform(Vector3.Zero, matrices[i]);
+        }
+
+        return result;
+    }
+
+    private static Matrix4x4 BuildSkeletonWorldMatrix(SkeletonData skeleton, int index, Matrix4x4[] matrices, byte[] state)
+    {
+        if (state[index] == 2)
+        {
+            return matrices[index];
+        }
+
+        if (state[index] == 1)
+        {
+            return Matrix4x4.Identity;
+        }
+
+        state[index] = 1;
+        var bone = skeleton.Bones[index];
+        var rotation = NormalizeQuaternionOrIdentity(new Quaternion(bone.Qx, bone.Qy, bone.Qz, bone.Qw));
+        var local = Matrix4x4.CreateFromQuaternion(rotation) *
+                    Matrix4x4.CreateTranslation(bone.X, bone.Y, bone.Z);
+        if (bone.ParentIndex >= 0 && bone.ParentIndex < skeleton.Bones.Count)
+        {
+            matrices[index] = local * BuildSkeletonWorldMatrix(skeleton, bone.ParentIndex, matrices, state);
+        }
+        else
+        {
+            matrices[index] = local;
+        }
+
+        state[index] = 2;
+        return matrices[index];
+    }
+
+    private static float QuaternionDistanceRadians(Quaternion a, Quaternion b)
+    {
+        a = NormalizeQuaternionOrIdentity(a);
+        b = NormalizeQuaternionOrIdentity(b);
+        var dot = Math.Abs(Quaternion.Dot(a, b));
+        dot = Math.Clamp(dot, 0f, 1f);
+        return 2f * MathF.Acos(dot);
+    }
+
+    private static Quaternion NormalizeQuaternionOrIdentity(Quaternion rotation)
+        => rotation.LengthSquared() > 0.000001f ? Quaternion.Normalize(rotation) : Quaternion.Identity;
 
     private static ReinsertTextureOptions BuildReinsertTextureOptions(bool useDiffuseAtlas, bool uncompressedTextures)
         => useDiffuseAtlas
@@ -2174,6 +2560,7 @@ public sealed class MainForm : Form
         }
 
         var lower = Path.GetFileNameWithoutExtension(name).ToLowerInvariant();
+        if (lower.Contains("eyelash") || lower.Contains("eyelashes")) return "eyelashes";
         if (lower.Contains("eye")) return "eye";
         if (lower.Contains("mouth") || lower.Contains("teeth") || lower.Contains("tongue")) return "mouth";
         if (lower.Contains("hair")) return "hair";
@@ -2200,9 +2587,10 @@ public sealed class MainForm : Form
     private static GltfDiffuseAtlasOptions BuildAtlasOptions(string templateMeshPath)
     {
         var names = ReinsertTextureService.ResolveAtlasTextureNames(templateMeshPath);
+        const bool packSharedPartsTextures = true;
         return names is null
-            ? new GltfDiffuseAtlasOptions()
-            : new GltfDiffuseAtlasOptions(AtlasName: names.Diffuse, NormalAtlasName: names.Normal);
+            ? new GltfDiffuseAtlasOptions(PackSharedPartsTextures: packSharedPartsTextures)
+            : new GltfDiffuseAtlasOptions(AtlasName: names.Diffuse, NormalAtlasName: names.Normal, PackSharedPartsTextures: packSharedPartsTextures);
     }
 
     private static string BuildAtlasStatusLine(GltfDiffuseAtlasResult atlas)
@@ -2306,17 +2694,43 @@ public sealed class MainForm : Form
             }
 
             var target = FindCombinedTargetByPartSuffix(primitive, sourcePartPrefix, targetBySuffix);
+            int? targetSubmeshIndex = null;
             if (target is null &&
                 ShouldLeavePrimitiveToCompanionPort(primitive, sourcePartPrefix, inputRoot, targetDir, targetPartPrefix, groupPaths))
             {
                 continue;
             }
 
+            if (target is null &&
+                FindCombinedTargetByTemplateName(primitive, targets) is { } templateMatch)
+            {
+                target = templateMatch.Target;
+                targetSubmeshIndex = templateMatch.SubmeshIndex;
+            }
             target ??= FindBestCombinedPartTarget(primitive, targets) ?? mainTarget;
-            AddPrimitive(result, target.FullPath, ClonePrimitiveForCombinedPart(primitive));
+            AddPrimitive(result, target.FullPath, ClonePrimitiveForCombinedPart(primitive, targetSubmeshIndex));
         }
 
         return result;
+    }
+
+    private static bool ShouldPreserveCombinedEyeHelperPrimitives(GltfModel model, GameConfig gameConfig)
+        => gameConfig.Id == GameId.WolfAmongUs &&
+           model.Primitives.Any(static primitive =>
+               string.IsNullOrWhiteSpace(primitive.SourceMeshPath) &&
+               primitive.TextureSlots.TryGetValue("diffuse", out var diffuse) &&
+               IsEyeHelperTextureName(diffuse.Name));
+
+    private static bool IsEyeHelperTextureName(string? name)
+    {
+        if (string.IsNullOrWhiteSpace(name))
+        {
+            return false;
+        }
+
+        var stem = Path.GetFileNameWithoutExtension(name);
+        return stem.Equals("map_1px_alpha", StringComparison.OrdinalIgnoreCase) ||
+               stem.Equals("color_000", StringComparison.OrdinalIgnoreCase);
     }
 
     // A primitive whose part suffix matches a sibling file outside the group (e.g. the GLB carries
@@ -2441,21 +2855,30 @@ public sealed class MainForm : Form
             Path.GetRelativePath(inputRoot, asset.MeshPath),
         };
         var tokens = BuildPartTokens(primaryLabels);
+        var templateNames = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        var templateSubmeshByName = new Dictionary<string, int>(StringComparer.OrdinalIgnoreCase);
+
+        var fallbackLabels = new List<string>();
+        for (var submeshIndex = 0; submeshIndex < mesh.Submeshes.Count; submeshIndex++)
+        {
+            var submesh = mesh.Submeshes[submeshIndex];
+            fallbackLabels.Add(submesh.Name);
+            AddTemplateName(templateNames, templateSubmeshByName, submesh.Name, submeshIndex);
+            if (!string.IsNullOrWhiteSpace(submesh.MaterialName))
+            {
+                fallbackLabels.Add(submesh.MaterialName!);
+                AddTemplateName(templateNames, templateSubmeshByName, submesh.MaterialName, submeshIndex);
+            }
+
+            fallbackLabels.AddRange(submesh.TextureNames.Values);
+            foreach (var textureName in submesh.TextureNames.Values)
+            {
+                AddTemplateName(templateNames, templateSubmeshByName, textureName, submeshIndex);
+            }
+        }
 
         if (tokens.Count == 0)
         {
-            var fallbackLabels = new List<string>();
-            foreach (var submesh in mesh.Submeshes)
-            {
-                fallbackLabels.Add(submesh.Name);
-                if (!string.IsNullOrWhiteSpace(submesh.MaterialName))
-                {
-                    fallbackLabels.Add(submesh.MaterialName!);
-                }
-
-                fallbackLabels.AddRange(submesh.TextureNames.Values);
-            }
-
             tokens = BuildPartTokens(fallbackLabels);
         }
 
@@ -2469,8 +2892,95 @@ public sealed class MainForm : Form
             asset,
             Path.GetFullPath(asset.MeshPath),
             tokens,
+            templateNames,
+            templateSubmeshByName,
             isMain,
             mesh.VertexCount);
+    }
+
+    private static CombinedPartTemplateMatch? FindCombinedTargetByTemplateName(GltfPrimitive primitive, IReadOnlyList<CombinedPartTarget> targets)
+    {
+        var labels = new List<string?>();
+        labels.Add(primitive.MaterialName);
+        labels.AddRange(primitive.TextureSlots.Values.Select(static image => image.Name));
+        labels.AddRange(primitive.ReferencedTextures.Values.Select(static image => image.Name));
+
+        var names = labels
+            .Select(NormalizeTemplateMatchName)
+            .Where(static name => !string.IsNullOrWhiteSpace(name))
+            .Distinct(StringComparer.OrdinalIgnoreCase)
+            .ToArray();
+        if (names.Length == 0)
+        {
+            return null;
+        }
+
+        CombinedPartTarget? best = null;
+        int? bestSubmeshIndex = null;
+        var bestScore = 0;
+        var tied = false;
+        foreach (var target in targets)
+        {
+            var score = names.Count(target.TemplateNames.Contains);
+            if (score > bestScore)
+            {
+                best = target;
+                bestSubmeshIndex = ResolveBestTemplateSubmeshIndex(names, target);
+                bestScore = score;
+                tied = false;
+            }
+            else if (score > 0 && score == bestScore)
+            {
+                tied = true;
+            }
+        }
+
+        return bestScore > 0 && !tied && best is not null
+            ? new CombinedPartTemplateMatch(best, bestSubmeshIndex)
+            : null;
+    }
+
+    private static int? ResolveBestTemplateSubmeshIndex(IReadOnlyList<string> names, CombinedPartTarget target)
+    {
+        foreach (var name in names)
+        {
+            if (target.TemplateSubmeshByName.TryGetValue(name, out var submeshIndex))
+            {
+                return submeshIndex;
+            }
+        }
+
+        return null;
+    }
+
+    private static void AddTemplateName(
+        HashSet<string> names,
+        Dictionary<string, int> submeshByName,
+        string? name,
+        int submeshIndex)
+    {
+        if (NormalizeTemplateMatchName(name) is { Length: > 0 } normalized)
+        {
+            names.Add(normalized);
+            submeshByName.TryAdd(normalized, submeshIndex);
+        }
+    }
+
+    private static string NormalizeTemplateMatchName(string? name)
+    {
+        if (string.IsNullOrWhiteSpace(name))
+        {
+            return "";
+        }
+
+        var stem = Path.GetFileNameWithoutExtension(name).Trim();
+        var generatedMarker = stem.IndexOf("__tt_", StringComparison.OrdinalIgnoreCase);
+        if (generatedMarker > 0)
+        {
+            stem = stem[..generatedMarker];
+        }
+
+        return stem;
     }
 
     private static void ExpandMissingCombinedPartSlots(IReadOnlyList<CombinedPartTarget> targets)
@@ -2487,7 +2997,7 @@ public sealed class MainForm : Form
 
         if (head is not null)
         {
-            foreach (var token in new[] { "hair", "eye", "brow", "ear", "nose", "neck" })
+            foreach (var token in new[] { "hair", "eye", "brow", "eyelashes", "ear", "nose", "neck" })
             {
                 if (Find(token) is null)
                 {
@@ -2597,6 +3107,7 @@ public sealed class MainForm : Form
         if (Has(token, "head")) tokens.Add("head");
         if (Has(token, "face")) tokens.Add("head");
         if (Has(token, "hair")) tokens.Add("hair");
+        if (Has(token, "eyelash") || Has(token, "eyelashes")) tokens.Add("eyelashes");
         if (Has(token, "hat")) tokens.Add("hat");
         if (Has(token, "hand")) tokens.Add("hand");
         if (Has(token, "arm")) tokens.Add("arm");
@@ -2614,9 +3125,9 @@ public sealed class MainForm : Form
     }
 
     private static int TokenWeight(string token)
-        => token is "body" or "torso" or "head" or "hair" or "hat" or "hand" or "arm" or "leg" or "foot" ? 3 : 1;
+        => token is "body" or "torso" or "head" or "hair" or "hat" or "hand" or "arm" or "leg" or "foot" or "eyelashes" ? 3 : 1;
 
-    private static GltfPrimitive ClonePrimitiveForCombinedPart(GltfPrimitive source)
+    private static GltfPrimitive ClonePrimitiveForCombinedPart(GltfPrimitive source, int? targetSubmeshIndex)
     {
         return new GltfPrimitive
         {
@@ -2636,7 +3147,7 @@ public sealed class MainForm : Form
             MaterialName = source.MaterialName,
             BonePaletteIndex = null,
             SourceMeshPath = null,
-            SourceSubmeshIndex = null,
+            SourceSubmeshIndex = targetSubmeshIndex,
             RecoveredDetailLineTextureName = source.RecoveredDetailLineTextureName,
             IsSkinned = source.IsSkinned,
             BaseColor = source.BaseColor,
@@ -2660,8 +3171,12 @@ public sealed class MainForm : Form
         ModelAsset Asset,
         string FullPath,
         HashSet<string> Tokens,
+        HashSet<string> TemplateNames,
+        Dictionary<string, int> TemplateSubmeshByName,
         bool IsMainPart,
         int OriginalVertexCount);
+
+    private sealed record CombinedPartTemplateMatch(CombinedPartTarget Target, int? SubmeshIndex);
 
     private string? ChooseOutputFolder()
     {
@@ -2752,12 +3267,12 @@ public sealed class MainForm : Form
         try
         {
             var message = await operation();
-            _statusLabel.Text = "Done.";
+            SetStatusText("Done.");
             MessageBox.Show(message, Text, MessageBoxButtons.OK, MessageBoxIcon.Information);
         }
         catch (Exception ex)
         {
-            _statusLabel.Text = "Error.";
+            SetStatusText("Error.");
             var logPath = ErrorLog.Write(ex, "Operation failed");
             MessageBox.Show(
                 $"Operation failed. A detailed log was written to:\n{logPath}\n\n{ex.Message}",
@@ -2801,11 +3316,12 @@ public sealed class MainForm : Form
 
         if (busy)
         {
-            // Start as an indeterminate "working" animation; long operations switch it to a real
-            // percentage via SetProgress. This makes it obvious the tool is busy, not frozen.
-            _progress.Style = ProgressBarStyle.Marquee;
-            _progress.MarqueeAnimationSpeed = 30;
-            _progressLabel.Text = "Working...";
+            _progress.MarqueeAnimationSpeed = 0;
+            _progress.Style = ProgressBarStyle.Continuous;
+            _progress.Minimum = 0;
+            _progress.Maximum = 100;
+            _progress.Value = 0;
+            _progressLabel.Text = "Working... 0%";
             _progress.Visible = true;
             _progressLabel.Visible = true;
         }
@@ -2813,23 +3329,31 @@ public sealed class MainForm : Form
         {
             _progress.Visible = false;
             _progressLabel.Visible = false;
+            _progressLabel.Text = "";
+            _progressLabel.ToolTipText = "";
             _progress.MarqueeAnimationSpeed = 0;
-            _progress.Style = ProgressBarStyle.Blocks;
+            _progress.Style = ProgressBarStyle.Continuous;
+            _progress.Value = 0;
         }
     }
 
-    // Switches the toolbar bar to a real percentage. Safe to call from a Progress<T> callback (UI thread).
+    // Updates the deterministic progress bar. Safe to call from a Progress<T> callback (UI thread).
     private void SetProgress(int done, int total, string label)
     {
-        if (total <= 0)
+        if (!_isBusy || total <= 0)
         {
             return;
         }
 
         _progress.Style = ProgressBarStyle.Continuous;
+        _progress.MarqueeAnimationSpeed = 0;
+        _progress.Minimum = 0;
         _progress.Maximum = total;
         _progress.Value = Math.Clamp(done, 0, total);
         _progressLabel.Text = label;
+        _progressLabel.ToolTipText = label;
+        _progress.Visible = true;
+        _progressLabel.Visible = true;
     }
 
     // Looks for a newer GitHub release. When silent (startup), stays quiet unless an update is found;
@@ -2939,7 +3463,8 @@ public sealed class MainForm : Form
         changelog.NewWindow += (_, e) => ((System.ComponentModel.CancelEventArgs)e).Cancel = true;
         changelog.Navigating += (_, e) =>
         {
-            if (changelog.DocumentText.Length > 0 && e.Url.Scheme is "http" or "https")
+            if (!string.IsNullOrEmpty(changelog.DocumentText) &&
+                e.Url is { Scheme: "http" or "https" })
             {
                 e.Cancel = true;
                 OpenUrl(e.Url.ToString());
@@ -3032,6 +3557,7 @@ public sealed class MainForm : Form
             FormBorderStyle = FormBorderStyle.Sizable,
             MinimizeBox = false,
             ShowInTaskbar = false,
+            Icon = LoadDialogIcon("logo - issue.ico"),
             ClientSize = new Size(680, 430),
             MinimumSize = new Size(560, 360),
             Font = Font,
@@ -3257,6 +3783,9 @@ public sealed class MainForm : Form
             : name;
     }
 
+    private static string BuildLoadedFolderStatus(string? folder)
+        => $"Loaded: {GetSafeFolderName(folder)}";
+
     private static string BuildIssueUrl(string title, string body)
     {
         const string newIssueUrl = "https://github.com/HeitorSpectre/Telltale-D3DMesh-Editor/issues/new";
@@ -3264,6 +3793,11 @@ public sealed class MainForm : Form
             + "?title=" + Uri.EscapeDataString(title)
             + "&body=" + Uri.EscapeDataString(body);
     }
+
+    private static Icon LoadDialogIcon(string iconFileName)
+        => EmbeddedIconResources.LoadIcon(iconFileName == "logo - issue.ico"
+            ? EmbeddedIconResources.Issue
+            : EmbeddedIconResources.D3DMesh);
 
     private void ShowCreditsDialog()
     {

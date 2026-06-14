@@ -6,6 +6,12 @@ public enum GameId
     WolfAmongUs,
     WalkingDeadSeason2,
     MinecraftStoryMode,
+    BackToTheFuture,
+    BackToTheFutureEpisode1,
+    BackToTheFutureEpisode2,
+    BackToTheFutureEpisode3,
+    BackToTheFutureEpisode4,
+    BackToTheFutureEpisode5,
 }
 
 // Per-game settings, so behaviour specific to one game stays isolated and never affects another. The
@@ -16,6 +22,13 @@ public sealed class GameConfig
 {
     public required GameId Id { get; init; }
     public required string DisplayName { get; init; }
+    public bool IsBackToTheFuture => Id is
+        GameId.BackToTheFuture or
+        GameId.BackToTheFutureEpisode1 or
+        GameId.BackToTheFutureEpisode2 or
+        GameId.BackToTheFutureEpisode3 or
+        GameId.BackToTheFutureEpisode4 or
+        GameId.BackToTheFutureEpisode5;
 
     // Some games store a material's opacity (hair strands, lens, etc.) in a separate companion texture
     // named "<diffuse>Alpha" / "<diffuse>_alpha" rather than in the diffuse's own alpha channel. When
@@ -104,7 +117,7 @@ public sealed class GameConfig
         ClearInheritedSecondaryTexturesOnReimport = false,
         PreferGltfTextureNamesOnReimport = false,
         PreferSemanticTemplateTextureNamesOnReimport = false,
-        RemoveEyeHelperPrimitivesOnReimport = false,
+        RemoveEyeHelperPrimitivesOnReimport = true,
         SplitBodyLineAlphaOnReimport = false,
         InvertBodyLineAlphaOnReimport = false,
         InvertHeadLineAlphaOnReimport = false,
@@ -125,7 +138,7 @@ public sealed class GameConfig
         ClearInheritedSecondaryTexturesOnReimport = false,
         PreferGltfTextureNamesOnReimport = false,
         PreferSemanticTemplateTextureNamesOnReimport = true,
-        RemoveEyeHelperPrimitivesOnReimport = true,
+        RemoveEyeHelperPrimitivesOnReimport = false,
         SplitBodyLineAlphaOnReimport = false,
         InvertBodyLineAlphaOnReimport = false,
         InvertHeadLineAlphaOnReimport = false,
@@ -179,11 +192,52 @@ public sealed class GameConfig
         PortCompanionVariantPartsOnReimport = true,
     };
 
-    public static readonly IReadOnlyList<GameConfig> All = [Generic, WolfAmongUs, WalkingDeadSeason2, MinecraftStoryMode];
+    public static readonly GameConfig BackToTheFuture = CreateBackToTheFuture(GameId.BackToTheFuture, "Back to the Future: The Game");
+    public static readonly GameConfig BackToTheFutureEpisode1 = CreateBackToTheFuture(GameId.BackToTheFutureEpisode1, "Back to the Future: Episode 1 - It's About Time");
+    public static readonly GameConfig BackToTheFutureEpisode2 = CreateBackToTheFuture(GameId.BackToTheFutureEpisode2, "Back to the Future: Episode 2 - Get Tannen!");
+    public static readonly GameConfig BackToTheFutureEpisode3 = CreateBackToTheFuture(GameId.BackToTheFutureEpisode3, "Back to the Future: Episode 3 - Citizen Brown");
+    public static readonly GameConfig BackToTheFutureEpisode4 = CreateBackToTheFuture(GameId.BackToTheFutureEpisode4, "Back to the Future: Episode 4 - Double Visions");
+    public static readonly GameConfig BackToTheFutureEpisode5 = CreateBackToTheFuture(GameId.BackToTheFutureEpisode5, "Back to the Future: Episode 5 - OUTATIME");
+
+    public static readonly IReadOnlyList<GameConfig> All =
+    [
+        Generic,
+        WolfAmongUs,
+        WalkingDeadSeason2,
+        MinecraftStoryMode,
+        BackToTheFuture,
+        BackToTheFutureEpisode1,
+        BackToTheFutureEpisode2,
+        BackToTheFutureEpisode3,
+        BackToTheFutureEpisode4,
+        BackToTheFutureEpisode5,
+    ];
 
     // The active game. Defaults to Generic, which behaves exactly as the tool did before per-game config.
     public static GameConfig Current { get; set; } = Generic;
 
     public static GameConfig FromId(GameId id)
         => All.FirstOrDefault(game => game.Id == id) ?? Generic;
+
+    private static GameConfig CreateBackToTheFuture(GameId id, string displayName)
+        => new()
+        {
+            Id = id,
+            DisplayName = displayName,
+            UsesCompanionAlphaTextures = true,
+            ClearInheritedBakeOnReimport = false,
+            ClearInheritedSecondaryTexturesOnReimport = false,
+            PreferGltfTextureNamesOnReimport = false,
+            PreferSemanticTemplateTextureNamesOnReimport = true,
+            RemoveEyeHelperPrimitivesOnReimport = false,
+            SplitBodyLineAlphaOnReimport = false,
+            InvertBodyLineAlphaOnReimport = false,
+            InvertHeadLineAlphaOnReimport = false,
+            InvertHandLineAlphaOnReimport = false,
+            TreatAdvObj000TexturesAsBake = true,
+            PixelatedGltfTextures = false,
+            PreserveSkeletonDerivedFieldsOnMerge = false,
+            PortTranslationScalesOnSkeletonMerge = false,
+            PortCompanionVariantPartsOnReimport = false,
+        };
 }

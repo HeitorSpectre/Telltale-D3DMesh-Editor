@@ -1,3 +1,4 @@
+using TelltaleD3DMeshEditor.Core;
 using TelltaleD3DMeshEditor.Formats.Mesh;
 using TelltaleD3DMeshEditor.Formats.Skeleton;
 
@@ -14,6 +15,11 @@ public sealed class ModelAsset
 
     public string MeshPath { get; }
     public string? SkeletonPath { get; }
+
+    public static ModelAsset FromPaths(string meshPath, string? skeletonPath = null)
+        => new(
+            Path.GetFullPath(meshPath),
+            string.IsNullOrWhiteSpace(skeletonPath) ? null : Path.GetFullPath(skeletonPath));
 
     // Discovers every mesh under <paramref name="inputPath"/> and pairs it with its skeleton.
     // <paramref name="progress"/> (optional) receives a 0..1 fraction as meshes are processed; it is
@@ -106,7 +112,7 @@ public sealed class ModelAsset
         {
             try
             {
-                var skeleton = SkeletonLoader.Load(skeletonPath, version: 13);
+                var skeleton = SkeletonLoader.Load(skeletonPath, GameConfig.Current.IsBackToTheFuture ? 1 : 13);
                 result[skeletonPath] = skeleton.Bones
                     .Select(bone => bone.Hash)
                     .Where(hash => hash != 0)

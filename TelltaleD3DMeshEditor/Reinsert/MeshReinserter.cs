@@ -967,6 +967,7 @@ public static class MeshReinserter
                     var slotIndex = Array.FindIndex(layout.TextureSlots, candidate => string.Equals(candidate, slot, StringComparison.OrdinalIgnoreCase));
                     if (slotIndex < 0 ||
                         slotIndex >= template.TextureSlotFieldOffsets.Length ||
+                        !TemplateProvidesSlot(layout, template, slotIndex) ||
                         !textureIndexBySlot.TryGetValue(slot, out var indexByName) ||
                         !indexByName.TryGetValue(textureName, out var textureIndex))
                     {
@@ -1100,6 +1101,11 @@ public static class MeshReinserter
 
                 var slotIndex = Array.FindIndex(layout.TextureSlots, candidate => string.Equals(candidate, slot, StringComparison.OrdinalIgnoreCase));
                 if (slotIndex < 0)
+                {
+                    continue;
+                }
+
+                if (!TemplateProvidesSlot(layout, template, slotIndex))
                 {
                     continue;
                 }
@@ -1466,6 +1472,11 @@ public static class MeshReinserter
     private static bool TemplateProvidesSlot(D3DMeshLayout layout, SubmeshLayout template, string slot)
     {
         var slotIndex = Array.FindIndex(layout.TextureSlots, candidate => string.Equals(candidate, slot, StringComparison.OrdinalIgnoreCase));
+        return TemplateProvidesSlot(layout, template, slotIndex);
+    }
+
+    private static bool TemplateProvidesSlot(D3DMeshLayout layout, SubmeshLayout template, int slotIndex)
+    {
         return ReadTemplateTextureSlotIndex(layout, template, slotIndex) >= 0;
     }
 

@@ -16,6 +16,7 @@ internal static class Program
         }
 
         FileAssociationService.RegisterD3DMeshAssociation();
+        FileAssociationService.RegisterSkeletonAssociation();
 
         Application.SetUnhandledExceptionMode(UnhandledExceptionMode.CatchException);
         Application.ThreadException += (_, e) => ShowUnhandledException(e.Exception, "Unhandled UI exception");

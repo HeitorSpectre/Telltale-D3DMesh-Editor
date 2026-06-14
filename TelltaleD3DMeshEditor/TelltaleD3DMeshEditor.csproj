@@ -43,11 +43,35 @@
     <None Include="Resources\HashDBs\TexNames.HashDB" Link="HashDBs\TexNames.HashDB">
       <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
     </None>
-    <None Include="Resources\Icons\d3dmesh.ico" Link="Resources\Icons\d3dmesh.ico">
-      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
-    </None>
+    <EmbeddedResource Include="Resources\Icons\d3dmesh.ico">
+      <LogicalName>TelltaleD3DMeshEditor.Resources.Icons.D3DMesh.ico</LogicalName>
+    </EmbeddedResource>
+    <EmbeddedResource Include="Resources\Icons\skl.ico">
+      <LogicalName>TelltaleD3DMeshEditor.Resources.Icons.Skeleton.ico</LogicalName>
+    </EmbeddedResource>
+    <EmbeddedResource Include="Resources\Icons\logo - issue.ico">
+      <LogicalName>TelltaleD3DMeshEditor.Resources.Icons.Issue.ico</LogicalName>
+    </EmbeddedResource>
     <EmbeddedResource Include="Resources\Images\drag and drop.png">
       <LogicalName>TelltaleD3DMeshEditor.Resources.Images.DragDrop.png</LogicalName>
+    </EmbeddedResource>
+    <EmbeddedResource Include="Resources\Images\Logo Background.png">
+      <LogicalName>TelltaleD3DMeshEditor.Resources.Images.LogoBackground.png</LogicalName>
+    </EmbeddedResource>
+    <EmbeddedResource Include="Resources\Images\BTTF101.png">
+      <LogicalName>TelltaleD3DMeshEditor.Resources.Images.BTTF101.png</LogicalName>
+    </EmbeddedResource>
+    <EmbeddedResource Include="Resources\Images\BTTF102.png">
+      <LogicalName>TelltaleD3DMeshEditor.Resources.Images.BTTF102.png</LogicalName>
+    </EmbeddedResource>
+    <EmbeddedResource Include="Resources\Images\BTTF103.png">
+      <LogicalName>TelltaleD3DMeshEditor.Resources.Images.BTTF103.png</LogicalName>
+    </EmbeddedResource>
+    <EmbeddedResource Include="Resources\Images\BTTF104.png">
+      <LogicalName>TelltaleD3DMeshEditor.Resources.Images.BTTF104.png</LogicalName>
+    </EmbeddedResource>
+    <EmbeddedResource Include="Resources\Images\BTTF105.png">
+      <LogicalName>TelltaleD3DMeshEditor.Resources.Images.BTTF105.png</LogicalName>
     </EmbeddedResource>
   </ItemGroup>
 
