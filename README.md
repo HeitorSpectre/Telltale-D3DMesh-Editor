@@ -30,7 +30,7 @@ https://github.com/HeitorSpectre/Telltale-D3DMesh-Editor/wiki
 |----------|------|--------|
 | PC | The Walking Dead: Season 2 | ✅ Working |
 | PC | The Wolf Among Us | ✅ Working |
-| PC | Minecraft Story Mode: Season One | 🚧 In Progress |
+| PC | Minecraft: Story Mode - Season 1 | 🚧 In Progress |
 
 ## Help with testing
 
