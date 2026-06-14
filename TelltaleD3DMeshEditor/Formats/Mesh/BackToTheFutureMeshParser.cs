@@ -542,6 +542,13 @@ internal static class BackToTheFutureMeshParser
             return "specular";
         }
 
+        if ((lower.Contains("environ", StringComparison.Ordinal) ||
+             lower.Contains("reflect", StringComparison.Ordinal)) &&
+            !existing.ContainsKey("environment"))
+        {
+            return "environment";
+        }
+
         if (!existing.ContainsKey("bake"))
         {
             return "bake";

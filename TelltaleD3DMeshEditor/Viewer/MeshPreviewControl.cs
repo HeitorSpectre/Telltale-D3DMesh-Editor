@@ -514,8 +514,9 @@ public sealed class MeshPreviewControl : Control
 
     private static bool IsTransparentPreviewMaterial(MaterialTextureSet? textures)
     {
-        return textures is not null &&
-               (textures.Diffuse?.AverageAlpha ?? 1f) < 0.95f;
+        var diffuse = textures?.Diffuse;
+        return diffuse is not null &&
+               (diffuse.AverageAlpha < 0.95f || diffuse.NonOpaqueAlphaRatio > 0.08f);
     }
 
     private static float EstimateSubmeshDepth(SubmeshData submesh, Matrix4x4 transform)

@@ -15,6 +15,7 @@ public sealed class TextureImage
         Pixels = pixels;
         SourcePath = sourcePath;
         AverageAlpha = ComputeAverageAlpha(pixels);
+        NonOpaqueAlphaRatio = ComputeNonOpaqueAlphaRatio(pixels);
     }
 
     public int Width { get; }
@@ -22,6 +23,7 @@ public sealed class TextureImage
     public int[] Pixels { get; }
     public string SourcePath { get; }
     public float AverageAlpha { get; }
+    public float NonOpaqueAlphaRatio { get; }
 
     public int Sample(float u, float v)
     {
@@ -72,6 +74,25 @@ public sealed class TextureImage
         }
 
         return sum / (pixels.Length * 255f);
+    }
+
+    private static float ComputeNonOpaqueAlphaRatio(int[] pixels)
+    {
+        if (pixels.Length == 0)
+        {
+            return 0f;
+        }
+
+        var count = 0;
+        foreach (var pixel in pixels)
+        {
+            if (((pixel >> 24) & 0xFF) < 250)
+            {
+                count++;
+            }
+        }
+
+        return count / (float)pixels.Length;
     }
 }
 

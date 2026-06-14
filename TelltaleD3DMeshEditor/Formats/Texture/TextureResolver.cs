@@ -429,10 +429,15 @@ public static class TextureResolver
             .Where(name => !string.IsNullOrWhiteSpace(name))
             .ToList();
         var hasGlassName = names.Any(IsGlassLikeName);
+        var hasSyntheticGlassColor = names.Any(IsBackToTheFutureSyntheticGlassColor);
 
         if (hasGlassName)
         {
             set.Diffuse = WithGlassPixelAlpha(set.Diffuse, 0.68f);
+        }
+        else if (hasSyntheticGlassColor)
+        {
+            set.Diffuse = WithUniformAlpha(set.Diffuse, 0.45f);
         }
     }
 
@@ -488,6 +493,13 @@ public static class TextureResolver
                !name.Contains("windowtrim", StringComparison.OrdinalIgnoreCase) &&
                !name.Contains("window_frame", StringComparison.OrdinalIgnoreCase) &&
                !name.Contains("window_trim", StringComparison.OrdinalIgnoreCase);
+    }
+
+    private static bool IsBackToTheFutureSyntheticGlassColor(string name)
+    {
+        // BTTF apartment cabinet glass is stored as a synthetic flat color, not as a named
+        // glass/window texture. Keep this exact enough to avoid making generic grey props transparent.
+        return name.Equals("color_5d5d5d", StringComparison.OrdinalIgnoreCase);
     }
 
     private static bool TryFindExactTexture(string value, IReadOnlyList<TextureCandidate> files, out TextureCandidate candidate)
