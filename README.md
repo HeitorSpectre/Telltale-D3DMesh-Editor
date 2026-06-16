@@ -48,7 +48,7 @@ Made by [Heitor Spectre](https://github.com/HeitorSpectre).
 
 Special thanks to everyone who helped with this project:
 
-- **TelltaleToolKit** by [iMrShadow](https://github.com/iMrShadow)
+- **TelltaleToolKit and TelltaleTextureTool** by [iMrShadow](https://github.com/iMrShadow)
 - **D3DMeshUtilities** by [Gamma_02](https://github.com/gamma-02)
 - **D3DMESH-Converter** by [David Matos](https://github.com/frostbone25)
 - **TelltaleGames_D3DMesh** by [RandomTBush](https://github.com/RandomTBush)
