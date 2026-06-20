@@ -96,7 +96,7 @@ public sealed class ModelAsset
 
         try
         {
-            var mesh = D3DMeshParser.Parse(File.ReadAllBytes(meshPath));
+            var mesh = D3DMeshParser.ParseFile(meshPath);
             return FindUniquePaletteMatch(mesh, skeletonHashes);
         }
         catch

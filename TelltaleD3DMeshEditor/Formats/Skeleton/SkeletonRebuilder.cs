@@ -1,3 +1,4 @@
+using System.Buffers.Binary;
 using System.Numerics;
 using TelltaleToolKit;
 using TelltaleToolKit.Meta.Serialization;
@@ -41,6 +42,22 @@ public static class SkeletonRebuilder
         using var output = new MemoryStream();
         Toolkit.Instance.Serialize(skeleton, output, config);
         return output.ToArray();
+    }
+
+    public static byte[] RebuildWithEdits(string originalSklPath, SkeletonData edited, GameConfig gameConfig)
+    {
+        if (gameConfig.IsOriginalTalesFromTheBorderlandsPc)
+        {
+            // TFTB original PC builds use a legacy MSV skeleton layout that the toolkit cannot serialize yet.
+            // Rebuild it by applying the imported GLB's local bone transforms onto the target .skl
+            // entry table, matching the same partial-skeleton workflow used by the other games.
+            return RebuildLegacyMsvSkeletonWithEdits(
+                originalSklPath,
+                edited,
+                allowCharacterSpecificAliases: !gameConfig.DisableCharacterSpecificFacialRetargetOnReimport);
+        }
+
+        return RebuildWithEdits(originalSklPath, edited);
     }
 
     // True when reconstructing the skeleton (without changes) reproduces the original file byte-for-byte.
@@ -207,6 +224,159 @@ public static class SkeletonRebuilder
             $"Could not interpret '{Path.GetFileName(sklPath)}' as a Telltale skeleton with any known game profile.");
     }
 
+    private static byte[] RebuildLegacyMsvSkeletonWithEdits(
+        string originalSklPath,
+        SkeletonData edited,
+        bool allowCharacterSpecificAliases)
+    {
+        var bytes = File.ReadAllBytes(originalSklPath);
+        var records = ReadLegacyMsvBoneRecords(bytes);
+        var editedByHash = edited.Bones
+            .Where(bone => bone.Hash != 0)
+            .GroupBy(bone => bone.Hash)
+            .ToDictionary(group => group.Key, group => group.First());
+        var editedByName = edited.Bones
+            .Where(bone => !string.IsNullOrWhiteSpace(bone.Name))
+            .GroupBy(bone => bone.Name, StringComparer.OrdinalIgnoreCase)
+            .ToDictionary(group => group.Key, group => group.First(), StringComparer.OrdinalIgnoreCase);
+        var editedByAlias = allowCharacterSpecificAliases
+            ? edited.Bones
+                .Select(bone => (Bone: bone, HasAlias: BoneNameAliases.TryGetCharacterSpecificAlias(bone.Name, out var alias), Alias: alias))
+                .Where(item => item.HasAlias)
+                .GroupBy(item => item.Alias, StringComparer.OrdinalIgnoreCase)
+                .ToDictionary(group => group.Key, group => group.First().Bone, StringComparer.OrdinalIgnoreCase)
+            : new Dictionary<string, BoneData>(StringComparer.OrdinalIgnoreCase);
+
+        var matchedBones = 0;
+        foreach (var record in records)
+        {
+            if (!TryFindEditedBone(record, editedByHash, editedByName, editedByAlias, allowCharacterSpecificAliases, out var bone))
+            {
+                continue;
+            }
+
+            matchedBones++;
+            WriteLegacyF32(bytes, record.PositionOffset, bone.X);
+            WriteLegacyF32(bytes, record.PositionOffset + 4, bone.Y);
+            WriteLegacyF32(bytes, record.PositionOffset + 8, bone.Z);
+            WriteLegacyF32(bytes, record.RotationOffset, bone.Qx);
+            WriteLegacyF32(bytes, record.RotationOffset + 4, bone.Qy);
+            WriteLegacyF32(bytes, record.RotationOffset + 8, bone.Qz);
+            WriteLegacyF32(bytes, record.RotationOffset + 12, bone.Qw);
+        }
+
+        if (matchedBones == 0 && edited.Bones.Count > 0)
+        {
+            throw new InvalidDataException(
+                $"TFTB skeleton rebuild could not match any imported GLB bones to '{Path.GetFileName(originalSklPath)}'.");
+        }
+
+        return bytes;
+    }
+
+    private static List<LegacyMsvBoneRecord> ReadLegacyMsvBoneRecords(byte[] data)
+    {
+        var header = MetaStreamHeader.Parse(data);
+        if (header.Version == "MTRE")
+        {
+            throw new InvalidDataException("Legacy MSV skeleton rebuild does not support MTRE/ERTM skeletons.");
+        }
+
+        var reader = new DataReader(data);
+        if (header.DataOffset > 0)
+        {
+            reader.Seek(header.DataOffset);
+        }
+
+        reader.ReadUInt32();
+        var boneCount = checked((int)reader.ReadUInt32());
+        if (boneCount < 0 || boneCount > 4096)
+        {
+            throw new InvalidDataException($"Invalid legacy MSV skeleton bone count: {boneCount}");
+        }
+
+        var records = new List<LegacyMsvBoneRecord>(boneCount);
+        for (var i = 0; i < boneCount; i++)
+        {
+            var hash = ReadLegacySymbolHash(reader);
+            ReadLegacySymbolHash(reader);
+            reader.ReadInt32();
+            var positionOffset = reader.Position;
+            reader.Skip(3 * 4);
+            var rotationOffset = reader.Position;
+            reader.Skip(4 * 4);
+
+            reader.ReadUInt32();
+            reader.Skip(3 * 4);
+            reader.ReadFloat();
+            reader.Skip(3 * 4);
+            reader.Skip(9 * 4);
+
+            reader.ReadUInt32();
+            var ikCount = checked((int)reader.ReadUInt32());
+            for (var ik = 0; ik < ikCount; ik++)
+            {
+                var nameLength = checked((int)reader.ReadUInt32());
+                reader.Skip(nameLength);
+                reader.ReadFloat();
+            }
+
+            reader.ReadUInt32();
+            var piAmount = checked((int)reader.ReadUInt32());
+            reader.Skip(piAmount * 12);
+            reader.ReadUInt32();
+            reader.Skip(24);
+            reader.ReadFloat();
+
+            records.Add(new LegacyMsvBoneRecord(
+                hash,
+                BoneHashDatabase.Resolve(hash) ?? $"bone_{hash:X16}",
+                positionOffset,
+                rotationOffset));
+        }
+
+        return records;
+    }
+
+    private static bool TryFindEditedBone(
+        LegacyMsvBoneRecord record,
+        IReadOnlyDictionary<ulong, BoneData> editedByHash,
+        IReadOnlyDictionary<string, BoneData> editedByName,
+        IReadOnlyDictionary<string, BoneData> editedByAlias,
+        bool allowCharacterSpecificAliases,
+        out BoneData bone)
+    {
+        if (record.Hash != 0 && editedByHash.TryGetValue(record.Hash, out bone!))
+        {
+            return true;
+        }
+
+        if (editedByName.TryGetValue(record.Name, out bone!))
+        {
+            return true;
+        }
+
+        if (allowCharacterSpecificAliases &&
+            BoneNameAliases.TryGetCharacterSpecificAlias(record.Name, out var alias) &&
+            editedByAlias.TryGetValue(alias, out bone!))
+        {
+            return true;
+        }
+
+        bone = null!;
+        return false;
+    }
+
+    private static ulong ReadLegacySymbolHash(DataReader reader)
+    {
+        var low = reader.ReadUInt32();
+        var high = reader.ReadUInt32();
+        return ((ulong)high << 32) | low;
+    }
+
+    private static void WriteLegacyF32(byte[] data, int offset, float value)
+        => BinaryPrimitives.WriteSingleLittleEndian(data.AsSpan(offset, 4), value);
+
     private static void EnsureInitialized()
     {
         if (Toolkit.IsInitialized)
@@ -270,3 +440,9 @@ public sealed record SkeletonEntryDiagnostics(
     System.Numerics.Vector3 GlobalTranslationScale,
     System.Numerics.Vector3 LocalTranslationScale,
     System.Numerics.Vector3 AnimTranslationScale);
+
+internal sealed record LegacyMsvBoneRecord(
+    ulong Hash,
+    string Name,
+    int PositionOffset,
+    int RotationOffset);

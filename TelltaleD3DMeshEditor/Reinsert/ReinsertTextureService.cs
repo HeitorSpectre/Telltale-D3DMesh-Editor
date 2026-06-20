@@ -88,9 +88,12 @@ public static class ReinsertTextureService
                 {
                     if (TryResolveGameProvidedTextureName(templateMeshPath, image.Name, out var gameProvidedName))
                     {
-                        CopyGameProvidedTextureIfAvailable(templateMeshPath, outputFolder, gameProvidedName, writtenNames);
-                        writtenByImage[imageKey] = gameProvidedName;
-                        continue;
+                        if (ShouldMapWithoutEmittingGameProvidedTexture(gameProvidedName) ||
+                            CopyGameProvidedTextureIfAvailable(templateMeshPath, outputFolder, gameProvidedName, writtenNames))
+                        {
+                            writtenByImage[imageKey] = gameProvidedName;
+                            continue;
+                        }
                     }
 
                     var namingSlot = diffuseImageKeys.Contains(imageKey)
@@ -129,9 +132,12 @@ public static class ReinsertTextureService
 
                     if (TryResolveGameProvidedTextureName(templateMeshPath, textureName, out var chosenGameProvidedName))
                     {
-                        CopyGameProvidedTextureIfAvailable(templateMeshPath, outputFolder, chosenGameProvidedName, writtenNames);
-                        writtenByImage[imageKey] = chosenGameProvidedName;
-                        continue;
+                        if (ShouldMapWithoutEmittingGameProvidedTexture(chosenGameProvidedName) ||
+                            CopyGameProvidedTextureIfAvailable(templateMeshPath, outputFolder, chosenGameProvidedName, writtenNames))
+                        {
+                            writtenByImage[imageKey] = chosenGameProvidedName;
+                            continue;
+                        }
                     }
 
                     var outputTexturePath = Path.Combine(outputFolder, textureName + ".d3dtx");
@@ -173,9 +179,12 @@ public static class ReinsertTextureService
                 var semanticSlotName = ResolveSemanticTemplateName(primitive, image.Name, normalizedSlot, semanticTemplateNames, gameConfig);
                 if (TryResolveGameProvidedTextureName(templateMeshPath, semanticSlotName ?? image.Name, out var slotGameProvidedName))
                 {
-                    CopyGameProvidedTextureIfAvailable(templateMeshPath, outputFolder, slotGameProvidedName, writtenNames);
-                    slots[normalizedSlot] = slotGameProvidedName;
-                    continue;
+                    if (ShouldMapWithoutEmittingGameProvidedTexture(slotGameProvidedName) ||
+                        CopyGameProvidedTextureIfAvailable(templateMeshPath, outputFolder, slotGameProvidedName, writtenNames))
+                    {
+                        slots[normalizedSlot] = slotGameProvidedName;
+                        continue;
+                    }
                 }
 
                 if (TryWriteBodyLineInvertedAlphaTexture(
@@ -303,15 +312,35 @@ public static class ReinsertTextureService
         }
 
         var sourceTexturePath = FindSourceTextureTemplate(templateMeshPath, lineName);
-        if (sourceTexturePath is null)
+        var recoveredLineImage = primitive.RecoveredDetailLineImage;
+        if (sourceTexturePath is null && recoveredLineImage is null)
         {
             return;
         }
 
         var outputTexturePath = Path.Combine(outputFolder, lineName + ".d3dtx");
-        if (!Path.GetFullPath(sourceTexturePath).Equals(Path.GetFullPath(outputTexturePath), StringComparison.OrdinalIgnoreCase))
+        if (sourceTexturePath is not null)
         {
-            D3dtxWriter.WriteRenamedCopy(File.ReadAllBytes(sourceTexturePath), outputTexturePath);
+            if (!Path.GetFullPath(sourceTexturePath).Equals(Path.GetFullPath(outputTexturePath), StringComparison.OrdinalIgnoreCase))
+            {
+                D3dtxWriter.WriteRenamedCopy(File.ReadAllBytes(sourceTexturePath), outputTexturePath);
+            }
+        }
+        else
+        {
+            if (recoveredLineImage is null)
+            {
+                return;
+            }
+
+            var templateTexturePath = FindDetailTextureTemplate(templateMeshPath) ?? FindTemplateTexture(templateMeshPath);
+            if (templateTexturePath is null)
+            {
+                return;
+            }
+
+            var templateBytes = File.ReadAllBytes(templateTexturePath);
+            D3dtxWriter.WriteFromImageBytes(templateBytes, recoveredLineImage, outputTexturePath, options.ForceUncompressed);
         }
 
         writtenNames.Add(lineName);
@@ -837,7 +866,7 @@ public static class ReinsertTextureService
         MeshData? templateMesh;
         try
         {
-            templateMesh = D3DMeshParser.Parse(File.ReadAllBytes(templateMeshPath));
+            templateMesh = D3DMeshParser.ParseFile(templateMeshPath);
         }
         catch
         {
@@ -876,7 +905,45 @@ public static class ReinsertTextureService
 
         return new AtlasTextureNames(
             SanitizeName(bestDiffuse),
-            ResolveCompatibleAtlasNormalName(templateMesh, bestDiffuse));
+            ResolveCompatibleAtlasNormalName(templateMesh, bestDiffuse),
+            ResolveCompatibleAtlasDetailName(templateMesh, bestDiffuse));
+    }
+
+    // Finds an existing detail/lines texture name from the template to reuse for the separate detail atlas,
+    // so the detail section keeps a real detail map name (and the writer reuses its original .d3dtx format,
+    // which for lines is often A8/alpha rather than colour BC). Prefers a name in the same texture family as
+    // the chosen diffuse; otherwise returns the first detail/lines name found.
+    private static string? ResolveCompatibleAtlasDetailName(MeshData? templateMesh, string atlasDiffuseName)
+    {
+        if (templateMesh is null)
+        {
+            return null;
+        }
+
+        var atlasFamily = TextureFamilyKey(StripKnownTextureExtension(Path.GetFileName(atlasDiffuseName)));
+        string? firstDetail = null;
+        foreach (var submesh in templateMesh.Submeshes)
+        {
+            foreach (var slot in new[] { "detail_diffuse", "detail_bump", "tex8" })
+            {
+                if (!submesh.TextureNames.TryGetValue(slot, out var name) ||
+                    !IsSafeOriginalReplacementTextureName(name) ||
+                    !IsLineOrDetailTexture(name))
+                {
+                    continue;
+                }
+
+                var stem = StripKnownTextureExtension(Path.GetFileName(name));
+                firstDetail ??= stem;
+                if (!string.IsNullOrWhiteSpace(atlasFamily) &&
+                    TextureFamilyKey(stem).Equals(atlasFamily, StringComparison.OrdinalIgnoreCase))
+                {
+                    return SanitizeName(stem);
+                }
+            }
+        }
+
+        return firstDetail is null ? null : SanitizeName(firstDetail);
     }
 
     private static string? ResolveCompatibleAtlasNormalName(MeshData? templateMesh, string atlasDiffuseName)
@@ -998,7 +1065,7 @@ public static class ReinsertTextureService
 
         try
         {
-            var mesh = D3DMeshParser.Parse(File.ReadAllBytes(templateMeshPath));
+            var mesh = D3DMeshParser.ParseFile(templateMeshPath);
             var resolved = TextureResolver.ResolveForMesh(folder, templateMeshPath, mesh);
             var diffuse = resolved.Values.FirstOrDefault(set => set.Diffuse is not null)?.Diffuse?.SourcePath;
             if (!string.IsNullOrWhiteSpace(diffuse) && File.Exists(diffuse))
@@ -1020,6 +1087,37 @@ public static class ReinsertTextureService
             .OrderByDescending(path => new FileInfo(path).Length)
             .FirstOrDefault()
             ?? Directory.EnumerateFiles(folder, "*.d3dtx", SearchOption.TopDirectoryOnly).FirstOrDefault();
+    }
+
+    private static string? FindDetailTextureTemplate(string templateMeshPath)
+    {
+        var folder = Path.GetDirectoryName(Path.GetFullPath(templateMeshPath));
+        if (folder is null || !Directory.Exists(folder))
+        {
+            return null;
+        }
+
+        try
+        {
+            var mesh = D3DMeshParser.ParseFile(templateMeshPath);
+            foreach (var submesh in mesh.Submeshes)
+            {
+                if (submesh.TextureNames.TryGetValue("detail_diffuse", out var detailName) &&
+                    FindSourceTextureTemplate(templateMeshPath, detailName) is { } detailPath)
+                {
+                    return detailPath;
+                }
+            }
+        }
+        catch
+        {
+            // Fallback below keeps the recovery usable for meshes we cannot parse here.
+        }
+
+        return Directory.EnumerateFiles(folder, "*.d3dtx", SearchOption.TopDirectoryOnly)
+            .Where(path => IsLineOrDetailTexture(Path.GetFileNameWithoutExtension(path)))
+            .OrderByDescending(path => new FileInfo(path).Length)
+            .FirstOrDefault();
     }
 
     private static string? FindDiffuseTextureByMeshHash(string folder, string templateMeshPath)
@@ -1106,10 +1204,31 @@ public static class ReinsertTextureService
         bool preserveTemplateName)
     {
         if (nameMode == ResolvedTextureNameMode.SemanticTemplateNames &&
-            semanticTemplateName is not null &&
-            TryReservePreservedName(semanticTemplateName, reservedNames) is { } semanticName)
+            semanticTemplateName is not null)
         {
-            return semanticName;
+            if (TryReservePreservedName(semanticTemplateName, reservedNames) is { } semanticName)
+            {
+                return semanticName;
+            }
+
+            if (sourceTexturePath is not null &&
+                TryReservePreservedName(Path.GetFileName(sourceTexturePath), reservedNames) is { } sourceSemanticFallback)
+            {
+                return sourceSemanticFallback;
+            }
+
+            foreach (var preferred in preferredOriginalNames)
+            {
+                if (TryReservePreservedName(preferred, reservedNames) is { } preferredSemanticFallback)
+                {
+                    return preferredSemanticFallback;
+                }
+            }
+
+            if (TryReservePreservedName(rawName, reservedNames) is { } rawSemanticFallback)
+            {
+                return rawSemanticFallback;
+            }
         }
 
         if (nameMode == ResolvedTextureNameMode.SemanticTemplateNames &&
@@ -1245,7 +1364,7 @@ public static class ReinsertTextureService
         MeshData templateMesh;
         try
         {
-            templateMesh = D3DMeshParser.Parse(File.ReadAllBytes(templateMeshPath));
+            templateMesh = D3DMeshParser.ParseFile(templateMeshPath);
         }
         catch
         {
@@ -1412,7 +1531,7 @@ public static class ReinsertTextureService
         MeshData? templateMesh = null;
         try
         {
-            templateMesh = D3DMeshParser.Parse(File.ReadAllBytes(templateMeshPath));
+            templateMesh = D3DMeshParser.ParseFile(templateMeshPath);
         }
         catch
         {
@@ -1456,7 +1575,7 @@ public static class ReinsertTextureService
         MeshData templateMesh;
         try
         {
-            templateMesh = D3DMeshParser.Parse(File.ReadAllBytes(templateMeshPath));
+            templateMesh = D3DMeshParser.ParseFile(templateMeshPath);
         }
         catch
         {
@@ -1570,6 +1689,18 @@ public static class ReinsertTextureService
                stem.StartsWith("bmap_sk_sharedparts", StringComparison.Ordinal);
     }
 
+    private static bool ShouldMapWithoutEmittingGameProvidedTexture(string? name)
+    {
+        if (string.IsNullOrWhiteSpace(name))
+        {
+            return false;
+        }
+
+        var stem = StripKnownTextureExtension(Path.GetFileName(name)).ToLowerInvariant();
+        return stem.StartsWith("color_", StringComparison.Ordinal) ||
+               stem.StartsWith("map_", StringComparison.Ordinal);
+    }
+
     private static bool TryResolveGameProvidedTextureName(string templateMeshPath, string? name, out string textureName)
     {
         if (!TryGetGameProvidedTextureName(name, out textureName))
@@ -1585,26 +1716,21 @@ public static class ReinsertTextureService
         return true;
     }
 
-    private static void CopyGameProvidedTextureIfAvailable(
+    private static bool CopyGameProvidedTextureIfAvailable(
         string templateMeshPath,
         string outputFolder,
         string textureName,
         List<string> writtenNames)
     {
-        if (!IsSharedPartsTextureName(textureName))
-        {
-            return;
-        }
-
         if (writtenNames.Contains(textureName, StringComparer.OrdinalIgnoreCase))
         {
-            return;
+            return true;
         }
 
         var sourceTexturePath = FindSourceTextureTemplate(templateMeshPath, textureName);
         if (sourceTexturePath is null)
         {
-            return;
+            return false;
         }
 
         var outputTexturePath = Path.Combine(outputFolder, textureName + ".d3dtx");
@@ -1614,13 +1740,7 @@ public static class ReinsertTextureService
         }
 
         writtenNames.Add(textureName);
-    }
-
-    private static bool IsSharedPartsTextureName(string textureName)
-    {
-        var stem = StripKnownTextureExtension(Path.GetFileName(textureName)).ToLowerInvariant();
-        return stem.StartsWith("sk_sharedparts", StringComparison.Ordinal) ||
-               stem.StartsWith("bmap_sk_sharedparts", StringComparison.Ordinal);
+        return true;
     }
 
     private static int OriginalReplacementTexturePriority(string name)
@@ -1841,9 +1961,11 @@ public sealed record ReinsertedTextures(
     IReadOnlyList<IReadOnlyDictionary<string, string>> PrimitiveSlots,
     IReadOnlyList<string> WrittenNames);
 
-// Real template texture names the packed atlas reuses: the diffuse map name, and (optionally) the matching
-// normal map name. Both are existing names from the template — never a lines/detail map.
-public sealed record AtlasTextureNames(string Diffuse, string? Normal);
+// Real template texture names the packed atlas reuses: the diffuse map name, the matching normal map name,
+// and the matching detail/lines map name (when present). The diffuse/normal are real diffuse/normal names;
+// the detail name is intentionally an existing lines/detail map so the separate detail atlas lands in the
+// mesh's detail section with a detail-appropriate texture format.
+public sealed record AtlasTextureNames(string Diffuse, string? Normal, string? Detail);
 
 internal sealed record OriginalTextureNamePool(
     IReadOnlyDictionary<string, IReadOnlyList<string>> NamesBySlot,

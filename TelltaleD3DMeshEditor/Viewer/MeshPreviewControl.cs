@@ -4,11 +4,18 @@ using System.Globalization;
 using System.Numerics;
 using System.Reflection;
 using System.Runtime.InteropServices;
+using TelltaleD3DMeshEditor.Core;
 using TelltaleD3DMeshEditor.Formats.Mesh;
 using TelltaleD3DMeshEditor.Formats.Skeleton;
 using TelltaleD3DMeshEditor.Formats.Texture;
 
 namespace TelltaleD3DMeshEditor.Viewer;
+
+public enum PreviewCameraMode
+{
+    Orbit,
+    Flight,
+}
 
 // Software 3D viewer (GDI+): rasterizes the mesh with a z-buffer, applies diffuse/detail/bake/
 // shadow/normal layers, draws the skeleton, and supports rotate, pan, zoom, and pose editing.
@@ -48,6 +55,9 @@ public sealed class MeshPreviewControl : Control
     private readonly Dictionary<int, Vector3> _boneOffsets = new();
     private readonly Dictionary<int, Quaternion> _boneRotations = new();
     private Dictionary<int, int>? _rigidBoneMap;
+    private bool _antiAliasing;
+    private PreviewCameraMode _cameraMode = PreviewCameraMode.Orbit;
+    private Vector3 _flightPosition;
 
     public MeshPreviewControl()
     {
@@ -73,6 +83,7 @@ public sealed class MeshPreviewControl : Control
         // Reset the camera to the default view so the new model does not inherit the previous orientation.
         _yaw = DefaultYaw;
         _pitch = DefaultPitch;
+        _flightPosition = Vector3.Zero;
         Fit();
         Invalidate();
     }
@@ -93,6 +104,7 @@ public sealed class MeshPreviewControl : Control
     {
         _zoom = DefaultZoom;
         _pan = Vector2.Zero;
+        _flightPosition = Vector3.Zero;
         Invalidate();
     }
 
@@ -109,6 +121,32 @@ public sealed class MeshPreviewControl : Control
     {
         _panMode = enabled;
         Cursor = enabled ? Cursors.SizeAll : Cursors.Default;
+        Invalidate();
+    }
+
+    public void SetAntiAliasing(bool enabled)
+    {
+        if (_antiAliasing == enabled)
+        {
+            return;
+        }
+
+        _antiAliasing = enabled;
+        _meshBitmap?.Dispose();
+        _meshBitmap = null;
+        Invalidate();
+    }
+
+    public void SetCameraMode(PreviewCameraMode mode)
+    {
+        if (_cameraMode == mode)
+        {
+            return;
+        }
+
+        _cameraMode = mode;
+        _panMode = false;
+        Cursor = _poseMode ? Cursors.Cross : Cursors.Default;
         Invalidate();
     }
 
@@ -234,8 +272,9 @@ public sealed class MeshPreviewControl : Control
         }
         else if (e.Button == MouseButtons.Left || e.Button == MouseButtons.Right)
         {
-            _yaw += dx * 0.01f;
-            _pitch += dy * 0.01f;
+            var lookSpeed = _cameraMode == PreviewCameraMode.Flight ? 0.0065f : 0.01f;
+            _yaw += dx * lookSpeed;
+            _pitch += dy * lookSpeed;
             _pitch = Math.Clamp(_pitch, -1.45f, 1.45f);
             _lastMouse = e.Location;
             Invalidate();
@@ -260,17 +299,6 @@ public sealed class MeshPreviewControl : Control
         base.OnMouseDoubleClick(e);
     }
 
-    protected override void OnKeyDown(KeyEventArgs e)
-    {
-        if (e.KeyCode == Keys.F || e.KeyCode == Keys.Home)
-        {
-            Fit();
-            e.Handled = true;
-        }
-
-        base.OnKeyDown(e);
-    }
-
     private bool IsPanGesture(MouseEventArgs e)
     {
         return e.Button == MouseButtons.Middle
@@ -280,6 +308,13 @@ public sealed class MeshPreviewControl : Control
 
     private void ZoomAt(Point mouseLocation, float factor)
     {
+        if (_cameraMode == PreviewCameraMode.Flight)
+        {
+            _zoom = Math.Clamp(_zoom * factor, 0.08f, 30f);
+            Invalidate();
+            return;
+        }
+
         var oldZoom = _zoom;
         _zoom = Math.Clamp(_zoom * factor, 0.08f, 30f);
         var ratio = _zoom / oldZoom;
@@ -291,11 +326,99 @@ public sealed class MeshPreviewControl : Control
         Invalidate();
     }
 
+    private bool MoveFlightCamera(Keys key)
+    {
+        if (_mesh is null)
+        {
+            return false;
+        }
+
+        var bounds = _hasBounds ? _bounds : ComputeBounds(_mesh);
+        if (bounds.Radius <= 0)
+        {
+            return false;
+        }
+
+        var step = bounds.Radius * 0.08f / MathF.Max(_zoom, 0.1f);
+        if ((ModifierKeys & Keys.Shift) != 0)
+        {
+            step *= 3f;
+        }
+        else if ((ModifierKeys & Keys.Control) != 0)
+        {
+            step *= 0.35f;
+        }
+
+        var rotation = Matrix4x4.CreateRotationX(_pitch) * Matrix4x4.CreateRotationY(_yaw);
+        if (!Matrix4x4.Invert(rotation, out var inverseRotation))
+        {
+            return false;
+        }
+
+        var right = Vector3.Normalize(Vector3.TransformNormal(Vector3.UnitX, inverseRotation));
+        var up = Vector3.Normalize(Vector3.TransformNormal(Vector3.UnitY, inverseRotation));
+        var forward = Vector3.Normalize(Vector3.TransformNormal(-Vector3.UnitZ, inverseRotation));
+
+        switch (key)
+        {
+            case Keys.W:
+                _flightPosition += forward * step;
+                _zoom = Math.Clamp(_zoom * 1.035f, 0.08f, 30f);
+                return true;
+            case Keys.S:
+                _flightPosition -= forward * step;
+                _zoom = Math.Clamp(_zoom * 0.966f, 0.08f, 30f);
+                return true;
+            case Keys.A:
+                _flightPosition -= right * step;
+                return true;
+            case Keys.D:
+                _flightPosition += right * step;
+                return true;
+            case Keys.Q:
+                _flightPosition -= up * step;
+                return true;
+            case Keys.E:
+                _flightPosition += up * step;
+                return true;
+            default:
+                return false;
+        }
+    }
+
+    protected override bool IsInputKey(Keys keyData)
+    {
+        var key = keyData & Keys.KeyCode;
+        return _cameraMode == PreviewCameraMode.Flight &&
+               key is Keys.W or Keys.A or Keys.S or Keys.D or Keys.Q or Keys.E
+            ? true
+            : base.IsInputKey(keyData);
+    }
+
+    protected override void OnKeyDown(KeyEventArgs e)
+    {
+        if (e.KeyCode == Keys.F || e.KeyCode == Keys.Home)
+        {
+            Fit();
+            e.Handled = true;
+            return;
+        }
+
+        if (_cameraMode == PreviewCameraMode.Flight && MoveFlightCamera(e.KeyCode))
+        {
+            e.Handled = true;
+            Invalidate();
+            return;
+        }
+
+        base.OnKeyDown(e);
+    }
+
     protected override void OnPaint(PaintEventArgs e)
     {
         base.OnPaint(e);
         var g = e.Graphics;
-        g.SmoothingMode = SmoothingMode.AntiAlias;
+        g.SmoothingMode = _antiAliasing ? SmoothingMode.AntiAlias : SmoothingMode.None;
         DrawStudioBackground(g);
 
         if (_mesh is null)
@@ -316,10 +439,8 @@ public sealed class MeshPreviewControl : Control
             return;
         }
 
-        var transform = Matrix4x4.CreateTranslation(-bounds.Center) *
-                        Matrix4x4.CreateRotationX(_pitch) *
-                        Matrix4x4.CreateRotationY(_yaw);
-        var scale = MathF.Min(ClientSize.Width, ClientSize.Height) * 0.42f / bounds.Radius * _zoom;
+        var transform = BuildViewTransform(bounds);
+        var scale = GetViewScale(bounds);
         var center = GetViewportCenter();
 
         DrawGroundShadow(g, bounds.Radius, scale, center);
@@ -392,8 +513,11 @@ public sealed class MeshPreviewControl : Control
             return;
         }
 
-        var width = viewportWidth;
-        var height = viewportHeight;
+        var sample = _antiAliasing ? 2 : 1;
+        var width = checked(viewportWidth * sample);
+        var height = checked(viewportHeight * sample);
+        var renderScale = scale * sample;
+        var renderCenter = new PointF(center.X * sample, center.Y * sample);
         var (pixels, depth, bitmap) = PrepareRasterBuffers(width, height);
         var light = Vector3.Normalize(new Vector3(-0.45f, -0.65f, 1f));
         var baseBoneMatrices = _skeleton is not null ? BuildBoneWorldMatrices(_skeleton, null, null) : null;
@@ -408,6 +532,13 @@ public sealed class MeshPreviewControl : Control
             {
                 submeshOrder = submeshOrder
                     .OrderBy(index => EstimateSubmeshDepth(_mesh.Submeshes[index], transform))
+                    .ToList();
+            }
+            else if (GameConfig.Current.Id == GameId.TalesFromTheBorderlandsE3)
+            {
+                submeshOrder = submeshOrder
+                    .OrderBy(index => IsTftbE3UiStrokeUnderlay(_mesh.Submeshes[index]) ? 0 : 1)
+                    .ThenBy(index => index)
                     .ToList();
             }
 
@@ -433,7 +564,7 @@ public sealed class MeshPreviewControl : Control
                     var vertex = submesh.Vertices[i];
                     var posed = ApplyPose(vertex, rigidPose, boneMap, baseBoneMatrices, posedBoneMatrices);
                     var view = Vector3.Transform(posed, transform);
-                    var screen = Project(view, scale, center);
+                    var screen = Project(view, renderScale, renderCenter);
                     var normal = Vector3.TransformNormal(ApplyPoseNormal(vertex, rigidPose), transform);
                     if (normal.LengthSquared() < 0.000001f)
                     {
@@ -461,7 +592,8 @@ public sealed class MeshPreviewControl : Control
                         continue;
                     }
 
-                    RasterizeTriangle(renderVertices[a], renderVertices[b], renderVertices[c], textures, pixels, depth, width, height, writeDepth: !transparentPass);
+                    var writeDepth = !transparentPass && !IsTftbE3UiStrokeUnderlay(submesh);
+                    RasterizeTriangle(renderVertices[a], renderVertices[b], renderVertices[c], textures, pixels, depth, width, height, writeDepth);
                 }
             }
         }
@@ -476,7 +608,19 @@ public sealed class MeshPreviewControl : Control
             bitmap.UnlockBits(data);
         }
 
-        g.DrawImageUnscaled(bitmap, 0, 0);
+        if (sample == 1)
+        {
+            g.DrawImageUnscaled(bitmap, 0, 0);
+            return;
+        }
+
+        var previousInterpolation = g.InterpolationMode;
+        var previousPixelOffset = g.PixelOffsetMode;
+        g.InterpolationMode = InterpolationMode.HighQualityBicubic;
+        g.PixelOffsetMode = PixelOffsetMode.HighQuality;
+        g.DrawImage(bitmap, new Rectangle(0, 0, viewportWidth, viewportHeight));
+        g.InterpolationMode = previousInterpolation;
+        g.PixelOffsetMode = previousPixelOffset;
     }
 
     private void DrawPolygons(Graphics g, Matrix4x4 transform, float scale, PointF center)
@@ -517,6 +661,25 @@ public sealed class MeshPreviewControl : Control
         var diffuse = textures?.Diffuse;
         return diffuse is not null &&
                (diffuse.AverageAlpha < 0.95f || diffuse.NonOpaqueAlphaRatio > 0.08f);
+    }
+
+    private static bool IsTftbE3UiStrokeUnderlay(SubmeshData submesh)
+    {
+        if (GameConfig.Current.Id != GameId.TalesFromTheBorderlandsE3)
+        {
+            return false;
+        }
+
+        return IsUiStrokeName(submesh.Name) ||
+               IsUiStrokeName(submesh.MaterialName) ||
+               submesh.TextureNames.Values.Any(IsUiStrokeName);
+    }
+
+    private static bool IsUiStrokeName(string? name)
+    {
+        var normalized = NormalizeTextureName(name);
+        return normalized.StartsWith("ui_", StringComparison.OrdinalIgnoreCase) &&
+               normalized.Contains("stroke", StringComparison.OrdinalIgnoreCase);
     }
 
     private static float EstimateSubmeshDepth(SubmeshData submesh, Matrix4x4 transform)
@@ -595,6 +758,12 @@ public sealed class MeshPreviewControl : Control
                 if (textures?.Diffuse is null)
                 {
                     color = ShadeColor(baseColor, shade).ToArgb();
+                    if (GameConfig.Current.Id == GameId.TalesFromTheBorderlandsE3 && textures?.Bake is not null)
+                    {
+                        var bakeU = a.BakeU * w0 + b.BakeU * w1 + c.BakeU * w2;
+                        var bakeV = a.BakeV * w0 + b.BakeV * w1 + c.BakeV * w2;
+                        color = ShadeTexture(textures.Bake.SampleClamped(bakeU, bakeV), shade);
+                    }
                 }
                 else
                 {
@@ -1447,7 +1616,10 @@ public sealed class MeshPreviewControl : Control
 
     private Matrix4x4 BuildViewTransform(MeshBounds bounds)
     {
-        return Matrix4x4.CreateTranslation(-bounds.Center) *
+        var viewOrigin = _cameraMode == PreviewCameraMode.Flight
+            ? bounds.Center + _flightPosition
+            : bounds.Center;
+        return Matrix4x4.CreateTranslation(-viewOrigin) *
                Matrix4x4.CreateRotationX(_pitch) *
                Matrix4x4.CreateRotationY(_yaw);
     }

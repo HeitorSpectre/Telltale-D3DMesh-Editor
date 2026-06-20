@@ -358,7 +358,7 @@ internal static class DamageVariantPlanner
         Geometry? value;
         try
         {
-            var mesh = D3DMeshParser.Parse(File.ReadAllBytes(meshPath));
+            var mesh = D3DMeshParser.ParseFile(meshPath);
             var b = mesh.GetBounds();
             var cells = mesh.Submeshes
                 .SelectMany(submesh => submesh.Vertices)

@@ -2,16 +2,24 @@ namespace TelltaleD3DMeshEditor.Core;
 
 public enum GameId
 {
-    Generic,
-    WolfAmongUs,
-    WalkingDeadSeason2,
-    MinecraftStoryMode,
-    BackToTheFuture,
-    BackToTheFutureEpisode1,
-    BackToTheFutureEpisode2,
-    BackToTheFutureEpisode3,
-    BackToTheFutureEpisode4,
-    BackToTheFutureEpisode5,
+    Generic = 0,
+    WolfAmongUs = 1,
+    WalkingDeadSeason2 = 2,
+    MinecraftStoryMode = 3,
+    TalesFromTheBorderlands = 4,
+    TalesFromTheBorderlands2014 = 5,
+    TalesFromTheBorderlandsE3 = 6,
+    TalesFromTheBorderlandsOld = 7,
+    BackToTheFuture = 8,
+    BackToTheFutureEpisode1 = 9,
+    BackToTheFutureEpisode2 = 10,
+    BackToTheFutureEpisode3 = 11,
+    BackToTheFutureEpisode4 = 12,
+    BackToTheFutureEpisode5 = 13,
+    WalkingDead = 14,
+    TalesFromTheBorderlands2021 = 15,
+    MinecraftStoryModeGroup = 16,
+    MinecraftStoryModeSeason2 = 17,
 }
 
 // Per-game settings, so behaviour specific to one game stays isolated and never affects another. The
@@ -22,6 +30,7 @@ public sealed class GameConfig
 {
     public required GameId Id { get; init; }
     public required string DisplayName { get; init; }
+    public string? ModernTextureToolkitGameName { get; init; }
     public bool IsBackToTheFuture => Id is
         GameId.BackToTheFuture or
         GameId.BackToTheFutureEpisode1 or
@@ -29,6 +38,31 @@ public sealed class GameConfig
         GameId.BackToTheFutureEpisode3 or
         GameId.BackToTheFutureEpisode4 or
         GameId.BackToTheFutureEpisode5;
+
+    public bool IsWalkingDead => Id is
+        GameId.WalkingDead or
+        GameId.WalkingDeadSeason2;
+
+    public bool IsTalesFromTheBorderlands => Id is
+        GameId.TalesFromTheBorderlands or
+        GameId.TalesFromTheBorderlands2014 or
+        GameId.TalesFromTheBorderlandsE3 or
+        GameId.TalesFromTheBorderlandsOld;
+
+    public bool IsMinecraftStoryMode => Id is
+        GameId.MinecraftStoryModeGroup or
+        GameId.MinecraftStoryMode or
+        GameId.MinecraftStoryModeSeason2;
+
+    public bool IsOriginalTalesFromTheBorderlandsPc => Id is
+        GameId.TalesFromTheBorderlands2014 or
+        GameId.TalesFromTheBorderlandsE3;
+
+    public bool IsGameMenuGroup => Id is
+        GameId.TalesFromTheBorderlands or
+        GameId.BackToTheFuture or
+        GameId.WalkingDead or
+        GameId.MinecraftStoryModeGroup;
 
     // Some games store a material's opacity (hair strands, lens, etc.) in a separate companion texture
     // named "<diffuse>Alpha" / "<diffuse>_alpha" rather than in the diffuse's own alpha channel. When
@@ -108,6 +142,22 @@ public sealed class GameConfig
     // ported into the target's matching files during a combined reimport.
     public bool PortCompanionVariantPartsOnReimport { get; init; }
 
+    // TFTB E3 (v14) static props need a faithful per-vertex round-trip that the generic GLB pipeline
+    // cannot give: (1) baked colors are mostly black and the exporter normalizes black->white and drops
+    // COLOR_0, and (2) the original tangent.w is 0 but the importer forces it to 1. When enabled, a
+    // count-preserving reimport (submesh vertex count unchanged) restores the template's original
+    // per-vertex colors when the GLB carries none, and keeps the GLB's stored tangent.w (including 0)
+    // instead of forcing 1. Full swaps with a different vertex count keep the generic behaviour.
+    // Defaults off so the v13/14 character games (TWAU/TWD2/MCSM) stay byte-identical.
+    public bool PreserveTemplateVertexDataOnReimport { get; init; }
+
+    // Original TFTB PC drives facial animation very aggressively from character-specific mouth/face
+    // joints. Mapping another character's mouthCorner/jaw/tongue aliases onto the target character's
+    // facial rig makes the imported face follow the target lipsync, but the donor mouth is usually a
+    // different shape and collapses/recedes in-game. Keep exact bone matches, but do not retarget those
+    // character-specific face aliases for this profile.
+    public bool DisableCharacterSpecificFacialRetargetOnReimport { get; init; }
+
     public static readonly GameConfig Generic = new()
     {
         Id = GameId.Generic,
@@ -127,6 +177,7 @@ public sealed class GameConfig
         PreserveSkeletonDerivedFieldsOnMerge = false,
         PortTranslationScalesOnSkeletonMerge = false,
         PortCompanionVariantPartsOnReimport = false,
+        DisableCharacterSpecificFacialRetargetOnReimport = false,
     };
 
     public static readonly GameConfig WolfAmongUs = new()
@@ -148,6 +199,13 @@ public sealed class GameConfig
         PreserveSkeletonDerivedFieldsOnMerge = false,
         PortTranslationScalesOnSkeletonMerge = false,
         PortCompanionVariantPartsOnReimport = false,
+        DisableCharacterSpecificFacialRetargetOnReimport = false,
+    };
+
+    public static readonly GameConfig WalkingDead = new()
+    {
+        Id = GameId.WalkingDead,
+        DisplayName = "The Walking Dead",
     };
 
     public static readonly GameConfig WalkingDeadSeason2 = new()
@@ -169,12 +227,14 @@ public sealed class GameConfig
         PreserveSkeletonDerivedFieldsOnMerge = false,
         PortTranslationScalesOnSkeletonMerge = false,
         PortCompanionVariantPartsOnReimport = false,
+        DisableCharacterSpecificFacialRetargetOnReimport = false,
     };
 
     public static readonly GameConfig MinecraftStoryMode = new()
     {
         Id = GameId.MinecraftStoryMode,
-        DisplayName = "Minecraft: Story Mode",
+        DisplayName = "Minecraft: Story Mode - Season 1",
+        ModernTextureToolkitGameName = "Minecraft: Story Mode",
         UsesCompanionAlphaTextures = false,
         ClearInheritedBakeOnReimport = false,
         ClearInheritedSecondaryTexturesOnReimport = false,
@@ -190,6 +250,88 @@ public sealed class GameConfig
         PreserveSkeletonDerivedFieldsOnMerge = true,
         PortTranslationScalesOnSkeletonMerge = true,
         PortCompanionVariantPartsOnReimport = true,
+        DisableCharacterSpecificFacialRetargetOnReimport = false,
+    };
+
+    public static readonly GameConfig MinecraftStoryModeGroup = new()
+    {
+        Id = GameId.MinecraftStoryModeGroup,
+        DisplayName = "Minecraft: Story Mode",
+    };
+
+    public static readonly GameConfig MinecraftStoryModeSeason2 = new()
+    {
+        Id = GameId.MinecraftStoryModeSeason2,
+        DisplayName = "Minecraft: Story Mode - Season 2",
+    };
+
+    public static readonly GameConfig TalesFromTheBorderlands2014 = new()
+    {
+        Id = GameId.TalesFromTheBorderlands2014,
+        DisplayName = "Tales from the Borderlands (2014/2015)",
+        ModernTextureToolkitGameName = "Borderlands",
+        UsesCompanionAlphaTextures = false,
+        ClearInheritedBakeOnReimport = false,
+        ClearInheritedSecondaryTexturesOnReimport = false,
+        PreferGltfTextureNamesOnReimport = false,
+        PreferSemanticTemplateTextureNamesOnReimport = false,
+        RemoveEyeHelperPrimitivesOnReimport = false,
+        SplitBodyLineAlphaOnReimport = false,
+        InvertBodyLineAlphaOnReimport = false,
+        InvertHeadLineAlphaOnReimport = false,
+        InvertHandLineAlphaOnReimport = false,
+        TreatAdvObj000TexturesAsBake = false,
+        PixelatedGltfTextures = false,
+        PreserveSkeletonDerivedFieldsOnMerge = false,
+        PortTranslationScalesOnSkeletonMerge = false,
+        PortCompanionVariantPartsOnReimport = false,
+        DisableCharacterSpecificFacialRetargetOnReimport = true,
+    };
+
+    public static readonly GameConfig TalesFromTheBorderlandsE3 = new()
+    {
+        Id = GameId.TalesFromTheBorderlandsE3,
+        DisplayName = "Tales from the Borderlands (E3)",
+        ModernTextureToolkitGameName = "Borderlands",
+        PreserveTemplateVertexDataOnReimport = true,
+        UsesCompanionAlphaTextures = false,
+        ClearInheritedBakeOnReimport = false,
+        ClearInheritedSecondaryTexturesOnReimport = false,
+        PreferGltfTextureNamesOnReimport = false,
+        PreferSemanticTemplateTextureNamesOnReimport = false,
+        RemoveEyeHelperPrimitivesOnReimport = false,
+        SplitBodyLineAlphaOnReimport = false,
+        InvertBodyLineAlphaOnReimport = false,
+        InvertHeadLineAlphaOnReimport = false,
+        InvertHandLineAlphaOnReimport = false,
+        TreatAdvObj000TexturesAsBake = false,
+        PixelatedGltfTextures = false,
+        PreserveSkeletonDerivedFieldsOnMerge = false,
+        PortTranslationScalesOnSkeletonMerge = false,
+        PortCompanionVariantPartsOnReimport = false,
+        DisableCharacterSpecificFacialRetargetOnReimport = true,
+    };
+
+    // The 2014 source-code leak build. It uses an older serialization (non-interleaved vertex streams,
+    // 4VSM/ERTM containers). There is no playable build, so this profile is view/extract + GLB export
+    // only; reinsertion is intentionally not supported. Behaviour flags stay neutral.
+    public static readonly GameConfig TalesFromTheBorderlandsOld = new()
+    {
+        Id = GameId.TalesFromTheBorderlandsOld,
+        DisplayName = "Tales from the Borderlands (Old)",
+        ModernTextureToolkitGameName = "Borderlands",
+    };
+
+    public static readonly GameConfig TalesFromTheBorderlands2021 = new()
+    {
+        Id = GameId.TalesFromTheBorderlands2021,
+        DisplayName = "Tales from the Borderlands (2021)",
+    };
+
+    public static readonly GameConfig TalesFromTheBorderlands = new()
+    {
+        Id = GameId.TalesFromTheBorderlands,
+        DisplayName = "Tales from the Borderlands",
     };
 
     public static readonly GameConfig BackToTheFuture = CreateBackToTheFuture(GameId.BackToTheFuture, "Back to the Future: The Game");
@@ -203,8 +345,14 @@ public sealed class GameConfig
     [
         Generic,
         WolfAmongUs,
+        WalkingDead,
         WalkingDeadSeason2,
+        MinecraftStoryModeGroup,
         MinecraftStoryMode,
+        TalesFromTheBorderlands,
+        TalesFromTheBorderlands2014,
+        TalesFromTheBorderlandsE3,
+        TalesFromTheBorderlandsOld,
         BackToTheFuture,
         BackToTheFutureEpisode1,
         BackToTheFutureEpisode2,
@@ -219,13 +367,48 @@ public sealed class GameConfig
     public static GameConfig FromId(GameId id)
         => All.FirstOrDefault(game => game.Id == id) ?? Generic;
 
+    public GameConfig WithNormalizeFacialBonesOnReimport(bool enabled)
+    {
+        if (!enabled)
+        {
+            return this;
+        }
+
+        return new GameConfig
+        {
+            Id = Id,
+            DisplayName = DisplayName,
+            ModernTextureToolkitGameName = ModernTextureToolkitGameName,
+            UsesCompanionAlphaTextures = UsesCompanionAlphaTextures,
+            ClearInheritedBakeOnReimport = ClearInheritedBakeOnReimport,
+            ClearInheritedSecondaryTexturesOnReimport = ClearInheritedSecondaryTexturesOnReimport,
+            PreferGltfTextureNamesOnReimport = PreferGltfTextureNamesOnReimport,
+            PreferSemanticTemplateTextureNamesOnReimport = PreferSemanticTemplateTextureNamesOnReimport,
+            RemoveEyeHelperPrimitivesOnReimport = RemoveEyeHelperPrimitivesOnReimport,
+            SplitBodyLineAlphaOnReimport = SplitBodyLineAlphaOnReimport,
+            InvertBodyLineAlphaOnReimport = InvertBodyLineAlphaOnReimport,
+            InvertHeadLineAlphaOnReimport = InvertHeadLineAlphaOnReimport,
+            InvertHandLineAlphaOnReimport = InvertHandLineAlphaOnReimport,
+            TreatAdvObj000TexturesAsBake = TreatAdvObj000TexturesAsBake,
+            PixelatedGltfTextures = PixelatedGltfTextures,
+            PreserveSkeletonDerivedFieldsOnMerge = PreserveSkeletonDerivedFieldsOnMerge,
+            PortTranslationScalesOnSkeletonMerge = PortTranslationScalesOnSkeletonMerge,
+            PortCompanionVariantPartsOnReimport = PortCompanionVariantPartsOnReimport,
+            PreserveTemplateVertexDataOnReimport = PreserveTemplateVertexDataOnReimport,
+            DisableCharacterSpecificFacialRetargetOnReimport = false,
+        };
+    }
+
     private static GameConfig CreateBackToTheFuture(GameId id, string displayName)
         => new()
         {
             Id = id,
             DisplayName = displayName,
             UsesCompanionAlphaTextures = true,
-            ClearInheritedBakeOnReimport = false,
+            // BTTF environment props use a baked lightmap in the "bake" slot. Keeping the original object's
+            // dark lightmap over a reimported model multiplies it down to black in-game (the viewer shows
+            // diffuse only, so it looks fine there). Clearing it neutralizes the inherited lighting.
+            ClearInheritedBakeOnReimport = true,
             ClearInheritedSecondaryTexturesOnReimport = false,
             PreferGltfTextureNamesOnReimport = false,
             PreferSemanticTemplateTextureNamesOnReimport = true,
@@ -239,5 +422,6 @@ public sealed class GameConfig
             PreserveSkeletonDerivedFieldsOnMerge = false,
             PortTranslationScalesOnSkeletonMerge = false,
             PortCompanionVariantPartsOnReimport = false,
+            DisableCharacterSpecificFacialRetargetOnReimport = false,
         };
 }

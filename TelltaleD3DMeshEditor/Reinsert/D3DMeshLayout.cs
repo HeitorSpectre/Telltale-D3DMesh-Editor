@@ -52,7 +52,9 @@ public sealed class D3DMeshLayout
     public int TextureGroupBlockLength { get; init; }
     public required List<TextureGroupLayout> TextureGroups { get; init; }
 
-    // V13/14: 8 floats in uv1X uv1Y uv4X uv4Y uv2X uv2Y uv3X uv3Y order.
+    // V13/14: usually 8 floats in uv1X uv1Y uv4X uv4Y uv2X uv2Y uv3X uv3Y order.
+    // TFTB E3 keeps the same v14 mesh version but may store extra floats before the following sized
+    // blocks, so the layout walker detects the real count from the block markers.
     // V17/18: 10 floats in uv1X uv1Y extraX extraY uv2X uv2Y uv3X uv3Y uv4X uv4Y order.
     public int UvScalesOffset { get; init; }
     public int UvScalesLength { get; init; }
@@ -197,7 +199,7 @@ public sealed class D3DMeshLayout
         var textureGroupBlockLength = reader.Position - textureGroupBlockOffset;
 
         var uvScalesOffset = reader.Position;
-        var uvScaleFloatCount = isV18Layout ? 10 : 8;
+        var uvScaleFloatCount = isV18Layout ? 10 : DetectUvScaleFloatCount(reader);
         for (var i = 0; i < uvScaleFloatCount; i++)
         {
             reader.ReadFloat();
@@ -308,6 +310,60 @@ public sealed class D3DMeshLayout
     {
         var size = (int)reader.ReadUInt32() - 4;
         reader.Skip(size);
+    }
+
+    private static int DetectUvScaleFloatCount(DataReader reader)
+    {
+        var start = reader.Position;
+        for (var candidate = 8; candidate <= 128; candidate++)
+        {
+            if (LooksLikePostUvBlocks(reader, start + candidate * 4))
+            {
+                return candidate;
+            }
+        }
+
+        return 8;
+    }
+
+    private static bool LooksLikePostUvBlocks(DataReader reader, int position)
+    {
+        if (!TrySkipSizedBlockAt(reader, position, out var afterFirstBlock) ||
+            !TrySkipSizedBlockAt(reader, afterFirstBlock, out var afterSecondBlock))
+        {
+            return false;
+        }
+
+        var faceCountOffset = afterSecondBlock + 1 + 4;
+        var faceDataOffset = faceCountOffset + 4 + 8;
+        if (faceDataOffset > reader.Length)
+        {
+            return false;
+        }
+
+        var facePointCount = reader.PeekUInt32(faceCountOffset);
+        return facePointCount <= int.MaxValue / 2 &&
+               facePointCount % 3 == 0 &&
+               faceDataOffset + facePointCount * 2L <= reader.Length;
+    }
+
+    private static bool TrySkipSizedBlockAt(DataReader reader, int position, out int nextPosition)
+    {
+        nextPosition = position;
+        if (position < 0 || position + 4 > reader.Length)
+        {
+            return false;
+        }
+
+        var size = reader.PeekUInt32(position);
+        var end = position + (long)size;
+        if (size < 4 || end > reader.Length)
+        {
+            return false;
+        }
+
+        nextPosition = (int)end;
+        return true;
     }
 
     private static (List<ulong[]> Palettes, byte[] EntryTemplate) ReadBonePalettes(DataReader reader, int entrySize)

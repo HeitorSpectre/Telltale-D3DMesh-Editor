@@ -11,6 +11,7 @@ public sealed record GltfDiffuseAtlasOptions(
     int MaxSize = 8192,
     string AtlasName = "diffuse_atlas",
     string? NormalAtlasName = null,
+    string? DetailAtlasName = null,
     bool PackSharedPartsTextures = false);
 
 public sealed record GltfDiffuseAtlasResult(
@@ -62,13 +63,32 @@ public static class GltfDiffuseAtlasPacker
 
         try
         {
-            using var atlas = BuildAtlas(decoded, placements);
+            // Build the diffuse atlas from the DIFFUSE images only. Detail/lines textures get their own
+            // parallel atlas image below so the mesh's detail section never points at the colour atlas (the
+            // game's detail/line shader misreads a colour BC texture placed in that section). Both atlases
+            // share the same placements/dimensions, so the detail UVs (uv1/uv2) remapped to a detail
+            // placement sample the detail atlas at the matching spot.
+            var diffuseDecoded = decoded.Where(image => IsDiffuseKey(image.Key)).ToList();
+            var detailDecoded = decoded.Where(image => IsDetailKey(image.Key)).ToList();
+            using var atlas = BuildAtlas(diffuseDecoded.Count > 0 ? diffuseDecoded : decoded, placements);
             var atlasImage = new GltfImage
             {
                 Name = options.AtlasName,
                 Data = EncodePng(atlas),
                 MimeType = "image/png",
             };
+
+            GltfImage? detailAtlasImage = null;
+            if (detailDecoded.Count > 0)
+            {
+                using var detailAtlas = BuildAtlas(detailDecoded, placements);
+                detailAtlasImage = new GltfImage
+                {
+                    Name = options.DetailAtlasName ?? options.AtlasName + "_detail",
+                    Data = EncodePng(detailAtlas),
+                    MimeType = "image/png",
+                };
+            }
 
             // Normal maps share UV0 with the diffuse, so they can't live in a separate region of the same
             // atlas. Instead build a PARALLEL normal-map atlas with identical placements: each material's
@@ -143,15 +163,25 @@ public static class GltfDiffuseAtlasPacker
                     RemoveDetailSlots(textureSlots);
                     RemoveDetailSlots(referencedTextures);
                     var detailAtlasUv = RemapUvsToPlacement(detailSourceUv, detailPlacement, atlas.Width, atlas.Height, out var detailWrapped);
-                    uv1 = detailAtlasUv;
+                    // The detail/lines map is sampled from uv2 in-game. Always write uv2; only mirror it onto
+                    // uv1 when uv1 is not carrying a lightmap (bake) — overwriting a lightmap's uv1 with the
+                    // detail UV breaks the bake in-game. Meshes without a lightmap keep the original behaviour.
                     uv2 = detailAtlasUv;
+                    if (!HasBakeLightmap(primitive))
+                    {
+                        uv1 = detailAtlasUv;
+                    }
                     if (detailWrapped)
                     {
                         warnings.Add($"Primitive '{primitive.MaterialName ?? primitive.SourceSubmeshIndex?.ToString() ?? "unknown"}' has detail UV outside 0..1; atlas packed it with repeat wrapping.");
                     }
 
-                    textureSlots["detail_diffuse"] = atlasImage;
-                    referencedTextures["detail_diffuse"] = atlasImage;
+                    // Point the detail/lines slot at the SEPARATE detail atlas, not the colour atlas, so the
+                    // mesh's detail section keeps a detail texture in-game. Falls back to the colour atlas
+                    // only if no detail atlas was built (should not happen when a detail texture was found).
+                    var detailTarget = detailAtlasImage ?? atlasImage;
+                    textureSlots["detail_diffuse"] = detailTarget;
+                    referencedTextures["detail_diffuse"] = detailTarget;
                 }
 
                 // Point the normal-map slot at the parallel normal atlas (sampled with the same UV0).
@@ -901,6 +931,7 @@ public static class GltfDiffuseAtlasPacker
             SourceMeshPath = source.SourceMeshPath,
             SourceSubmeshIndex = source.SourceSubmeshIndex,
             RecoveredDetailLineTextureName = source.RecoveredDetailLineTextureName,
+            RecoveredDetailLineImage = source.RecoveredDetailLineImage,
             IsSkinned = source.IsSkinned,
             BaseColor = baseColor,
             TextureSlots = textureSlots,
@@ -909,6 +940,35 @@ public static class GltfDiffuseAtlasPacker
 
     private static string ImageKey(GltfImage image)
         => image.Name + ":" + image.Data.Length + ":" + Convert.ToHexString(SHA256.HashData(image.Data));
+
+    // A primitive carries a lightmap when it references a "bake" slot (or a *_000 / lightmap-named texture).
+    // The lightmap is sampled from uv1, so the atlas must not overwrite uv1 with the detail UV.
+    private static bool HasBakeLightmap(GltfPrimitive primitive)
+    {
+        foreach (var (slot, image) in primitive.TextureSlots.Concat(primitive.ReferencedTextures))
+        {
+            if (slot.Equals("bake", StringComparison.OrdinalIgnoreCase) || IsBakeLightmapName(image.Name))
+            {
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+    private static bool IsBakeLightmapName(string textureName)
+    {
+        var lower = Path.GetFileNameWithoutExtension(textureName).ToLowerInvariant();
+        return lower.EndsWith("_000", StringComparison.Ordinal) ||
+               lower.Contains("lightmap", StringComparison.Ordinal) ||
+               lower.Contains("_bake", StringComparison.Ordinal);
+    }
+
+    private static bool IsDiffuseKey(string key)
+        => key.StartsWith("diffuse:", StringComparison.Ordinal);
+
+    private static bool IsDetailKey(string key)
+        => key.StartsWith("detail:", StringComparison.Ordinal);
 
     private static string DiffuseAtlasKey(GltfPrimitive primitive)
         => primitive.TextureSlots.TryGetValue("diffuse", out var diffuse)

@@ -173,7 +173,104 @@ public static class TextureResolver
             loaded[candidate.Path] = texture;
         }
 
+        if (IsTftbE3PlaceholderDetail(candidate, texture))
+        {
+            return null;
+        }
+
+        if (IsTftbE3OpaqueDiffuseWithAuxiliaryAlpha(candidate, texture))
+        {
+            return ForceOpaque(texture);
+        }
+
         return texture;
+    }
+
+    private static bool IsTftbE3OpaqueDiffuseWithAuxiliaryAlpha(TextureCandidate candidate, TextureImage texture)
+    {
+        if (GameConfig.Current.Id != GameId.TalesFromTheBorderlandsE3 ||
+            candidate.Role != TextureRole.Diffuse ||
+            texture.AverageAlpha >= 0.15f ||
+            texture.NonOpaqueAlphaRatio < 0.95f ||
+            texture.AlphaMode is not (0 or -1 or null))
+        {
+            return false;
+        }
+
+        var stem = NormalizeStem(Path.GetFileNameWithoutExtension(candidate.Path));
+        if (stem.StartsWith("ui_", StringComparison.OrdinalIgnoreCase) ||
+            stem.StartsWith("fx_", StringComparison.OrdinalIgnoreCase) ||
+            stem.StartsWith("map_", StringComparison.OrdinalIgnoreCase) ||
+            stem.StartsWith("color_", StringComparison.OrdinalIgnoreCase) ||
+            stem.Contains("decal", StringComparison.OrdinalIgnoreCase) ||
+            stem.Contains("alpha", StringComparison.OrdinalIgnoreCase) ||
+            stem.Contains("_alp", StringComparison.OrdinalIgnoreCase) ||
+            stem.Contains("glow", StringComparison.OrdinalIgnoreCase) ||
+            stem.Contains("glass", StringComparison.OrdinalIgnoreCase) ||
+            stem.Contains("eye", StringComparison.OrdinalIgnoreCase) ||
+            stem.Contains("lash", StringComparison.OrdinalIgnoreCase))
+        {
+            return false;
+        }
+
+        long visibleRgb = 0;
+        foreach (var argb in texture.Pixels)
+        {
+            var r = (argb >> 16) & 0xFF;
+            var g = (argb >> 8) & 0xFF;
+            var b = argb & 0xFF;
+            if (r + g + b > 48)
+            {
+                visibleRgb++;
+            }
+        }
+
+        return visibleRgb > texture.Pixels.Length / 2;
+    }
+
+    private static TextureImage ForceOpaque(TextureImage source)
+    {
+        var pixels = new int[source.Pixels.Length];
+        for (var i = 0; i < source.Pixels.Length; i++)
+        {
+            pixels[i] = unchecked((int)0xFF000000) | (source.Pixels[i] & 0x00FFFFFF);
+        }
+
+        return new TextureImage(source.Width, source.Height, pixels, source.SourcePath);
+    }
+
+    private static bool IsTftbE3PlaceholderDetail(TextureCandidate candidate, TextureImage texture)
+    {
+        if (GameConfig.Current.Id != GameId.TalesFromTheBorderlandsE3 ||
+            candidate.Role != TextureRole.Detail ||
+            texture.Width > 4 ||
+            texture.Height > 4 ||
+            texture.Pixels.Length == 0)
+        {
+            return false;
+        }
+
+        var stem = NormalizeStem(Path.GetFileNameWithoutExtension(candidate.Path));
+        if (!stem.Contains("line", StringComparison.OrdinalIgnoreCase) &&
+            !stem.Contains("detail", StringComparison.OrdinalIgnoreCase))
+        {
+            return false;
+        }
+
+        long red = 0;
+        long green = 0;
+        long blue = 0;
+        foreach (var argb in texture.Pixels)
+        {
+            red += (argb >> 16) & 0xFF;
+            green += (argb >> 8) & 0xFF;
+            blue += argb & 0xFF;
+        }
+
+        var count = texture.Pixels.Length;
+        return red / count <= 32 &&
+               green / count <= 32 &&
+               blue / count >= 180;
     }
 
     private static bool TryLoad(string path, out TextureImage texture)
@@ -515,13 +612,13 @@ public static class TextureResolver
         {
             foreach (var file in files)
             {
-                var fileHash = Crc64Ecma.Compute(Path.GetFileName(file.Path));
-                if (fileHash == wantedHash)
+                if (TextureFileMatchesHash(file, wantedHash))
                 {
                     candidate = file;
                     return true;
                 }
             }
+
         }
 
         foreach (var file in files)
@@ -535,6 +632,22 @@ public static class TextureResolver
         }
 
         return false;
+    }
+
+    private static bool TextureFileMatchesHash(TextureCandidate file, ulong wantedHash)
+    {
+        if (Crc64Ecma.Compute(Path.GetFileName(file.Path)) == wantedHash)
+        {
+            return true;
+        }
+
+        if (GameConfig.Current.Id != GameId.TalesFromTheBorderlandsE3)
+        {
+            return false;
+        }
+
+        var stem = NormalizeStem(Path.GetFileNameWithoutExtension(file.Path));
+        return Crc64Ecma.Compute(stem) == wantedHash;
     }
 
     private static bool TryParseHashReference(string value, out ulong hash)
@@ -587,6 +700,11 @@ public static class TextureResolver
         if (fileStem.Equals(wanted, StringComparison.OrdinalIgnoreCase)) return 100;
         if (fileStem.EndsWith("_" + wanted, StringComparison.OrdinalIgnoreCase)) return 90;
         if (fileStem.Contains(wanted, StringComparison.OrdinalIgnoreCase)) return 75;
+        if (GameConfig.Current.Id == GameId.TalesFromTheBorderlandsE3)
+        {
+            return 0;
+        }
+
         if (wanted.Contains(fileStem, StringComparison.OrdinalIgnoreCase)) return 60;
         return 0;
     }

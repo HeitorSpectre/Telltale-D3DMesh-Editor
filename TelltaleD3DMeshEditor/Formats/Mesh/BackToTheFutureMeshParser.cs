@@ -4,7 +4,7 @@ using TelltaleD3DMeshEditor.Core;
 
 namespace TelltaleD3DMeshEditor.Formats.Mesh;
 
-internal static class BackToTheFutureMeshParser
+internal static partial class BackToTheFutureMeshParser
 {
     private const int MaxTextureScanBytes = 700;
 
@@ -144,7 +144,7 @@ internal static class BackToTheFutureMeshParser
                 continue;
             }
 
-            if (!TryReadTriangleSetHeader(data, offset, expectedVertexMin, out var candidate))
+            if (!TryReadTriangleSetHeader(data, offset, expectedVertexMin, out var candidate, out var fieldBaseOffset, out var boneSetOffset))
             {
                 continue;
             }
@@ -167,7 +167,9 @@ internal static class BackToTheFutureMeshParser
                 VertexMax: candidate.VertexMax,
                 FacePointStart: candidate.FacePointStart,
                 PolygonCount: candidate.PolygonCount,
-                TextureNames: textures));
+                TextureNames: textures,
+                FieldBaseOffset: fieldBaseOffset,
+                BoneSetFieldOffset: boneSetOffset));
         }
 
         if (infos.Count == 0)
@@ -305,7 +307,7 @@ internal static class BackToTheFutureMeshParser
     {
         for (var offset = start; offset + 0x80 < end; offset++)
         {
-            if (TryReadTriangleSetHeader(data, offset, expectedVertexMin, out _))
+            if (TryReadTriangleSetHeader(data, offset, expectedVertexMin, out _, out _, out _))
             {
                 return offset;
             }
@@ -315,15 +317,24 @@ internal static class BackToTheFutureMeshParser
     }
 
     private static bool TryReadTriangleSetHeader(byte[] data, int offset, int expectedVertexMin, out TriangleSetHeader header)
+        => TryReadTriangleSetHeader(data, offset, expectedVertexMin, out header, out _, out _);
+
+    // fieldBaseOffset receives the absolute byte offset of the vertexMin field for the matched header,
+    // so the reinserter can patch vertexMin/vertexMax/facePointStart/polygonCount in place. The four
+    // u32 fields are always contiguous from this offset, regardless of which header variant matched.
+    // boneSetOffset receives the offset of the bone-set (palette) index field, so skinned reinsertion can
+    // repoint each submesh to its rebuilt palette.
+    private static bool TryReadTriangleSetHeader(byte[] data, int offset, int expectedVertexMin, out TriangleSetHeader header, out int fieldBaseOffset, out int boneSetOffset)
     {
         header = default;
-        if (TryReadCompactTriangleSetHeader(data, offset, expectedVertexMin, out header))
+        if (TryReadCompactTriangleSetHeader(data, offset, expectedVertexMin, out header, out fieldBaseOffset, out boneSetOffset))
         {
             return true;
         }
 
         if (HasCompactTriangleSetHeaderAhead(data, offset, expectedVertexMin))
         {
+            boneSetOffset = offset;
             return false;
         }
 
@@ -334,7 +345,9 @@ internal static class BackToTheFutureMeshParser
                 fieldOffset: 0x24,
                 boneSetIndex: checked((int)Math.Min(ReadUInt32(data, offset + 0x18), int.MaxValue)),
                 requireLegacyMarker: true,
-                out header))
+                out header,
+                out fieldBaseOffset,
+                out boneSetOffset))
         {
             return true;
         }
@@ -346,16 +359,22 @@ internal static class BackToTheFutureMeshParser
             fieldOffset: 0x20,
             boneSetIndex: checked((int)Math.Min(ReadUInt32(data, offset + 0x18), int.MaxValue)),
             requireLegacyMarker: false,
-            out header);
+            out header,
+            out fieldBaseOffset,
+            out boneSetOffset);
     }
 
     private static bool TryReadCompactTriangleSetHeader(
         byte[] data,
         int offset,
         int expectedVertexMin,
-        out TriangleSetHeader header)
+        out TriangleSetHeader header,
+        out int fieldBaseOffset,
+        out int boneSetOffset)
     {
         header = default;
+        fieldBaseOffset = offset + 8;
+        boneSetOffset = offset;
         if (offset + 24 > data.Length)
         {
             return false;
@@ -408,7 +427,7 @@ internal static class BackToTheFutureMeshParser
         var end = Math.Min(data.Length - 24, offset + 0x40);
         for (var lookahead = offset + 1; lookahead <= end; lookahead++)
         {
-            if (TryReadCompactTriangleSetHeader(data, lookahead, expectedVertexMin, out _))
+            if (TryReadCompactTriangleSetHeader(data, lookahead, expectedVertexMin, out _, out _, out _))
             {
                 return true;
             }
@@ -424,9 +443,13 @@ internal static class BackToTheFutureMeshParser
         int fieldOffset,
         int boneSetIndex,
         bool requireLegacyMarker,
-        out TriangleSetHeader header)
+        out TriangleSetHeader header,
+        out int fieldBaseOffset,
+        out int boneSetOffset)
     {
         header = default;
+        fieldBaseOffset = offset + fieldOffset;
+        boneSetOffset = offset + 0x18;
         if (offset + fieldOffset + 16 > data.Length)
         {
             return false;
@@ -603,11 +626,11 @@ internal static class BackToTheFutureMeshParser
             var minFacePointCount = infos.Max(info => (long)info.FacePointStart + info.PolygonCount * 3L);
             if (maxVertex >= vertexCount || minFacePointCount > indices.Count)
             {
-                fallback ??= new FaceSection(indices, nextOffset);
+                fallback ??= new FaceSection(indices, nextOffset, offset);
                 continue;
             }
 
-            return new FaceSection(indices, nextOffset);
+            return new FaceSection(indices, nextOffset, offset);
         }
 
         if (fallback is not null)
@@ -1035,7 +1058,9 @@ internal static class BackToTheFutureMeshParser
         int VertexMax,
         int FacePointStart,
         int PolygonCount,
-        Dictionary<string, string> TextureNames);
+        Dictionary<string, string> TextureNames,
+        int FieldBaseOffset = -1,
+        int BoneSetFieldOffset = -1);
 
     private readonly record struct TriangleSetHeader(
         int BoneSetIndex,
@@ -1044,7 +1069,7 @@ internal static class BackToTheFutureMeshParser
         int FacePointStart,
         int PolygonCount);
 
-    private sealed record FaceSection(List<int> Indices, int NextOffset);
+    private sealed record FaceSection(List<int> Indices, int NextOffset, int SectionOffset = -1);
 
     private sealed record BonePaletteInfo(
         IReadOnlyList<ulong[]> Palettes,

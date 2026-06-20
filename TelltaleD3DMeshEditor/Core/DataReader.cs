@@ -125,6 +125,16 @@ public sealed class DataReader
         return BinaryPrimitives.ReadUInt32LittleEndian(_data.AsSpan(Position, 4));
     }
 
+    public uint PeekUInt32(int offset)
+    {
+        if (offset < 0 || offset + 4 > _data.Length)
+        {
+            throw new EndOfStreamException($"Offset is outside the file: 0x{offset:X}");
+        }
+
+        return BinaryPrimitives.ReadUInt32LittleEndian(_data.AsSpan(offset, 4));
+    }
+
     public (float X, float Y, float Z) ReadVec3()
     {
         return (ReadFloat(), ReadFloat(), ReadFloat());

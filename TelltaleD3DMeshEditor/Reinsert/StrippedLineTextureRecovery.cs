@@ -109,7 +109,7 @@ public static class StrippedLineTextureRecovery
         var byDiffuse = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
         try
         {
-            var mesh = D3DMeshParser.Parse(File.ReadAllBytes(templateMeshPath));
+            var mesh = D3DMeshParser.ParseFile(templateMeshPath);
             foreach (var submesh in mesh.Submeshes)
             {
                 if (!submesh.TextureNames.TryGetValue("bump", out var bump) ||
@@ -239,6 +239,7 @@ public static class StrippedLineTextureRecovery
             SourceMeshPath = source.SourceMeshPath,
             SourceSubmeshIndex = source.SourceSubmeshIndex,
             RecoveredDetailLineTextureName = source.RecoveredDetailLineTextureName,
+            RecoveredDetailLineImage = source.RecoveredDetailLineImage,
             IsSkinned = source.IsSkinned,
             BaseColor = source.BaseColor,
             TextureSlots = textureSlots,

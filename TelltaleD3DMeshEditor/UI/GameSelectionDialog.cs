@@ -31,12 +31,16 @@ public sealed class GameSelectionDialog : Form
         _gameCombo.DropDownStyle = ComboBoxStyle.DropDownList;
         _gameCombo.Location = new Point(12, 42);
         _gameCombo.Size = new Size(336, 24);
-        foreach (var game in GameConfig.All.Where(game => game.Id != GameId.Generic))
+        foreach (var game in GameConfig.All.Where(game => game.Id != GameId.Generic && !game.IsGameMenuGroup && !IsBlockedBackToTheFutureEpisode(game.Id)))
         {
             _gameCombo.Items.Add(game);
         }
 
-        var selected = GameConfig.All.FirstOrDefault(game => game.Id == current.Id && game.Id != GameId.Generic);
+        var selected = GameConfig.All.FirstOrDefault(game =>
+            game.Id == current.Id &&
+            game.Id != GameId.Generic &&
+            !game.IsGameMenuGroup &&
+            !IsBlockedBackToTheFutureEpisode(game.Id));
         _gameCombo.SelectedItem = selected ?? _gameCombo.Items.Cast<GameConfig>().FirstOrDefault();
         _gameCombo.DisplayMember = nameof(GameConfig.DisplayName);
 
@@ -54,4 +58,10 @@ public sealed class GameSelectionDialog : Form
         CancelButton = _cancelButton;
         Controls.AddRange([label, _gameCombo, _okButton, _cancelButton]);
     }
+
+    private static bool IsBlockedBackToTheFutureEpisode(GameId id)
+        => id is GameId.BackToTheFutureEpisode2 or
+                 GameId.BackToTheFutureEpisode3 or
+                 GameId.BackToTheFutureEpisode4 or
+                 GameId.BackToTheFutureEpisode5;
 }

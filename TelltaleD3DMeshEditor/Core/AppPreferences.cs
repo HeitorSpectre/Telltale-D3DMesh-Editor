@@ -7,11 +7,25 @@ public sealed record AppPreferences
     public GameId LastGame { get; init; } = GameId.Generic;
     public string OutputFormat { get; init; } = "Glb";
     public bool TextureAtlas { get; init; }
+    public bool ViewerAntiAliasing { get; init; }
+    public bool ViewerFlightCamera { get; init; }
 
     // When true, textures written on reimport are saved uncompressed (ARGB8) instead of DXT.
     // Needed for games like Minecraft: Story Mode whose low-resolution character ("skin") textures
     // are shipped uncompressed; DXT block compression smears their sharp pixel-art edges in-game.
     public bool UncompressedTextures { get; init; }
+
+    // When true, an imported GLB/GLTF is uniformly rescaled (and recentered) on reimport so its overall
+    // size matches the original mesh it replaces. Useful when a model carries an unintended export scale
+    // (e.g. a Blender node scale of 10) and would otherwise enter the game far larger or smaller than the
+    // asset it replaces. Off by default; proportions are preserved (single scale factor).
+    public bool MatchOriginalModelSize { get; init; }
+
+    // Optional facial-bone alias retarget. When enabled, character-specific facial bones such as
+    // "bigby_mouthCorner_L" may be matched to the target's equivalent "rhys_mouthCorner_L". It can help
+    // compatible face rigs follow target lipsync, but remains off by default because mismatched rigs can
+    // deform the mouth.
+    public bool NormalizeFacialBonesOnReimport { get; init; }
 
     private static readonly JsonSerializerOptions JsonOptions = new()
     {
@@ -55,7 +69,14 @@ public sealed record AppPreferences
         Save(current with { LastGame = game.Id });
     }
 
-    public static void SaveToolSettings(string outputFormat, bool textureAtlas, bool uncompressedTextures)
+    public static void SaveToolSettings(
+        string outputFormat,
+        bool textureAtlas,
+        bool uncompressedTextures,
+        bool matchOriginalModelSize,
+        bool normalizeFacialBonesOnReimport,
+        bool viewerAntiAliasing,
+        bool viewerFlightCamera)
     {
         var current = Load();
         Save(current with
@@ -63,6 +84,10 @@ public sealed record AppPreferences
             OutputFormat = outputFormat,
             TextureAtlas = textureAtlas,
             UncompressedTextures = uncompressedTextures,
+            MatchOriginalModelSize = matchOriginalModelSize,
+            NormalizeFacialBonesOnReimport = normalizeFacialBonesOnReimport,
+            ViewerAntiAliasing = viewerAntiAliasing,
+            ViewerFlightCamera = viewerFlightCamera,
         });
     }
 

@@ -67,6 +67,9 @@ public static class BoneHashDatabase
 public static class TextureHashDatabase
 {
     private static Dictionary<ulong, string>? _names;
+    private static readonly Dictionary<string, Dictionary<ulong, string>> FolderNames = new(StringComparer.OrdinalIgnoreCase);
+    private static readonly object FolderNamesLock = new();
+    private static readonly AsyncLocal<string?> CurrentTextureFolder = new();
 
     public static string Resolve(uint low, uint high)
     {
@@ -76,11 +79,111 @@ public static class TextureHashDatabase
         {
             return StripD3dtxExtension(name);
         }
+        if (TryResolveTftbE3TextureHash(combined, out name))
+        {
+            return name;
+        }
+        if (TryResolveFolderTextureHash(combined, out name))
+        {
+            return name;
+        }
 
         var swapped = ((ulong)low << 32) | high;
-        return names.TryGetValue(swapped, out name)
-            ? StripD3dtxExtension(name)
-            : $"0x{combined:X16}";
+        if (names.TryGetValue(swapped, out name))
+        {
+            return StripD3dtxExtension(name);
+        }
+        if (TryResolveTftbE3TextureHash(swapped, out name))
+        {
+            return name;
+        }
+        if (TryResolveFolderTextureHash(swapped, out name))
+        {
+            return name;
+        }
+
+        return $"0x{combined:X16}";
+    }
+
+    public static IDisposable UseTextureFolder(string? folder)
+    {
+        var previous = CurrentTextureFolder.Value;
+        CurrentTextureFolder.Value = !string.IsNullOrWhiteSpace(folder) && Directory.Exists(folder)
+            ? Path.GetFullPath(folder)
+            : null;
+        return new RestoreTextureFolder(previous);
+    }
+
+    private static bool TryResolveFolderTextureHash(ulong hash, out string name)
+    {
+        name = "";
+        var folder = CurrentTextureFolder.Value;
+        if (string.IsNullOrWhiteSpace(folder) || !Directory.Exists(folder))
+        {
+            return false;
+        }
+
+        var names = GetFolderTextureNames(folder);
+        if (!names.TryGetValue(hash, out var resolvedName) || string.IsNullOrWhiteSpace(resolvedName))
+        {
+            return false;
+        }
+
+        name = resolvedName;
+        return true;
+    }
+
+    private static Dictionary<ulong, string> GetFolderTextureNames(string folder)
+    {
+        folder = Path.GetFullPath(folder);
+        lock (FolderNamesLock)
+        {
+            if (FolderNames.TryGetValue(folder, out var cached))
+            {
+                return cached;
+            }
+
+            var names = new Dictionary<ulong, string>();
+            foreach (var path in Directory.EnumerateFiles(folder, "*.d3dtx", SearchOption.TopDirectoryOnly))
+            {
+                var fileName = Path.GetFileName(path);
+                var stem = StripD3dtxExtension(fileName);
+                AddTextureName(names, fileName, stem);
+                AddTextureName(names, stem, stem);
+            }
+
+            FolderNames[folder] = names;
+            return names;
+        }
+    }
+
+    private static void AddTextureName(Dictionary<ulong, string> names, string hashSource, string resolvedName)
+    {
+        if (string.IsNullOrWhiteSpace(hashSource) || string.IsNullOrWhiteSpace(resolvedName))
+        {
+            return;
+        }
+
+        var hash = Crc64Ecma.Compute(hashSource);
+        names.TryAdd(hash, resolvedName);
+    }
+
+    private static bool TryResolveTftbE3TextureHash(ulong hash, out string name)
+    {
+        name = "";
+        if (GameConfig.Current.Id != GameId.TalesFromTheBorderlandsE3)
+        {
+            return false;
+        }
+
+        name = hash switch
+        {
+            0x45730782E0534ABEUL => "sk55_fiona_uprBodyAlt",
+            0xD3A20FD1C5D29AF1UL => "sk55_fiona_bodyLower",
+            0xC34B7F9E1167022CUL => "sk55_fiona_bodyLower_nm",
+            _ => ""
+        };
+        return name.Length > 0;
     }
 
     private static string StripD3dtxExtension(string name)
@@ -88,5 +191,13 @@ public static class TextureHashDatabase
         return name.EndsWith(".d3dtx", StringComparison.OrdinalIgnoreCase)
             ? name[..^".d3dtx".Length]
             : name;
+    }
+
+    private sealed class RestoreTextureFolder(string? previous) : IDisposable
+    {
+        public void Dispose()
+        {
+            CurrentTextureFolder.Value = previous;
+        }
     }
 }

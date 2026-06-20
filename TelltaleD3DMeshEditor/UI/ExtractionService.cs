@@ -121,7 +121,7 @@ public static class ExtractionService
 
     private static void WriteCompleteAsset(ModelAsset asset, string inputRoot, string outputPath, ExportFormat format)
     {
-        var mesh = WithSourceMetadata(D3DMeshParser.Parse(File.ReadAllBytes(asset.MeshPath)), inputRoot, asset.MeshPath);
+        var mesh = WithSourceMetadata(D3DMeshParser.ParseFile(asset.MeshPath), inputRoot, asset.MeshPath);
         var textureSets = TextureResolver.ResolveForMesh(inputRoot, asset.MeshPath, mesh);
         // Faithful export: diffuse and lines/detail textures remain separate, matching Telltale materials.
         var baseColorByName = BaseColorExporter.BuildRawDiffuse(mesh, textureSets);
@@ -207,7 +207,7 @@ public static class ExtractionService
         var parsed = group.Assets
             .Select(asset =>
             {
-                var mesh = D3DMeshParser.Parse(File.ReadAllBytes(asset.MeshPath));
+                var mesh = D3DMeshParser.ParseFile(asset.MeshPath);
                 var textures = TextureResolver.ResolveForMesh(inputRoot, asset.MeshPath, mesh);
                 return new ParsedPart(asset, mesh, textures);
             })
@@ -292,6 +292,13 @@ public static class ExtractionService
             return SkeletonLoader.Load(skeletonPath, meshVersion);
         }
         catch when (GameConfig.Current.IsBackToTheFuture)
+        {
+            return null;
+        }
+        // The Tales from the Borderlands source leak ships static props (carTannen, gunGlock, handcuffs)
+        // with .skl files in an unrecognised layout. They carry no skinning, so a skeleton failure should
+        // not block the mesh+texture export — fall back to a skeleton-less asset.
+        catch when (GameConfig.Current.Id == GameId.TalesFromTheBorderlandsOld)
         {
             return null;
         }

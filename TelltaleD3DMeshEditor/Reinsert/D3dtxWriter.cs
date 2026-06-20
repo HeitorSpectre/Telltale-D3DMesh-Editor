@@ -71,82 +71,80 @@ public static class D3dtxWriter
         return tex.Write();
     }
 
+    // Back to the Future ("ERTM") textures are a d3dtx header followed by a complete embedded DDS file
+    // (size = mDataSize, sitting at the tail). Regenerating the image therefore means rebuilding BOTH
+    // the d3dtx header fields (mD3DFormat / mWidth / mHeight / mDataSize) AND the inner DDS header
+    // (dwWidth / dwHeight / fourCC) so they stay consistent with the new pixels. The previous splice
+    // only patched the d3dtx width/height and reused the template's inner DDS header + mDataSize, which
+    // produced a DDS that claimed the template's dimensions over differently-sized pixels (scanline
+    // corruption, oversized mDataSize, tools rejecting the file). Ep1 textures store a single base mip
+    // and declare a larger mNumMipLevels than they keep, so we mirror that: write the base mip only and
+    // leave mNumMipLevels untouched.
     private static byte[] BuildLegacyErtmFromTemplate(byte[] template, int[] pixels, int width, int height)
     {
-        var info = ReadLegacyErtmTextureInfo(template);
-        var format = info.Format == Dxt5Format || HasMeaningfulAlpha(pixels)
-            ? Dxt5Format
-            : Dxt1Format;
-        var mipCount = Math.Min(CountTtgMips(width, height, format), Math.Max(1, info.MipCount));
-        var mipPayloads = BuildMipPayloads(pixels, width, height, mipCount, format);
-        var payloadLength = mipPayloads.Sum(mip => mip.Length);
-        var result = new byte[info.PixelStart + payloadLength];
-        Buffer.BlockCopy(template, 0, result, 0, Math.Min(template.Length, info.PixelStart));
+        const int ddsHeaderSize = 128; // 4-byte "DDS " magic + 124-byte DDSURFACEDESC2
 
-        BinaryPrimitives.WriteUInt32LittleEndian(result.AsSpan(info.DxtOffset - 4, 4), checked((uint)mipPayloads.Count));
-        var fourCc = format == Dxt5Format ? "DXT5" : "DXT1";
-        Encoding.ASCII.GetBytes(fourCc, result.AsSpan(info.DxtOffset, 4));
-        BinaryPrimitives.WriteInt32LittleEndian(result.AsSpan(info.DxtOffset + 4, 4), width);
-        BinaryPrimitives.WriteInt32LittleEndian(result.AsSpan(info.DxtOffset + 8, 4), height);
-
-        var cursor = info.PixelStart;
-        foreach (var mip in mipPayloads)
+        var ddsStart = IndexOf(template, "DDS ");
+        if (ddsStart < 4 || ddsStart + ddsHeaderSize > template.Length)
         {
-            Buffer.BlockCopy(mip, 0, result, cursor, mip.Length);
-            cursor += mip.Length;
+            throw new NotSupportedException("Legacy ERTM D3DTX texture does not contain an embedded DDS file.");
         }
 
+        var (formatOffset, templateIsDxt5) = FindLegacyD3dFormatOffset(template, ddsStart);
+
+        // Keep the template's codec, only upgrading DXT1 -> DXT5 when the new image needs alpha.
+        var useDxt5 = templateIsDxt5 || HasMeaningfulAlpha(pixels);
+        var format = useDxt5 ? Dxt5Format : Dxt1Format;
+        var fourCc = useDxt5 ? "DXT5" : "DXT1";
+        var basePayload = useDxt5 ? EncodeDxt5(pixels, width, height) : EncodeDxt1(pixels, width, height);
+
+        // Rebuild the inner DDS: clone the template's header and patch only what depends on the image
+        // (dimensions + fourCC). dwFlags / dwPitchOrLinearSize / dwMipMapCount / caps are kept exactly
+        // as the template authored them, matching the originals' single-mip, linear-size-less layout.
+        var dds = new byte[ddsHeaderSize + basePayload.Length];
+        Buffer.BlockCopy(template, ddsStart, dds, 0, ddsHeaderSize);
+        BinaryPrimitives.WriteInt32LittleEndian(dds.AsSpan(12, 4), height); // dwHeight
+        BinaryPrimitives.WriteInt32LittleEndian(dds.AsSpan(16, 4), width);  // dwWidth
+        Encoding.ASCII.GetBytes(fourCc, dds.AsSpan(84, 4));                 // ddpfPixelFormat.dwFourCC
+        Buffer.BlockCopy(basePayload, 0, dds, ddsHeaderSize, basePayload.Length);
+
+        // d3dtx header (everything before the inner DDS), with the format-dependent fields patched.
+        var header = template.AsSpan(0, ddsStart).ToArray();
+        Encoding.ASCII.GetBytes(fourCc, header.AsSpan(formatOffset, 4));               // mD3DFormat
+        BinaryPrimitives.WriteInt32LittleEndian(header.AsSpan(formatOffset + 4, 4), width);  // mWidth
+        BinaryPrimitives.WriteInt32LittleEndian(header.AsSpan(formatOffset + 8, 4), height); // mHeight
+        BinaryPrimitives.WriteUInt32LittleEndian(header.AsSpan(ddsStart - 4, 4), (uint)dds.Length); // mDataSize
+
+        var result = new byte[header.Length + dds.Length];
+        Buffer.BlockCopy(header, 0, result, 0, header.Length);
+        Buffer.BlockCopy(dds, 0, result, header.Length, dds.Length);
         return result;
     }
 
-    private static LegacyErtmTextureInfo ReadLegacyErtmTextureInfo(byte[] data)
+    // Locates the d3dtx mD3DFormat FourCC (the texture's own format string, which precedes the embedded
+    // DDS). mNumMipLevels sits at offset-4, mWidth at +4 and mHeight at +8. Only the d3dtx header region
+    // (before the DDS) is searched so the DDS's own pixel-format FourCC is never mistaken for it.
+    private static (int Offset, bool IsDxt5) FindLegacyD3dFormatOffset(byte[] template, int ddsStart)
     {
-        var dxtOffset = IndexOf(data, "DXT1");
-        var format = Dxt1Format;
-        var blockBytes = 8;
-        var dxt3Offset = IndexOf(data, "DXT3");
-        var dxt5Offset = IndexOf(data, "DXT5");
-        if (dxtOffset < 0 || (dxt3Offset >= 0 && dxt3Offset < dxtOffset))
+        var header = template.AsSpan(0, ddsStart);
+        var best = -1;
+        var bestIsDxt5 = false;
+        foreach (var (fourCc, isDxt5) in new[] { ("DXT1", false), ("DXT3", true), ("DXT5", true) })
         {
-            dxtOffset = dxt3Offset;
-            format = Dxt5Format;
-            blockBytes = 16;
+            var offset = IndexOf(header.ToArray(), fourCc);
+            if (offset >= 4 && (best < 0 || offset < best))
+            {
+                best = offset;
+                bestIsDxt5 = isDxt5;
+            }
         }
 
-        if (dxtOffset < 0 || (dxt5Offset >= 0 && dxt5Offset < dxtOffset))
+        if (best < 0)
         {
-            dxtOffset = dxt5Offset;
-            format = Dxt5Format;
-            blockBytes = 16;
+            throw new NotSupportedException("Legacy ERTM D3DTX texture does not declare a supported DXT format.");
         }
 
-        if (dxtOffset < 4)
-        {
-            throw new NotSupportedException("Legacy ERTM D3DTX texture does not contain a supported DXT payload.");
-        }
-
-        var mipCount = checked((int)BinaryPrimitives.ReadUInt32LittleEndian(data.AsSpan(dxtOffset - 4, 4)));
-        var texWidth = BinaryPrimitives.ReadInt32LittleEndian(data.AsSpan(dxtOffset + 4, 4));
-        var texHeight = BinaryPrimitives.ReadInt32LittleEndian(data.AsSpan(dxtOffset + 8, 4));
-        if (texWidth <= 0 || texHeight <= 0 || texWidth > 8192 || texHeight > 8192 || mipCount <= 0 || mipCount > 32)
-        {
-            throw new InvalidDataException($"Invalid legacy D3DTX dimensions or mip count: {texWidth}x{texHeight}, mips={mipCount}.");
-        }
-
-        var pixelLength = LegacyMipChainSize(texWidth, texHeight, blockBytes, mipCount);
-        if (pixelLength > data.Length || data.Length - pixelLength < dxtOffset)
-        {
-            pixelLength = MipSizeOf(texWidth, texHeight, blockBytes);
-            mipCount = 1;
-        }
-
-        var pixelStart = data.Length - pixelLength;
-        if (pixelStart < 0 || pixelStart >= data.Length)
-        {
-            throw new InvalidDataException("Legacy D3DTX pixel payload is outside the file.");
-        }
-
-        return new LegacyErtmTextureInfo(dxtOffset, pixelStart, mipCount, format);
+        return (best, bestIsDxt5);
     }
 
     private static List<byte[]> BuildMipPayloads(int[] pixels, int width, int height, int mipCount, uint format)
@@ -572,24 +570,6 @@ public static class D3dtxWriter
 
     private static int MipSizeOf(int width, int height, int blockBytes) =>
         Math.Max(1, (width + 3) / 4) * Math.Max(1, (height + 3) / 4) * blockBytes;
-
-    private static int LegacyMipChainSize(int width, int height, int blockBytes, int mipCount)
-    {
-        var total = 0;
-        for (var mip = 0; mip < mipCount; mip++)
-        {
-            total = checked(total + MipSizeOf(width, height, blockBytes));
-            if (width == 1 && height == 1)
-            {
-                break;
-            }
-
-            width = Math.Max(1, width / 2);
-            height = Math.Max(1, height / 2);
-        }
-
-        return total;
-    }
 
     private static int IndexOf(byte[] data, string value)
     {
@@ -1079,6 +1059,4 @@ public static class D3dtxWriter
         public int BlockSize { get; set; }
         public byte[] Block { get; set; } = [];
     }
-
-    private readonly record struct LegacyErtmTextureInfo(int DxtOffset, int PixelStart, int MipCount, uint Format);
 }

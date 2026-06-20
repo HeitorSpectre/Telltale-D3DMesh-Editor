@@ -67,10 +67,15 @@ public sealed class MainForm : Form
     private ModelAssetGroup? _selectedGroup;
     private ExportFormat _exportFormat = ExportFormat.Glb;
     private bool _uncompressedTextures;
+    private bool _matchOriginalModelSize;
+    private bool _normalizeFacialBonesOnReimport;
+    private bool _viewerAntiAliasing;
+    private bool _viewerFlightCamera;
     private bool _isBusy;
     private bool _applyingTreeSelection;
     private bool _treeRebuildQueued;
     private readonly string? _initialMeshPath;
+    private string? _statusTextBeforeCreditLinkHover;
 
     public MainForm(string? initialMeshPath = null)
     {
@@ -98,6 +103,12 @@ public sealed class MainForm : Form
             : ExportFormat.Glb;
         _btnDiffuseAtlas.Checked = preferences.TextureAtlas;
         _uncompressedTextures = preferences.UncompressedTextures;
+        _matchOriginalModelSize = preferences.MatchOriginalModelSize;
+        _normalizeFacialBonesOnReimport = preferences.NormalizeFacialBonesOnReimport;
+        _viewerAntiAliasing = preferences.ViewerAntiAliasing;
+        _viewerFlightCamera = preferences.ViewerFlightCamera;
+        _preview.SetAntiAliasing(_viewerAntiAliasing);
+        _preview.SetCameraMode(_viewerFlightCamera ? PreviewCameraMode.Flight : PreviewCameraMode.Orbit);
 
         BuildUi();
         WireEvents();
@@ -189,7 +200,10 @@ public sealed class MainForm : Form
             _miSkeleton
         });
 
-        _gameSelector.ToolTipText = "Selects which Telltale game's texture/model rules to apply. The Wolf Among Us behaves exactly as before.";
+        _gameSelector.ToolTipText = "Selects which Telltale game's texture/model rules to apply.";
+        _gameSelector.DisplayStyle = ToolStripItemDisplayStyle.ImageAndText;
+        _gameSelector.TextImageRelation = TextImageRelation.ImageBeforeText;
+        _gameSelector.ImageScaling = ToolStripItemImageScaling.None;
         BuildGameSelectorMenu();
 
         UpdateGameSelector();
@@ -388,11 +402,6 @@ public sealed class MainForm : Form
             return;
         }
 
-        if (!EnsureGameSelectedForOpen())
-        {
-            return;
-        }
-
         var path = paths[0];
         if (Directory.Exists(path))
         {
@@ -423,11 +432,6 @@ public sealed class MainForm : Form
             return;
         }
 
-        if (!EnsureGameSelectedForOpen())
-        {
-            return;
-        }
-
         await LoadFolderAsync(Path.GetDirectoryName(meshPath)!);
         SelectLoadedMesh(meshPath);
     }
@@ -436,7 +440,10 @@ public sealed class MainForm : Form
     {
         var format = _exportFormat == ExportFormat.Glb ? "GLB" : "GLTF";
         var atlas = _btnDiffuseAtlas.Checked ? "on" : "off";
-        _btnSettings.ToolTipText = $"Open tool settings. Output Format: {format}; Texture Atlas: {atlas}.";
+        var aa = _viewerAntiAliasing ? "on" : "off";
+        var camera = _viewerFlightCamera ? "flight" : "orbit";
+        var faceBones = _normalizeFacialBonesOnReimport ? "on" : "off";
+        _btnSettings.ToolTipText = $"Open tool settings. Output Format: {format}; Texture Atlas: {atlas}; Facial Bones: {faceBones}; Viewer AA: {aa}; Camera: {camera}.";
     }
 
     private void ShowSettingsDialog()
@@ -450,23 +457,22 @@ public sealed class MainForm : Form
             MaximizeBox = false,
             ShowIcon = false,
             ShowInTaskbar = false,
-            ClientSize = new Size(360, 196),
+            AutoSize = true,
+            AutoSizeMode = AutoSizeMode.GrowAndShrink,
             Font = Font,
         };
 
         var layout = new TableLayoutPanel
         {
-            Dock = DockStyle.Fill,
+            AutoSize = true,
+            AutoSizeMode = AutoSizeMode.GrowAndShrink,
             Padding = new Padding(12),
-            ColumnCount = 2,
-            RowCount = 4,
+            ColumnCount = 1,
+            RowCount = 2,
         };
-        layout.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 110));
-        layout.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100));
+        layout.ColumnStyles.Add(new ColumnStyle(SizeType.AutoSize));
         layout.RowStyles.Add(new RowStyle(SizeType.AutoSize));
         layout.RowStyles.Add(new RowStyle(SizeType.AutoSize));
-        layout.RowStyles.Add(new RowStyle(SizeType.AutoSize));
-        layout.RowStyles.Add(new RowStyle(SizeType.Percent, 100));
 
         var formatLabel = new Label
         {
@@ -517,12 +523,90 @@ public sealed class MainForm : Form
             Margin = new Padding(0, 0, 0, 10),
         };
 
+        var toolTip = new ToolTip();
+        var scaleLabel = new Label
+        {
+            Text = "Model size:",
+            AutoSize = true,
+            Anchor = AnchorStyles.Left,
+            Margin = new Padding(0, 3, 8, 10),
+        };
+        var matchSizeCheck = new CheckBox
+        {
+            Text = "Match original model size on reimport",
+            Checked = _matchOriginalModelSize,
+            AutoSize = true,
+            Anchor = AnchorStyles.Left,
+            Margin = new Padding(0, 0, 0, 10),
+        };
+        toolTip.SetToolTip(matchSizeCheck,
+            "Uniformly rescales the imported model so its overall size matches the original mesh it replaces.\n" +
+            "Use it when a GLB carries an unintended export scale (e.g. a Blender node scale) and enters the game too big or too small.\n" +
+            "Proportions are preserved.");
+
+        var facialBonesLabel = new Label
+        {
+            Text = "Facial bones:",
+            AutoSize = true,
+            Anchor = AnchorStyles.Left,
+            Margin = new Padding(0, 3, 8, 10),
+        };
+        var facialBonesCheck = new CheckBox
+        {
+            Text = "Normalize facial bones on reimport",
+            Checked = _normalizeFacialBonesOnReimport,
+            AutoSize = true,
+            Anchor = AnchorStyles.Left,
+            Margin = new Padding(0, 0, 0, 10),
+        };
+        toolTip.SetToolTip(facialBonesCheck,
+            "Allows character-specific face bones with the same role to be retargeted by suffix, for example bigby_mouthCorner_L to rhys_mouthCorner_L.\n" +
+            "This can help compatible face rigs follow target lipsync, but can deform mismatched mouths. Off keeps each game's default safe behavior.");
+
+        var viewerLabel = new Label
+        {
+            Text = "Viewer:",
+            AutoSize = true,
+            Anchor = AnchorStyles.Left,
+            Margin = new Padding(0, 3, 8, 10),
+        };
+        var antiAliasCheck = new CheckBox
+        {
+            Text = "Anti-aliasing (smoother preview)",
+            Checked = _viewerAntiAliasing,
+            AutoSize = true,
+            Anchor = AnchorStyles.Left,
+            Margin = new Padding(0, 0, 0, 10),
+        };
+        toolTip.SetToolTip(antiAliasCheck,
+            "Renders the model preview at 2x resolution and downsamples it for smoother triangle edges.\n" +
+            "This is preview-only and may be slower on very large meshes.");
+
+        var cameraLabel = new Label
+        {
+            Text = "Camera:",
+            AutoSize = true,
+            Anchor = AnchorStyles.Left,
+            Margin = new Padding(0, 3, 8, 10),
+        };
+        var flightCameraCheck = new CheckBox
+        {
+            Text = "Flight camera (WASD + Q/E)",
+            Checked = _viewerFlightCamera,
+            AutoSize = true,
+            Anchor = AnchorStyles.Left,
+            Margin = new Padding(0, 0, 0, 10),
+        };
+        toolTip.SetToolTip(flightCameraCheck,
+            "Switches the preview from orbit-style navigation to a free-flight camera.\n" +
+            "Left-drag looks around; W/S dolly, A/D strafe, Q/E move vertically. Shift moves faster, Ctrl slower.");
+
         var buttons = new FlowLayoutPanel
         {
             FlowDirection = FlowDirection.RightToLeft,
-            Dock = DockStyle.Bottom,
+            Dock = DockStyle.Fill,
             AutoSize = true,
-            Margin = new Padding(0),
+            Margin = new Padding(0, 12, 0, 0),
         };
         var ok = new Button { Text = "OK", DialogResult = DialogResult.OK, Width = 86 };
         var cancel = new Button { Text = "Cancel", DialogResult = DialogResult.Cancel, Width = 86 };
@@ -536,14 +620,47 @@ public sealed class MainForm : Form
         buttons.Controls.Add(simulateUpdate);
 #endif
 
-        layout.Controls.Add(formatLabel, 0, 0);
-        layout.Controls.Add(formatCombo, 1, 0);
-        layout.Controls.Add(atlasLabel, 0, 1);
-        layout.Controls.Add(atlasCheck, 1, 1);
-        layout.Controls.Add(compressionLabel, 0, 2);
-        layout.Controls.Add(uncompressedCheck, 1, 2);
-        layout.Controls.Add(buttons, 0, 3);
-        layout.SetColumnSpan(buttons, 2);
+        var tabs = new TabControl
+        {
+            Size = new Size(386, 224),
+            Margin = new Padding(0),
+        };
+        var generalPage = new TabPage("General")
+        {
+            Padding = new Padding(10),
+            UseVisualStyleBackColor = true,
+        };
+        var viewerPage = new TabPage("Viewer")
+        {
+            Padding = new Padding(10),
+            UseVisualStyleBackColor = true,
+        };
+
+        var generalLayout = CreateSettingsPageLayout();
+        generalLayout.Controls.Add(formatLabel, 0, 0);
+        generalLayout.Controls.Add(formatCombo, 1, 0);
+        generalLayout.Controls.Add(atlasLabel, 0, 1);
+        generalLayout.Controls.Add(atlasCheck, 1, 1);
+        generalLayout.Controls.Add(compressionLabel, 0, 2);
+        generalLayout.Controls.Add(uncompressedCheck, 1, 2);
+        generalLayout.Controls.Add(scaleLabel, 0, 3);
+        generalLayout.Controls.Add(matchSizeCheck, 1, 3);
+        generalLayout.Controls.Add(facialBonesLabel, 0, 4);
+        generalLayout.Controls.Add(facialBonesCheck, 1, 4);
+
+        var viewerLayout = CreateSettingsPageLayout();
+        viewerLayout.Controls.Add(viewerLabel, 0, 0);
+        viewerLayout.Controls.Add(antiAliasCheck, 1, 0);
+        viewerLayout.Controls.Add(cameraLabel, 0, 1);
+        viewerLayout.Controls.Add(flightCameraCheck, 1, 1);
+
+        generalPage.Controls.Add(generalLayout);
+        viewerPage.Controls.Add(viewerLayout);
+        tabs.TabPages.Add(generalPage);
+        tabs.TabPages.Add(viewerPage);
+
+        layout.Controls.Add(tabs, 0, 0);
+        layout.Controls.Add(buttons, 0, 1);
         dialog.Controls.Add(layout);
         dialog.AcceptButton = ok;
         dialog.CancelButton = cancel;
@@ -556,11 +673,41 @@ public sealed class MainForm : Form
         _exportFormat = formatCombo.SelectedIndex == 0 ? ExportFormat.Glb : ExportFormat.GltfSeparate;
         _btnDiffuseAtlas.Checked = atlasCheck.Checked;
         _uncompressedTextures = uncompressedCheck.Checked;
+        _matchOriginalModelSize = matchSizeCheck.Checked;
+        _normalizeFacialBonesOnReimport = facialBonesCheck.Checked;
+        _viewerAntiAliasing = antiAliasCheck.Checked;
+        _viewerFlightCamera = flightCameraCheck.Checked;
+        _preview.SetAntiAliasing(_viewerAntiAliasing);
+        _preview.SetCameraMode(_viewerFlightCamera ? PreviewCameraMode.Flight : PreviewCameraMode.Orbit);
         UpdateFormatButton();
         AppPreferences.SaveToolSettings(
             _exportFormat == ExportFormat.Glb ? "Glb" : "GltfSeparate",
             _btnDiffuseAtlas.Checked,
-            _uncompressedTextures);
+            _uncompressedTextures,
+            _matchOriginalModelSize,
+            _normalizeFacialBonesOnReimport,
+            _viewerAntiAliasing,
+            _viewerFlightCamera);
+    }
+
+    private static TableLayoutPanel CreateSettingsPageLayout()
+    {
+        var layout = new TableLayoutPanel
+        {
+            AutoSize = true,
+            AutoSizeMode = AutoSizeMode.GrowAndShrink,
+            Dock = DockStyle.Top,
+            ColumnCount = 2,
+            RowCount = 5,
+        };
+        layout.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 116));
+        layout.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100));
+        for (var i = 0; i < 5; i++)
+        {
+            layout.RowStyles.Add(new RowStyle(SizeType.AutoSize));
+        }
+
+        return layout;
     }
 
     private void SetReadyState()
@@ -596,11 +743,6 @@ public sealed class MainForm : Form
 
     private async Task OpenFolderDialogAsync()
     {
-        if (!EnsureGameSelectedForOpen())
-        {
-            return;
-        }
-
         using var dialog = new FolderBrowserDialog
         {
             Description = "Select the folder containing the .d3dmesh, .d3dtx and .skl files",
@@ -620,11 +762,6 @@ public sealed class MainForm : Form
     // a model show up with its textures. No external unpacking tool is needed.
     private async Task OpenArchiveAsync()
     {
-        if (!EnsureGameSelectedForOpen())
-        {
-            return;
-        }
-
         using var dialog = new OpenFileDialog
         {
             Title = "Select one or more Telltale archives (.ttarch / .ttarch2)",
@@ -691,6 +828,8 @@ public sealed class MainForm : Form
 
             if (totalExtracted > 0)
             {
+                TryAutoSelectGameForGeneric(loadFolder, archivePaths.Concat(detectedGames));
+
                 var loadProgress = new Progress<double>(fraction =>
                     SetProgress((int)(fraction * 1000), 1000, $"Reading folder... {(int)(fraction * 100)}%"));
                 await ReloadAssetsAsync(loadFolder, loadProgress);
@@ -715,6 +854,17 @@ public sealed class MainForm : Form
     private void UpdateGameSelector()
     {
         _gameSelector.Text = $"Game: {GameConfig.Current.DisplayName}";
+        if (TryGetGameMenuImage(GameConfig.Current.Id, out var image))
+        {
+            _gameSelector.Image = image;
+            _gameSelector.ImageScaling = ToolStripItemImageScaling.None;
+        }
+        else
+        {
+            _gameSelector.Image = null;
+        }
+
+        UpdateGameSelectorImages(_gameSelector.DropDownItems);
         UpdateGameSelectorChecks(_gameSelector.DropDownItems);
     }
 
@@ -727,43 +877,85 @@ public sealed class MainForm : Form
                 GameId.BackToTheFutureEpisode2 or
                 GameId.BackToTheFutureEpisode3 or
                 GameId.BackToTheFutureEpisode4 or
-                GameId.BackToTheFutureEpisode5)
+                GameId.BackToTheFutureEpisode5 or
+                GameId.WalkingDeadSeason2 or
+                GameId.MinecraftStoryMode or
+                GameId.TalesFromTheBorderlands2014 or
+                GameId.TalesFromTheBorderlandsE3 or
+                GameId.TalesFromTheBorderlandsOld)
             {
                 continue;
             }
 
-            var item = CreateGameMenuItem(game);
+            var item = CreateGameMenuItem(game, selectable: !game.IsGameMenuGroup);
+            if (game.Id == GameId.TalesFromTheBorderlands)
+            {
+                item.DropDownItems.Add(CreateGameMenuItem(GameConfig.TalesFromTheBorderlands2014));
+                item.DropDownItems.Add(CreateGameMenuItem(GameConfig.TalesFromTheBorderlandsE3));
+                item.DropDownItems.Add(CreateGameMenuItem(GameConfig.TalesFromTheBorderlandsOld));
+                item.DropDownItems.Add(CreateGameMenuItem(GameConfig.TalesFromTheBorderlands2021, enabled: false));
+            }
+
             if (game.Id == GameId.BackToTheFuture)
             {
                 item.DropDownItems.Add(CreateGameMenuItem(GameConfig.BackToTheFutureEpisode1));
-                item.DropDownItems.Add(CreateGameMenuItem(GameConfig.BackToTheFutureEpisode2));
-                item.DropDownItems.Add(CreateGameMenuItem(GameConfig.BackToTheFutureEpisode3));
-                item.DropDownItems.Add(CreateGameMenuItem(GameConfig.BackToTheFutureEpisode4));
-                item.DropDownItems.Add(CreateGameMenuItem(GameConfig.BackToTheFutureEpisode5));
+                item.DropDownItems.Add(CreateGameMenuItem(GameConfig.BackToTheFutureEpisode2, enabled: false));
+                item.DropDownItems.Add(CreateGameMenuItem(GameConfig.BackToTheFutureEpisode3, enabled: false));
+                item.DropDownItems.Add(CreateGameMenuItem(GameConfig.BackToTheFutureEpisode4, enabled: false));
+                item.DropDownItems.Add(CreateGameMenuItem(GameConfig.BackToTheFutureEpisode5, enabled: false));
+            }
+
+            if (game.Id == GameId.WalkingDead)
+            {
+                item.DropDownItems.Add(CreateGameMenuItem(GameConfig.WalkingDeadSeason2));
+            }
+
+            if (game.Id == GameId.MinecraftStoryModeGroup)
+            {
+                item.DropDownItems.Add(CreateGameMenuItem(GameConfig.MinecraftStoryMode));
+                item.DropDownItems.Add(CreateGameMenuItem(GameConfig.MinecraftStoryModeSeason2, enabled: false));
             }
 
             _gameSelector.DropDownItems.Add(item);
         }
     }
 
-    private ToolStripMenuItem CreateGameMenuItem(GameConfig game)
+    private ToolStripMenuItem CreateGameMenuItem(GameConfig game, bool selectable = true, bool enabled = true)
     {
-        var item = new ToolStripMenuItem(game.DisplayName) { Tag = game };
+        var item = new ToolStripMenuItem(game.DisplayName) { Tag = game, Enabled = enabled };
         if (TryGetGameMenuImage(game.Id, out var image))
         {
             item.Image = image;
             item.ImageScaling = ToolStripItemImageScaling.None;
         }
 
-        item.Click += async (_, _) => await SelectGameAsync(game);
+        if (selectable && enabled)
+        {
+            item.Click += async (_, _) => await SelectGameAsync(game);
+        }
+
         return item;
     }
 
     private bool TryGetGameMenuImage(GameId id, out Image image)
     {
         image = null!;
-        var resourceName = id switch
+        var imageId = ResolveGameMenuImageId(id);
+        var resourceName = imageId switch
         {
+            GameId.Generic => "Auto-Generic",
+            GameId.WalkingDead => "TWD",
+            GameId.WalkingDeadSeason2 => "TWDS2",
+            GameId.WolfAmongUs => "TWAU",
+            GameId.MinecraftStoryModeGroup => "MCSM",
+            GameId.MinecraftStoryMode => "MCSMS1",
+            GameId.MinecraftStoryModeSeason2 => "MCSMS2",
+            GameId.TalesFromTheBorderlands => "TFTB",
+            GameId.TalesFromTheBorderlands2014 => "TFTB2014",
+            GameId.TalesFromTheBorderlandsE3 => "TFTBE3",
+            GameId.TalesFromTheBorderlandsOld => "TFTBOLD",
+            GameId.TalesFromTheBorderlands2021 => "TFTB2021",
+            GameId.BackToTheFuture => "BTTF",
             GameId.BackToTheFutureEpisode1 => "BTTF101",
             GameId.BackToTheFutureEpisode2 => "BTTF102",
             GameId.BackToTheFutureEpisode3 => "BTTF103",
@@ -776,7 +968,7 @@ public sealed class MainForm : Form
             return false;
         }
 
-        if (_gameMenuImages.TryGetValue(id, out image!))
+        if (_gameMenuImages.TryGetValue(imageId, out image!))
         {
             return true;
         }
@@ -790,9 +982,24 @@ public sealed class MainForm : Form
 
         using var loaded = Image.FromStream(stream);
         image = CreateMenuThumbnail(loaded, 28);
-        _gameMenuImages[id] = image;
+        _gameMenuImages[imageId] = image;
         return true;
     }
+
+    private static GameId ResolveGameMenuImageId(GameId id)
+        => id switch
+        {
+            GameId.TalesFromTheBorderlands when GameConfig.Current.IsTalesFromTheBorderlands => GameConfig.Current.Id,
+            GameId.BackToTheFuture when IsBackToTheFutureEpisode(GameConfig.Current.Id) => GameConfig.Current.Id,
+            _ => id,
+        };
+
+    private static bool IsBackToTheFutureEpisode(GameId id)
+        => id is GameId.BackToTheFutureEpisode1 or
+                 GameId.BackToTheFutureEpisode2 or
+                 GameId.BackToTheFutureEpisode3 or
+                 GameId.BackToTheFutureEpisode4 or
+                 GameId.BackToTheFutureEpisode5;
 
     private static Bitmap CreateMenuThumbnail(Image source, int size)
     {
@@ -814,8 +1021,29 @@ public sealed class MainForm : Form
         {
             item.Checked = item.Tag is GameConfig game &&
                 (ReferenceEquals(game, GameConfig.Current) ||
+                 (game.Id == GameId.WalkingDead && GameConfig.Current.IsWalkingDead) ||
+                 (game.Id == GameId.MinecraftStoryModeGroup && GameConfig.Current.IsMinecraftStoryMode) ||
+                 (game.Id == GameId.TalesFromTheBorderlands && GameConfig.Current.IsTalesFromTheBorderlands) ||
                  (game.Id == GameId.BackToTheFuture && GameConfig.Current.IsBackToTheFuture));
             UpdateGameSelectorChecks(item.DropDownItems);
+        }
+    }
+
+    private void UpdateGameSelectorImages(ToolStripItemCollection items)
+    {
+        foreach (var item in items.OfType<ToolStripMenuItem>())
+        {
+            if (item.Tag is GameConfig game && TryGetGameMenuImage(game.Id, out var image))
+            {
+                item.Image = image;
+                item.ImageScaling = ToolStripItemImageScaling.None;
+            }
+            else
+            {
+                item.Image = null;
+            }
+
+            UpdateGameSelectorImages(item.DropDownItems);
         }
     }
 
@@ -831,6 +1059,7 @@ public sealed class MainForm : Form
         GameConfig.Current = game;
         AppPreferences.SaveGameConfig(game);
         UpdateGameSelector();
+        UpdateSelectionButtons();
 
         if (_rootFolder is not null)
         {
@@ -838,24 +1067,244 @@ public sealed class MainForm : Form
         }
     }
 
-    private bool EnsureGameSelectedForOpen()
+    private void TryAutoSelectGameForGeneric(string folder, IEnumerable<string>? extraHints = null)
     {
         if (GameConfig.Current.Id != GameId.Generic)
         {
-            return true;
+            return;
         }
 
-        using var dialog = new GameSelectionDialog(GameConfig.Current);
-        if (dialog.ShowDialog(this) != DialogResult.OK)
+        var inferred = InferGameConfigForAutoGeneric(folder, extraHints);
+        if (inferred is null || inferred.Id == GameId.Generic)
+        {
+            return;
+        }
+
+        GameConfig.Current = inferred;
+        AppPreferences.SaveGameConfig(inferred);
+        UpdateGameSelector();
+        UpdateSelectionButtons();
+    }
+
+    private static GameConfig? InferGameConfigForAutoGeneric(string folder, IEnumerable<string>? extraHints)
+    {
+        foreach (var hint in EnumerateAutoGenericTextHints(folder, extraHints))
+        {
+            var inferred = InferGameConfigFromText(hint);
+            if (inferred is not null)
+            {
+                return inferred;
+            }
+        }
+
+        foreach (var assetPath in EnumerateAutoGenericAssetFiles(folder))
+        {
+            var inferred = InferGameConfigFromAssetHeader(assetPath);
+            if (inferred is not null)
+            {
+                return inferred;
+            }
+        }
+
+        return null;
+    }
+
+    private static IEnumerable<string> EnumerateAutoGenericTextHints(string folder, IEnumerable<string>? extraHints)
+    {
+        yield return folder;
+
+        if (extraHints is not null)
+        {
+            foreach (var hint in extraHints)
+            {
+                if (!string.IsNullOrWhiteSpace(hint))
+                {
+                    yield return hint;
+                }
+            }
+        }
+    }
+
+    private static IEnumerable<string> EnumerateAutoGenericAssetFiles(string folder)
+    {
+        IEnumerable<string> files;
+        try
+        {
+            files = Directory.EnumerateFiles(folder, "*.*", SearchOption.AllDirectories)
+                .Where(path =>
+                    path.EndsWith(".d3dmesh", StringComparison.OrdinalIgnoreCase))
+                .Take(200)
+                .ToArray();
+        }
+        catch
+        {
+            yield break;
+        }
+
+        foreach (var file in files)
+        {
+            yield return file;
+        }
+    }
+
+    private static GameConfig? InferGameConfigFromAssetHeader(string path)
+    {
+        try
+        {
+            var data = File.ReadAllBytes(path);
+            var header = MetaStreamHeader.Parse(data);
+            if (header.DataOffset <= 0 || header.DataOffset + 12 > data.Length)
+            {
+                return null;
+            }
+
+            var reader = new DataReader(data);
+            reader.Seek(header.DataOffset);
+            var nameHeaderLength = reader.ReadUInt32();
+            var nameLength = reader.ReadUInt32();
+            if (nameLength > nameHeaderLength)
+            {
+                reader.Seek(reader.Position - 4);
+                nameLength = nameHeaderLength;
+            }
+
+            if (nameLength > data.Length || reader.Position + nameLength + 4 > data.Length)
+            {
+                return null;
+            }
+
+            reader.Skip(checked((int)nameLength));
+            var meshVersion = reader.ReadInt32();
+            return InferGameConfigFromMeshSignature(header.Version, meshVersion);
+        }
+        catch
+        {
+            return null;
+        }
+    }
+
+    private static GameConfig? InferGameConfigFromMeshSignature(string metaStreamVersion, int meshVersion)
+    {
+        if (metaStreamVersion == "MSV4")
+        {
+            return GameConfig.TalesFromTheBorderlandsOld;
+        }
+
+        if (metaStreamVersion == "MTRE")
+        {
+            if (meshVersion == 1)
+            {
+                return GameConfig.BackToTheFutureEpisode1;
+            }
+
+            if (meshVersion is 5 or 6 or 9 or 10 or 11)
+            {
+                return GameConfig.TalesFromTheBorderlandsOld;
+            }
+
+            return null;
+        }
+
+        if (metaStreamVersion == "MSV5" && meshVersion == 12)
+        {
+            return GameConfig.TalesFromTheBorderlandsOld;
+        }
+
+        if (metaStreamVersion == "MSV5" && meshVersion == 17)
+        {
+            return GameConfig.TalesFromTheBorderlands2014;
+        }
+
+        if (metaStreamVersion == "MSV5" && meshVersion == 18)
+        {
+            return GameConfig.MinecraftStoryMode;
+        }
+
+        // Versions 13/14 are shared by nearby Telltale generations, and MTRE v12 appears in both
+        // supported and unsupported games. Keep Auto / Generic unless the folder/archive name supplied
+        // a stronger hint.
+        return null;
+    }
+
+    private static GameConfig? InferGameConfigFromText(string text)
+    {
+        if (string.IsNullOrWhiteSpace(text))
+        {
+            return null;
+        }
+
+        if (text.Contains("TWDS2", StringComparison.OrdinalIgnoreCase) ||
+            text.Contains("Walking Dead: Season 2", StringComparison.OrdinalIgnoreCase) ||
+            text.Contains("Walking Dead Season 2", StringComparison.OrdinalIgnoreCase) ||
+            text.Contains("WD200", StringComparison.OrdinalIgnoreCase))
+        {
+            return GameConfig.WalkingDeadSeason2;
+        }
+
+        if (text.Contains("TWAU", StringComparison.OrdinalIgnoreCase) ||
+            text.Contains("Wolf Among Us", StringComparison.OrdinalIgnoreCase) ||
+            text.Contains("Fables_pc_", StringComparison.OrdinalIgnoreCase))
+        {
+            return GameConfig.WolfAmongUs;
+        }
+
+        if (text.Contains("MCSM", StringComparison.OrdinalIgnoreCase) ||
+            text.Contains("Minecraft Story Mode", StringComparison.OrdinalIgnoreCase) ||
+            text.Contains("Minecraft: Story Mode", StringComparison.OrdinalIgnoreCase))
+        {
+            return GameConfig.MinecraftStoryMode;
+        }
+
+        if (IsTalesFromTheBorderlandsOldHint(text))
+        {
+            return GameConfig.TalesFromTheBorderlandsOld;
+        }
+
+        if (IsTalesFromTheBorderlandsE3Hint(text))
+        {
+            return GameConfig.TalesFromTheBorderlandsE3;
+        }
+
+        if (IsTalesFromTheBorderlands2014Hint(text))
+        {
+            return GameConfig.TalesFromTheBorderlands2014;
+        }
+
+        if (text.Contains("BTTF", StringComparison.OrdinalIgnoreCase) ||
+            text.Contains("Back to the Future", StringComparison.OrdinalIgnoreCase) ||
+            text.Contains("BackToTheFuture", StringComparison.OrdinalIgnoreCase))
+        {
+            return GameConfig.BackToTheFutureEpisode1;
+        }
+
+        return null;
+    }
+
+    private static bool IsTalesFromTheBorderlands2014Hint(string text)
+    {
+        if (text.Contains("2021", StringComparison.OrdinalIgnoreCase))
         {
             return false;
         }
 
-        GameConfig.Current = dialog.SelectedGame;
-        AppPreferences.SaveGameConfig(GameConfig.Current);
-        UpdateGameSelector();
-        return true;
+        return text.Contains("TFTB2014", StringComparison.OrdinalIgnoreCase) ||
+               text.Contains("TftBL", StringComparison.OrdinalIgnoreCase) ||
+               text.Contains("Tales from the Borderlands", StringComparison.OrdinalIgnoreCase) ||
+               text.Contains("Borderlands", StringComparison.OrdinalIgnoreCase);
     }
+
+    private static bool IsTalesFromTheBorderlandsOldHint(string text)
+        => !text.Contains("2021", StringComparison.OrdinalIgnoreCase) &&
+           (text.Contains("Source Code Leaked", StringComparison.OrdinalIgnoreCase) ||
+            text.Contains("TFTBOLD", StringComparison.OrdinalIgnoreCase) ||
+            text.Contains("Tales from the Borderlands (Old)", StringComparison.OrdinalIgnoreCase));
+
+    private static bool IsTalesFromTheBorderlandsE3Hint(string text)
+        => !text.Contains("2021", StringComparison.OrdinalIgnoreCase) &&
+           (text.Contains("TFTBE3", StringComparison.OrdinalIgnoreCase) ||
+            text.Contains("E3 Leak", StringComparison.OrdinalIgnoreCase) ||
+            text.Contains("TFTB E3", StringComparison.OrdinalIgnoreCase) ||
+            text.Contains("Tales from the Borderlands E3", StringComparison.OrdinalIgnoreCase));
 
     // Entry point for Open Folder / Reload / drag-drop. Owns the busy state, the progress bar and error
     // reporting so a large folder loads on a background thread without freezing the window.
@@ -895,6 +1344,8 @@ public sealed class MainForm : Form
         _selectedGroup = null;
         _preview.SetScene(null, null);
         progress?.Report(0);
+
+        TryAutoSelectGameForGeneric(folder);
 
         var (assets, groups) = await Task.Run(() =>
         {
@@ -1418,6 +1869,17 @@ public sealed class MainForm : Form
         }
     }
 
+    // Auto / Generic is for best-effort viewing/extraction and has no safe game-specific reinsert path.
+    // Tales from the Borderlands (Old) is the 2014 source-code leak: view/extract/GLB only, never
+    // reinsertion (there is no playable build to put files back into). Every reimport entry point is
+    // gated on this so the feature is fully unavailable while either profile is selected.
+    private static bool ReinsertionSupported => GameConfig.Current.Id is not GameId.Generic and not GameId.TalesFromTheBorderlandsOld;
+
+    private static string GetReinsertionUnavailableMessage()
+        => GameConfig.Current.Id == GameId.Generic
+            ? "Reinsertion is disabled for Auto / Generic. Select a supported game profile before reimporting."
+            : "Reinsertion is disabled for Tales from the Borderlands (Old). This profile is view and GLB export only.";
+
     private void OnTreeSelect(TreeNode? node)
     {
         if (node?.Tag is ModelAssetGroup group)
@@ -1425,7 +1887,7 @@ public sealed class MainForm : Form
             _selectedAsset = null;
             _selectedGroup = group;
             _btnExtractSelected.Enabled = true;
-            _btnReimportSelected.Enabled = true;
+            _btnReimportSelected.Enabled = ReinsertionSupported;
             PreviewAssetGroup(group);
             return;
         }
@@ -1443,7 +1905,7 @@ public sealed class MainForm : Form
         _selectedAsset = asset;
         _selectedGroup = null;
         _btnExtractSelected.Enabled = true;
-        _btnReimportSelected.Enabled = true;
+        _btnReimportSelected.Enabled = ReinsertionSupported;
         PreviewAsset(asset);
     }
 
@@ -1457,8 +1919,9 @@ public sealed class MainForm : Form
         }
 
         _btnExtractSelected.Enabled = _rootFolder is not null && HasExtractSelection();
-        _btnReimportSelected.Enabled = GetSingleSelectedAssetForReimport() is not null ||
-                                      GetSingleSelectedGroupForReimport() is not null;
+        _btnReimportSelected.Enabled = ReinsertionSupported &&
+                                      (GetSingleSelectedAssetForReimport() is not null ||
+                                       GetSingleSelectedGroupForReimport() is not null);
     }
 
     private bool HasExtractSelection()
@@ -1514,11 +1977,21 @@ public sealed class MainForm : Form
     {
         try
         {
-            var mesh = D3DMeshParser.Parse(File.ReadAllBytes(asset.MeshPath));
+            var mesh = D3DMeshParser.ParseFile(asset.MeshPath);
             SkeletonData? skeleton = null;
             if (asset.SkeletonPath is not null)
             {
-                skeleton = SkeletonLoader.Load(asset.SkeletonPath, mesh.Version);
+                // A skeleton that fails to parse must not block the mesh+texture preview: some assets
+                // (e.g. the Tales from the Borderlands source-leak characters/props) ship .skl files in a
+                // layout we cannot read yet. Fall back to a skeleton-less preview instead of failing.
+                try
+                {
+                    skeleton = SkeletonLoader.Load(asset.SkeletonPath, mesh.Version);
+                }
+                catch
+                {
+                    skeleton = null;
+                }
             }
 
             var textures = _rootFolder is null
@@ -1696,6 +2169,16 @@ public sealed class MainForm : Form
 
     private async Task ReimportSelectedAsync()
     {
+        if (!ReinsertionSupported)
+        {
+            MessageBox.Show(
+                GetReinsertionUnavailableMessage(),
+                "Reinsertion unavailable",
+                MessageBoxButtons.OK,
+                MessageBoxIcon.Information);
+            return;
+        }
+
         var asset = GetSingleSelectedAssetForReimport();
         var group = GetSingleSelectedGroupForReimport();
         if (asset is not null)
@@ -1727,7 +2210,9 @@ public sealed class MainForm : Form
         {
             var useDiffuseAtlas = _btnDiffuseAtlas.Checked;
             var uncompressedTextures = _uncompressedTextures;
-            var result = await Task.Run(() => ReimportSingleAsset(asset, input, output, useDiffuseAtlas, uncompressedTextures));
+            var matchOriginalSize = _matchOriginalModelSize;
+            var normalizeFacialBones = _normalizeFacialBonesOnReimport;
+            var result = await Task.Run(() => ReimportSingleAsset(asset, input, output, useDiffuseAtlas, uncompressedTextures, matchOriginalSize, normalizeFacialBones));
             return result;
         });
 
@@ -1759,13 +2244,15 @@ public sealed class MainForm : Form
         var root = _rootFolder;
         var useDiffuseAtlas = _btnDiffuseAtlas.Checked;
         var uncompressedTextures = _uncompressedTextures;
+        var matchOriginalSize = _matchOriginalModelSize;
+        var normalizeFacialBones = _normalizeFacialBonesOnReimport;
 
         await RunWithUiLockAsync(async () =>
         {
             var result = await Task.Run(() =>
             {
                 var model = GltfReader.Load(input);
-                return ReimportCombinedGroup(group, root, model, input, outputFolder, useDiffuseAtlas, uncompressedTextures);
+                return ReimportCombinedGroup(group, root, model, input, outputFolder, useDiffuseAtlas, uncompressedTextures, matchOriginalSize, normalizeFacialBones);
             });
 
             return result;
@@ -1777,11 +2264,22 @@ public sealed class MainForm : Form
         }
     }
 
-    private static string ReimportSingleAsset(ModelAsset asset, string input, string output, bool useDiffuseAtlas, bool uncompressedTextures)
+    private static string ReimportSingleAsset(
+        ModelAsset asset,
+        string input,
+        string output,
+        bool useDiffuseAtlas,
+        bool uncompressedTextures,
+        bool matchOriginalSize = false,
+        bool normalizeFacialBonesOnReimport = false)
     {
-        var gameConfig = GameConfig.Current;
+        var gameConfig = GameConfig.Current.WithNormalizeFacialBonesOnReimport(normalizeFacialBonesOnReimport);
         var templateBytes = File.ReadAllBytes(asset.MeshPath);
         var model = GltfModelPreprocessor.ApplyGameReinsertRules(GltfReader.Load(input), gameConfig);
+        if (matchOriginalSize)
+        {
+            MatchImportedModelToTemplateSize(model, templateBytes);
+        }
         var effectiveUseDiffuseAtlas = useDiffuseAtlas;
         // With the atlas active, the line/normal textures must be present as image bytes to be packed, so
         // reload them from the template folder before atlasing (Blender strips them). Off the atlas path
@@ -1800,8 +2298,14 @@ public sealed class MainForm : Form
         var atlas = ApplyDiffuseAtlasIfRequested(model, effectiveUseDiffuseAtlas, asset.MeshPath);
         model = atlas.Model;
 
+        if (BttfMeshSupport.IsBackToTheFutureMesh(templateBytes))
+        {
+            return ReimportBttfSingleAsset(asset, model, input, output, effectiveUseDiffuseAtlas, uncompressedTextures, gameConfig, atlas);
+        }
+
         var layout = D3DMeshLayout.Build(templateBytes);
-        var skeleton = LoadSkeletonOrNull(asset.SkeletonPath, layout.Version);
+        var skeletonPath = ResolveReimportSkeletonPath(asset);
+        var skeleton = LoadSkeletonOrNull(skeletonPath, layout.Version);
         var textureOptions = BuildReinsertTextureOptions(effectiveUseDiffuseAtlas, uncompressedTextures);
         var textures = ReinsertTextureService.WriteAllReferencedTextures(model, asset.MeshPath, output, gameConfig, textureOptions);
         var bytes = MeshReinserter.ReinsertGeometry(layout, model, textures, skeleton, gameConfig);
@@ -1815,10 +2319,140 @@ public sealed class MainForm : Form
         var textureLine = textureCount > 0
             ? $"\nTextures: {textureCount} .d3dtx file(s) written next to the output mesh."
             : "";
-        var skeletonLine = RebuildSkeletonForReimport(asset, model, output, layout.Version);
+        var skeletonLine = RebuildSkeletonForReimport(asset, skeletonPath, model, output, layout.Version, gameConfig);
         var atlasLine = BuildAtlasStatusLine(atlas);
 
         return $"Reimported: {Path.GetFileName(asset.MeshPath)}\nInput: {input}\nOutput: {output}{textureLine}{atlasLine}{skeletonLine}\n{status}";
+    }
+
+    // Rescales the imported model so its overall size matches the template mesh it replaces (Settings >
+    // "Match original model size"). The original bounds come from the template's own geometry, so this
+    // works for every supported game/version. Failures are non-fatal: a model that cannot be measured is
+    // simply left at its imported scale.
+    private static void MatchImportedModelToTemplateSize(GltfModel model, byte[] templateBytes)
+    {
+        try
+        {
+            var bounds = D3DMeshParser.Parse(templateBytes).GetBounds();
+            GltfModelScaler.MatchBounds(model, bounds);
+        }
+        catch
+        {
+            // Leave the imported model untouched if the template cannot be parsed for bounds.
+        }
+    }
+
+    // Union of every group asset's original geometry bounds, used to scale a combined import as a whole.
+    private static bool TryGetCombinedTemplateBounds(ModelAssetGroup group, out (float MinX, float MinY, float MinZ, float MaxX, float MaxY, float MaxZ) bounds)
+    {
+        var minX = float.MaxValue;
+        var minY = float.MaxValue;
+        var minZ = float.MaxValue;
+        var maxX = float.MinValue;
+        var maxY = float.MinValue;
+        var maxZ = float.MinValue;
+        var any = false;
+        foreach (var asset in group.Assets)
+        {
+            try
+            {
+                var (bMinX, bMinY, bMinZ, bMaxX, bMaxY, bMaxZ) = D3DMeshParser.ParseFile(asset.MeshPath).GetBounds();
+                if (bMinX == 0 && bMinY == 0 && bMinZ == 0 && bMaxX == 0 && bMaxY == 0 && bMaxZ == 0)
+                {
+                    continue;
+                }
+
+                minX = Math.Min(minX, bMinX);
+                minY = Math.Min(minY, bMinY);
+                minZ = Math.Min(minZ, bMinZ);
+                maxX = Math.Max(maxX, bMaxX);
+                maxY = Math.Max(maxY, bMaxY);
+                maxZ = Math.Max(maxZ, bMaxZ);
+                any = true;
+            }
+            catch
+            {
+                // Skip assets that cannot be parsed; the remaining ones still define the union.
+            }
+        }
+
+        bounds = (minX, minY, minZ, maxX, maxY, maxZ);
+        return any;
+    }
+
+    // Back to the Future (.d3dmesh v1, "ERTM") reimport. The V13/17 pipeline cannot read v1, so geometry
+    // is rewritten by BttfMeshReinserter while textures reuse the shared ReinsertTextureService (its ERTM
+    // .d3dtx path is already in place). Phase 1 handles static meshes; skinned v1 meshes are rejected.
+    private static string ReimportBttfSingleAsset(
+        ModelAsset asset,
+        GltfModel model,
+        string input,
+        string output,
+        bool effectiveUseDiffuseAtlas,
+        bool uncompressedTextures,
+        GameConfig gameConfig,
+        GltfDiffuseAtlasResult atlas)
+    {
+        var templateBytes = File.ReadAllBytes(asset.MeshPath);
+        // Back to the Future binds textures by name and we keep the template's references, so write the
+        // imported model's textures under the template submeshes' own slot names, aligned by part. This
+        // replaces the V13/17 ReinsertTextureService path (which renames by semantics and would mismatch
+        // a v1 character swap).
+        var textureCount = BttfMeshSupport.WriteAlignedTextures(asset.MeshPath, output, model, uncompressedTextures);
+        var bytes = BttfMeshSupport.ReinsertGeometry(templateBytes, model, model.Skeleton);
+
+        // Keep the prop's baked lightmap only when the imported model supplies its own bake (e.g. a model
+        // extracted from the game). For an unrelated/external model the inherited bake would multiply it to
+        // black in-game, so its reference is removed from the mesh (no bake shipped).
+        var removedBakeRefs = 0;
+        if (gameConfig.ClearInheritedBakeOnReimport && !BttfMeshSupport.ModelDeclaresBake(model))
+        {
+            (bytes, removedBakeRefs) = BttfMeshSupport.BreakInheritedBakeReference(bytes, asset.MeshPath);
+        }
+
+        File.WriteAllBytes(output, bytes);
+
+        var status = BttfMeshSupport.VerifyClosesAtEof(bytes)
+            ? "Output verified: layout closes at EOF."
+            : "Warning: output was written, but the layout does not close at EOF.";
+        var textureLine = textureCount > 0
+            ? $"\nTextures: {textureCount} .d3dtx file(s) written next to the output mesh."
+            : "";
+        var bakeLine = removedBakeRefs > 0
+            ? "\nBake: removed the inherited lightmap reference (imported model has no bake), so the model keeps its real colors in-game."
+            : "";
+        var atlasLine = BuildAtlasStatusLine(atlas);
+        var skeletonLine = RebuildBttfSkeletonForReimport(asset, model, output);
+
+        return $"Reimported: {Path.GetFileName(asset.MeshPath)} (Back to the Future v1)\nInput: {input}\nOutput: {output}{textureLine}{bakeLine}{atlasLine}{skeletonLine}\n{status}";
+    }
+
+    // Writes the .skl next to the reimported Back to the Future mesh, rebuilt from the GLB's own skeleton
+    // (character swaps need the imported model's bones, not the target's). The ERTM header is reused from
+    // the target's .skl. No skin in the GLB, or no target .skl, leaves the original skeleton in place.
+    private static string RebuildBttfSkeletonForReimport(ModelAsset asset, GltfModel model, string output)
+    {
+        if (model.Skeleton is null || model.Skeleton.Bones.Count == 0)
+        {
+            return "";
+        }
+
+        if (asset.SkeletonPath is null || !File.Exists(asset.SkeletonPath))
+        {
+            return "\nSkeleton: skipped (the target asset has no .skl to base the ERTM header on).";
+        }
+
+        try
+        {
+            var skeletonBytes = BttfSkeletonWriter.Build(File.ReadAllBytes(asset.SkeletonPath), model.Skeleton);
+            var skeletonOutput = Path.Combine(Path.GetDirectoryName(output) ?? "", Path.GetFileName(asset.SkeletonPath));
+            File.WriteAllBytes(skeletonOutput, skeletonBytes);
+            return $"\nSkeleton: {Path.GetFileName(asset.SkeletonPath)} rebuilt from the GLB ({model.Skeleton.Bones.Count} bones).";
+        }
+        catch (Exception ex)
+        {
+            return $"\nSkeleton: could not rebuild the .skl ({ex.Message}); the target's original skeleton is left in use.";
+        }
     }
 
     // Rebuilds the .skl next to the reimported mesh from the skeleton inside the GLB. When the model
@@ -1826,19 +2460,19 @@ public sealed class MainForm : Form
     // untouched skeleton stays byte-identical). Prop targets intentionally stay geometry-only: a
     // skinned GLB can be used as a static prop, but the target should not gain a brand-new .skl.
     // Returns a status line (empty when the GLB carries no skin or the target has no skeleton).
-    private static string RebuildSkeletonForReimport(ModelAsset asset, GltfModel model, string output, int skeletonVersion)
+    private static string RebuildSkeletonForReimport(ModelAsset asset, string? skeletonPath, GltfModel model, string output, int skeletonVersion, GameConfig gameConfig)
     {
         if (model.Skeleton is null || model.Skeleton.Bones.Count == 0)
         {
-            if (asset.SkeletonPath is not null && File.Exists(asset.SkeletonPath))
+            if (skeletonPath is not null && File.Exists(skeletonPath))
             {
-                return "\nSkeleton: kept the target .skl; imported model has no skin and was bound as static geometry.";
+                return "\nSkeleton: not written; imported model has no skin and was bound as static geometry.";
             }
 
             return "";
         }
 
-        if (asset.SkeletonPath is null || !File.Exists(asset.SkeletonPath))
+        if (skeletonPath is null || !File.Exists(skeletonPath))
         {
             return "\nSkeleton: skipped because the target asset has no original .skl; imported rig was baked as static geometry.";
         }
@@ -1846,30 +2480,57 @@ public sealed class MainForm : Form
         try
         {
             var outputDir = Path.GetDirectoryName(output) ?? "";
-            var skeletonName = Path.GetFileName(asset.SkeletonPath);
+            var skeletonName = Path.GetFileName(skeletonPath);
             var skeletonOutput = Path.Combine(outputDir, skeletonName);
 
             if (TryNormalizeAxisConvertedSkeletonForReimport(
-                    asset.SkeletonPath,
+                    skeletonPath,
                     skeletonVersion,
                     model.Skeleton,
                     out _,
                     out var normalizedSkeleton,
                     out var keptStatus))
             {
-                var normalizedSkeletonBytes = SkeletonRebuilder.RebuildWithEdits(asset.SkeletonPath, normalizedSkeleton);
+                var normalizedSkeletonBytes = RebuildSkeletonBytesForGame(skeletonPath, normalizedSkeleton, gameConfig);
                 File.WriteAllBytes(skeletonOutput, normalizedSkeletonBytes);
                 return "\n" + keptStatus;
             }
 
-            var skeletonBytes = SkeletonRebuilder.RebuildWithEdits(asset.SkeletonPath, model.Skeleton);
+            var skeletonBytes = RebuildSkeletonBytesForGame(skeletonPath, model.Skeleton, gameConfig);
             File.WriteAllBytes(skeletonOutput, skeletonBytes);
             return $"\nSkeleton: {skeletonName} rebuilt from the original skeleton + your edits ({model.Skeleton.Bones.Count} bones).";
         }
         catch (Exception ex)
         {
+            if (gameConfig.IsOriginalTalesFromTheBorderlandsPc)
+            {
+                throw new InvalidDataException($"Could not rebuild the TFTB original PC .skl for '{Path.GetFileName(asset.MeshPath)}'.", ex);
+            }
+
             return $"\nSkeleton: could not rebuild the .skl ({ex.Message}).";
         }
+    }
+
+    private static byte[] RebuildSkeletonBytesForGame(string skeletonPath, SkeletonData skeleton, GameConfig gameConfig)
+        => SkeletonRebuilder.RebuildWithEdits(skeletonPath, skeleton, gameConfig);
+
+    private static string? ResolveReimportSkeletonPath(ModelAsset asset)
+    {
+        if (!string.IsNullOrWhiteSpace(asset.SkeletonPath) && File.Exists(asset.SkeletonPath))
+        {
+            return asset.SkeletonPath;
+        }
+
+        var sameStem = Path.ChangeExtension(asset.MeshPath, ".skl");
+        if (File.Exists(sameStem))
+        {
+            return sameStem;
+        }
+
+        var folder = Path.GetDirectoryName(asset.MeshPath);
+        return string.IsNullOrWhiteSpace(folder)
+            ? null
+            : SkeletonResolver.FindForMesh(folder, asset.MeshPath);
     }
 
     internal static string ReimportCombinedGroup(
@@ -1879,16 +2540,24 @@ public sealed class MainForm : Form
         string input,
         string outputFolder,
         bool useDiffuseAtlas,
-        bool uncompressedTextures)
+        bool uncompressedTextures,
+        bool matchOriginalSize = false,
+        bool normalizeFacialBonesOnReimport = false)
     {
         Directory.CreateDirectory(outputFolder);
-        var gameConfig = GameConfig.Current;
+        var gameConfig = GameConfig.Current.WithNormalizeFacialBonesOnReimport(normalizeFacialBonesOnReimport);
         combinedModel = GltfModelPreprocessor.ApplyGameReinsertRules(
             combinedModel,
             gameConfig,
             preserveEyeHelperPrimitives: ShouldPreserveCombinedEyeHelperPrimitives(combinedModel, gameConfig));
+        if (matchOriginalSize && TryGetCombinedTemplateBounds(group, out var combinedBounds))
+        {
+            // Scale the whole combined import as one unit against the union of the group's original
+            // meshes, so the assembly keeps its internal proportions and part alignment.
+            GltfModelScaler.MatchBounds(combinedModel, combinedBounds);
+        }
         var sourcePrimitives = BuildCombinedSourcePrimitiveMap(group, combinedModel, inputRoot, out var splitModeLine);
-        var combinedSkeleton = BuildCombinedReferenceSkeletonForReimport(group, combinedModel, inputRoot, outputFolder, out var skeletonLine);
+        var combinedSkeleton = BuildCombinedReferenceSkeletonForReimport(group, combinedModel, inputRoot, outputFolder, gameConfig, out var skeletonLine);
         var ok = 0;
         var skipped = 0;
         var invisible = 0;
@@ -1901,6 +2570,17 @@ public sealed class MainForm : Form
             if (!sourcePrimitives.TryGetValue(fullMeshPath, out var primitives) || primitives.Count == 0)
             {
                 var invisibleOutput = Path.Combine(outputFolder, Path.GetFileName(asset.MeshPath));
+                var invisibleTemplateBytes = File.ReadAllBytes(asset.MeshPath);
+                if (BttfMeshSupport.IsBackToTheFutureMesh(invisibleTemplateBytes))
+                {
+                    // Phase 1 keeps unassigned Back to the Future parts as the game's original mesh rather
+                    // than synthesising a v1 no-triangle placeholder.
+                    File.WriteAllBytes(invisibleOutput, invisibleTemplateBytes);
+                    invisible++;
+                    lines.Add($"INVISIBLE {Path.GetFileName(asset.MeshPath)}: no imported primitives were assigned; kept the original Back to the Future mesh.");
+                    continue;
+                }
+
                 var invisibleBytes = BuildInvisibleMeshBytes(asset.MeshPath);
                 File.WriteAllBytes(invisibleOutput, invisibleBytes);
 
@@ -1935,7 +2615,27 @@ public sealed class MainForm : Form
             var atlas = ApplyDiffuseAtlasIfRequested(partModel, effectiveUseDiffuseAtlas, asset.MeshPath);
             partModel = atlas.Model;
             var output = Path.Combine(outputFolder, Path.GetFileName(asset.MeshPath));
-            var layout = D3DMeshLayout.Build(File.ReadAllBytes(asset.MeshPath));
+
+            var partTemplateBytes = File.ReadAllBytes(asset.MeshPath);
+            if (BttfMeshSupport.IsBackToTheFutureMesh(partTemplateBytes))
+            {
+                var bttfTextureCount = BttfMeshSupport.WriteAlignedTextures(asset.MeshPath, output, partModel, uncompressedTextures);
+                var bttfBytes = BttfMeshSupport.ReinsertGeometry(partTemplateBytes, partModel, partModel.Skeleton);
+                if (gameConfig.ClearInheritedBakeOnReimport && !BttfMeshSupport.ModelDeclaresBake(partModel))
+                {
+                    (bttfBytes, _) = BttfMeshSupport.BreakInheritedBakeReference(bttfBytes, asset.MeshPath);
+                }
+
+                File.WriteAllBytes(output, bttfBytes);
+                RebuildBttfSkeletonForReimport(asset, partModel, output);
+                totalTextures += bttfTextureCount;
+                ok++;
+                var bttfStatus = BttfMeshSupport.VerifyClosesAtEof(bttfBytes) ? "verified" : "layout warning";
+                lines.Add($"OK {Path.GetFileName(asset.MeshPath)}: {primitives.Count} primitive(s), {bttfTextureCount} texture(s) (BTTF v1), {bttfStatus}.");
+                continue;
+            }
+
+            var layout = D3DMeshLayout.Build(partTemplateBytes);
             var skeleton = combinedSkeleton ?? LoadSkeletonOrNull(asset.SkeletonPath, layout.Version);
             var textureOptions = BuildReinsertTextureOptions(effectiveUseDiffuseAtlas, uncompressedTextures);
             var textures = ReinsertTextureService.WriteAllReferencedTextures(partModel, asset.MeshPath, output, gameConfig, textureOptions);
@@ -2063,7 +2763,7 @@ public sealed class MainForm : Form
             try
             {
                 var layout = D3DMeshLayout.Build(File.ReadAllBytes(candidate));
-                var donorMesh = D3DMeshParser.Parse(File.ReadAllBytes(donor));
+                var donorMesh = D3DMeshParser.ParseFile(donor);
                 var primitives = DonorPartPrimitiveBuilder.Build(donorMesh, referenceSkeleton);
                 if (primitives.Count == 0)
                 {
@@ -2071,10 +2771,11 @@ public sealed class MainForm : Form
                 }
 
                 var partModel = new GltfModel { Primitives = primitives };
+                var textureSlots = BuildTemplateTextureSlotsForCompanionPart(candidate, primitives.Count);
                 var bytes = MeshReinserter.ReinsertGeometry(
                     layout,
                     partModel,
-                    diffuseTextureNames: null,
+                    new ReinsertedTextures(textureSlots, []),
                     referenceSkeleton,
                     gameConfig);
                 File.WriteAllBytes(Path.Combine(outputFolder, candidateName), bytes);
@@ -2090,31 +2791,52 @@ public sealed class MainForm : Form
         return ported;
     }
 
-    private static byte[] BuildInvisibleMeshBytes(string templateMeshPath)
+    private static IReadOnlyList<IReadOnlyDictionary<string, string>> BuildTemplateTextureSlotsForCompanionPart(string templateMeshPath, int primitiveCount)
     {
-        var layout = D3DMeshLayout.Build(File.ReadAllBytes(templateMeshPath));
-        var submeshBytes = layout.Original
-            .AsSpan(layout.SubmeshTableOffset, layout.SubmeshTableLength)
-            .ToArray();
-
-        foreach (var submesh in layout.Submeshes)
+        var result = new List<IReadOnlyDictionary<string, string>>(primitiveCount);
+        MeshData? templateMesh = null;
+        try
         {
-            WriteU32(submeshBytes, submesh.FaceStartFieldOffset - layout.SubmeshTableOffset, 0);
-            WriteU32(submeshBytes, submesh.PolygonCountFieldOffset - layout.SubmeshTableOffset, 0);
-
-            // Keep vertex ranges untouched for old Telltale mesh versions that dislike zero-vertex files.
-            // With polygon counts and face buffer cleared, the mesh remains valid but has nothing to draw.
+            templateMesh = D3DMeshParser.ParseFile(templateMeshPath);
+        }
+        catch
+        {
+            templateMesh = null;
         }
 
-        var patches = new List<RegionPatch>
+        for (var primitiveIndex = 0; primitiveIndex < primitiveCount; primitiveIndex++)
         {
-            new(layout.SubmeshTableOffset, layout.SubmeshTableLength, submeshBytes),
-            new(layout.FaceCountFieldOffset, 4, U32(0)),
-            new(layout.FaceDataOffset, layout.FaceDataLength, []),
-        };
+            if (templateMesh is null || templateMesh.Submeshes.Count == 0)
+            {
+                result.Add(new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase));
+                continue;
+            }
 
-        var result = D3DMeshWriter.Apply(layout, patches);
-        BinaryPrimitives.WriteUInt32LittleEndian(result.AsSpan(4, 4), (uint)(result.Length - layout.DataOffset));
+            var templateSubmesh = templateMesh.Submeshes[Math.Min(primitiveIndex, templateMesh.Submeshes.Count - 1)];
+            result.Add(templateSubmesh.TextureNames
+                .Where(static pair => !string.IsNullOrWhiteSpace(pair.Value))
+                .ToDictionary(
+                    static pair => pair.Key,
+                    static pair => pair.Value,
+                    StringComparer.OrdinalIgnoreCase));
+        }
+
+        return result;
+    }
+
+    private static byte[] BuildInvisibleMeshBytes(string templateMeshPath)
+    {
+        // Keep the template mesh STRUCTURALLY INTACT — same vertex buffers, submesh table, polygon counts,
+        // bone palettes, texture groups and section offsets as the game's own (valid) file — and make it
+        // invisible by collapsing every triangle to a degenerate one: zeroing the index buffer turns each
+        // triangle into (v0, v0, v0), which has zero area and never rasterizes, in any pose. The earlier
+        // approach (removing the face buffer + zeroing the global/submesh face counts) left a mesh the
+        // Tales from the Borderlands 2014/2015 (v17) runtime rejected → crash on load. A complete mesh with
+        // degenerate triangles loads exactly like a normal one, just draws nothing.
+        var original = File.ReadAllBytes(templateMeshPath);
+        var layout = D3DMeshLayout.Build(original);
+        var result = (byte[])original.Clone();
+        result.AsSpan(layout.FaceDataOffset, layout.FaceDataLength).Clear();
         return result;
     }
 
@@ -2130,9 +2852,9 @@ public sealed class MainForm : Form
 
     // Locates the imported character's own .skl next to its source meshes (resolved from the GLB's
     // extras.sourceMesh paths), so the rebuild can adopt the donor's per-bone translation scales.
-    private static SkeletonData? LoadDonorSkeletonForScales(GltfModel model, string inputRoot)
+    private static SkeletonData? LoadDonorSkeletonForScales(GltfModel model, string inputRoot, GameConfig gameConfig)
     {
-        if (!GameConfig.Current.PortTranslationScalesOnSkeletonMerge)
+        if (!gameConfig.PortTranslationScalesOnSkeletonMerge)
         {
             return null;
         }
@@ -2172,18 +2894,20 @@ public sealed class MainForm : Form
         GltfModel model,
         string inputRoot,
         string outputFolder,
+        GameConfig gameConfig,
         out string statusLine)
     {
         statusLine = "Skeleton: skipped.";
+        var skeletonVersion = ResolveCombinedSkeletonVersion(group);
         if (string.IsNullOrWhiteSpace(group.SkeletonPath) || !File.Exists(group.SkeletonPath))
         {
             if (model.Skeleton is { Bones.Count: > 0 } foreignSkeleton)
             {
                 var outputPath = Path.Combine(outputFolder, group.OutputStem + ".skl");
-                var skeletonBytes = SkeletonRebuilder.WriteNewSkeleton(foreignSkeleton, GameConfig.Current.DisplayName);
+                var skeletonBytes = SkeletonRebuilder.WriteNewSkeleton(foreignSkeleton, gameConfig.DisplayName);
                 File.WriteAllBytes(outputPath, skeletonBytes);
                 statusLine = $"Skeleton: {Path.GetFileName(outputPath)} created from the imported model ({foreignSkeleton.Bones.Count} bones).";
-                return LoadSkeletonOrNull(outputPath, version: 13);
+                return LoadSkeletonOrNull(outputPath, skeletonVersion);
             }
 
             statusLine = "Skeleton: skipped because the Combined group has no original .skl and the imported model has no skeleton.";
@@ -2192,7 +2916,7 @@ public sealed class MainForm : Form
 
         if (model.Skeleton is null || model.Skeleton.Bones.Count == 0)
         {
-            var original = LoadSkeletonOrNull(group.SkeletonPath, version: 13);
+            var original = LoadSkeletonOrNull(group.SkeletonPath, skeletonVersion);
             var outputPath = Path.Combine(outputFolder, Path.GetFileName(group.SkeletonPath));
             if (!Path.GetFullPath(group.SkeletonPath).Equals(Path.GetFullPath(outputPath), StringComparison.OrdinalIgnoreCase))
             {
@@ -2209,21 +2933,23 @@ public sealed class MainForm : Form
             var outputPath = Path.Combine(outputFolder, skeletonName);
             if (TryNormalizeAxisConvertedSkeletonForReimport(
                     group.SkeletonPath,
-                    version: 13,
+                    skeletonVersion,
                     model.Skeleton,
                     out var originalSkeleton,
                     out var normalizedSkeleton,
                     out statusLine))
             {
-                var normalizedSkeletonBytes = SkeletonRebuilder.RebuildWithEdits(group.SkeletonPath, normalizedSkeleton);
+                var normalizedSkeletonBytes = RebuildSkeletonBytesForGame(group.SkeletonPath, normalizedSkeleton, gameConfig);
                 File.WriteAllBytes(outputPath, normalizedSkeletonBytes);
-                return LoadSkeletonOrNull(outputPath, version: 13) ?? originalSkeleton;
+                return LoadSkeletonOrNull(outputPath, skeletonVersion) ?? originalSkeleton;
             }
 
-            var scaleDonor = LoadDonorSkeletonForScales(model, inputRoot);
-            var skeletonBytes = SkeletonRebuilder.RebuildWithEdits(group.SkeletonPath, model.Skeleton, scaleDonor);
+            var scaleDonor = LoadDonorSkeletonForScales(model, inputRoot, gameConfig);
+            var skeletonBytes = gameConfig.IsOriginalTalesFromTheBorderlandsPc
+                ? RebuildSkeletonBytesForGame(group.SkeletonPath, model.Skeleton, gameConfig)
+                : SkeletonRebuilder.RebuildWithEdits(group.SkeletonPath, model.Skeleton, scaleDonor);
             File.WriteAllBytes(outputPath, skeletonBytes);
-            var rebuiltSkeleton = LoadSkeletonOrNull(outputPath, version: 13);
+            var rebuiltSkeleton = LoadSkeletonOrNull(outputPath, skeletonVersion);
             var scalesNote = scaleDonor is not null ? " + donor translation scales" : "";
             var boneCountLine = rebuiltSkeleton is null
                 ? $"{model.Skeleton.Bones.Count} imported bones"
@@ -2233,9 +2959,31 @@ public sealed class MainForm : Form
         }
         catch (Exception ex)
         {
+            if (gameConfig.IsOriginalTalesFromTheBorderlandsPc)
+            {
+                throw new InvalidDataException($"Could not rebuild the TFTB original PC Combined .skl for '{group.Name}'.", ex);
+            }
+
             statusLine = $"Skeleton: could not rebuild the .skl ({ex.Message}); original skeleton was used for mesh mapping.";
-            return LoadSkeletonOrNull(group.SkeletonPath, version: 13);
+            return LoadSkeletonOrNull(group.SkeletonPath, skeletonVersion);
         }
+    }
+
+    private static int ResolveCombinedSkeletonVersion(ModelAssetGroup group)
+    {
+        foreach (var asset in group.Assets)
+        {
+            try
+            {
+                return D3DMeshLayout.Build(File.ReadAllBytes(asset.MeshPath)).Version;
+            }
+            catch
+            {
+                // Try the next part; if none parse, fall back to the legacy skeleton reader version.
+            }
+        }
+
+        return 13;
     }
 
     private static bool TryNormalizeAxisConvertedSkeletonForReimport(
@@ -2475,6 +3223,10 @@ public sealed class MainForm : Form
                     "tex8",
                     "bump",
                     "normal",
+                    // Lightmap (bake) and baked shadow are per-object and not atlased, but must still be
+                    // written/preserved so atlasing a lightmapped mesh does not drop its lightmap section.
+                    "bake",
+                    "shadow",
                 },
             }
             : new ReinsertTextureOptions { ForceUncompressed = uncompressedTextures };
@@ -2532,7 +3284,7 @@ public sealed class MainForm : Form
         var result = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
         try
         {
-            var mesh = D3DMeshParser.Parse(File.ReadAllBytes(templateMeshPath));
+            var mesh = D3DMeshParser.ParseFile(templateMeshPath);
             foreach (var submesh in mesh.Submeshes)
             {
                 foreach (var name in submesh.TextureNames.Values.Append(submesh.Name))
@@ -2590,7 +3342,7 @@ public sealed class MainForm : Form
         const bool packSharedPartsTextures = true;
         return names is null
             ? new GltfDiffuseAtlasOptions(PackSharedPartsTextures: packSharedPartsTextures)
-            : new GltfDiffuseAtlasOptions(AtlasName: names.Diffuse, NormalAtlasName: names.Normal, PackSharedPartsTextures: packSharedPartsTextures);
+            : new GltfDiffuseAtlasOptions(AtlasName: names.Diffuse, NormalAtlasName: names.Normal, DetailAtlasName: names.Detail, PackSharedPartsTextures: packSharedPartsTextures);
     }
 
     private static string BuildAtlasStatusLine(GltfDiffuseAtlasResult atlas)
@@ -2848,7 +3600,7 @@ public sealed class MainForm : Form
 
     private static CombinedPartTarget BuildCombinedPartTarget(ModelAsset asset, string inputRoot)
     {
-        var mesh = D3DMeshParser.Parse(File.ReadAllBytes(asset.MeshPath));
+        var mesh = D3DMeshParser.ParseFile(asset.MeshPath);
         var primaryLabels = new List<string>
         {
             Path.GetFileNameWithoutExtension(asset.MeshPath),
@@ -3149,6 +3901,7 @@ public sealed class MainForm : Form
             SourceMeshPath = null,
             SourceSubmeshIndex = targetSubmeshIndex,
             RecoveredDetailLineTextureName = source.RecoveredDetailLineTextureName,
+            RecoveredDetailLineImage = source.RecoveredDetailLineImage,
             IsSkinned = source.IsSkinned,
             BaseColor = source.BaseColor,
             TextureSlots = source.TextureSlots,
@@ -3300,7 +4053,7 @@ public sealed class MainForm : Form
         _btnReload.Enabled = !busy && _rootFolder is not null;
         _btnExtractAll.Enabled = !busy && _rootFolder is not null && _assets.Count > 0;
         _btnExtractSelected.Enabled = !busy && _rootFolder is not null && HasExtractSelection();
-        _btnReimportSelected.Enabled = !busy &&
+        _btnReimportSelected.Enabled = !busy && ReinsertionSupported &&
                                       (GetSingleSelectedAssetForReimport() is not null ||
                                        GetSingleSelectedGroupForReimport() is not null);
         _btnCombineParts.Enabled = !busy && _rootFolder is not null && _assets.Count > 0;
@@ -3360,22 +4113,31 @@ public sealed class MainForm : Form
     // when triggered from the menu, also confirms when the tool is already up to date.
     private async Task CheckForUpdatesAsync(bool silent)
     {
-        var info = await UpdateChecker.CheckForUpdateAsync();
+        var info = await UpdateChecker.FetchLatestReleaseAsync();
         if (info is null)
         {
             if (!silent)
             {
                 MessageBox.Show(
-                    $"You're on the latest version (v{UpdateChecker.CurrentVersion}).",
+                    "Could not check for updates right now. Please try again later.",
                     Text,
                     MessageBoxButtons.OK,
-                    MessageBoxIcon.Information);
+                    MessageBoxIcon.Warning);
             }
 
             return;
         }
 
-        ShowUpdateDialog(info);
+        if (UpdateChecker.IsNewerVersion(info.Version, UpdateChecker.CurrentVersion))
+        {
+            ShowUpdateDialog(info);
+            return;
+        }
+
+        if (!silent)
+        {
+            ShowUpToDateDialog(info);
+        }
     }
 
 #if DEBUG
@@ -3514,11 +4276,95 @@ public sealed class MainForm : Form
         dialog.ShowDialog(this);
     }
 
-    private async Task InstallUpdateAsync(UpdateInfo info)
+    private void ShowUpToDateDialog(UpdateInfo info)
     {
+        using var dialog = new Form
+        {
+            Text = "You're up to date",
+            StartPosition = FormStartPosition.CenterParent,
+            FormBorderStyle = FormBorderStyle.FixedDialog,
+            MinimizeBox = false,
+            MaximizeBox = false,
+            ShowIcon = false,
+            ShowInTaskbar = false,
+            AutoSize = true,
+            AutoSizeMode = AutoSizeMode.GrowAndShrink,
+            Font = Font,
+        };
+
+        var layout = new TableLayoutPanel
+        {
+            AutoSize = true,
+            AutoSizeMode = AutoSizeMode.GrowAndShrink,
+            Padding = new Padding(16, 14, 16, 14),
+            ColumnCount = 1,
+            RowCount = 3,
+        };
+        layout.ColumnStyles.Add(new ColumnStyle(SizeType.AutoSize));
+        layout.RowStyles.Add(new RowStyle(SizeType.AutoSize));
+        layout.RowStyles.Add(new RowStyle(SizeType.AutoSize));
+        layout.RowStyles.Add(new RowStyle(SizeType.AutoSize));
+
+        var header = new Label
+        {
+            Text = $"You're on the latest version (v{UpdateChecker.CurrentVersion}).",
+            AutoSize = true,
+            Font = new Font(Font, FontStyle.Bold),
+            Margin = new Padding(0, 0, 0, 8),
+        };
+
+        var reinstallHint = new Label
+        {
+            Text = string.IsNullOrWhiteSpace(info.DownloadUrl)
+                ? "No downloadable installer was found for this release. You can open the release page manually."
+                : "If you want to reinstall this version, click Reinstall.",
+            AutoSize = true,
+            MaximumSize = new Size(420, 0),
+            Margin = new Padding(0, 0, 0, 14),
+        };
+
+        var buttons = new FlowLayoutPanel
+        {
+            FlowDirection = FlowDirection.RightToLeft,
+            Dock = DockStyle.Fill,
+            AutoSize = true,
+            WrapContents = false,
+        };
+        var close = new Button { Text = "Close", AutoSize = true, DialogResult = DialogResult.Cancel, Margin = new Padding(6, 0, 0, 0) };
+        var viewOnGitHub = new Button { Text = "View on GitHub", AutoSize = true, Margin = new Padding(6, 0, 0, 0) };
+        viewOnGitHub.Click += (_, _) => OpenUrl(info.ReleaseUrl);
+        buttons.Controls.Add(close);
+        buttons.Controls.Add(viewOnGitHub);
+
+        if (!string.IsNullOrWhiteSpace(info.DownloadUrl))
+        {
+            var reinstall = new Button { Text = "Reinstall", AutoSize = true, Margin = new Padding(6, 0, 0, 0) };
+            reinstall.Click += async (_, _) =>
+            {
+                dialog.Close();
+                await InstallUpdateAsync(info, reinstall: true);
+            };
+            buttons.Controls.Add(reinstall);
+        }
+
+        layout.Controls.Add(header, 0, 0);
+        layout.Controls.Add(reinstallHint, 0, 1);
+        layout.Controls.Add(buttons, 0, 2);
+        dialog.Controls.Add(layout);
+        dialog.CancelButton = close;
+        dialog.ShowDialog(this);
+    }
+
+    private async Task InstallUpdateAsync(UpdateInfo info, bool reinstall = false)
+    {
+        var action = reinstall ? "reinstall" : "install";
+        var title = reinstall ? "Reinstall current version" : "Install update";
+        var prompt = reinstall
+            ? $"Are you sure you want to reinstall {info.Title}?\n\nThe tool will download the release, close, replace its files, and reopen automatically."
+            : $"Install {info.Title} now?\n\nThe tool will download the release, close, replace its files, and reopen automatically.";
         var answer = MessageBox.Show(
-            $"Install {info.Title} now?\n\nThe tool will download the release, close, replace its files, and reopen automatically.",
-            Text,
+            prompt,
+            title,
             MessageBoxButtons.YesNo,
             MessageBoxIcon.Question,
             MessageBoxDefaultButton.Button1);
@@ -3530,19 +4376,19 @@ public sealed class MainForm : Form
         SetBusy(true);
         try
         {
-            SetStatusText($"Installing update {info.Version}...");
+            SetStatusText(reinstall ? $"Reinstalling version {info.Version}..." : $"Installing update {info.Version}...");
             var progress = new Progress<(int Done, int Total, string Label)>(p =>
                 SetProgress(p.Done, p.Total, p.Label));
             await SelfUpdater.DownloadExtractAndRestartAsync(info, progress);
-            SetStatusText("Restarting to apply update...");
+            SetStatusText(reinstall ? "Restarting to finish reinstall..." : "Restarting to apply update...");
             Application.Exit();
         }
         catch (Exception ex)
         {
-            SetStatusText("Update failed.");
+            SetStatusText(reinstall ? "Reinstall failed." : "Update failed.");
             MessageBox.Show(
-                $"Could not install the update automatically.\n\n{ex.Message}\n\nYou can still download it manually from GitHub.",
-                Text,
+                $"Could not {action} automatically.\n\n{ex.Message}\n\nYou can still download it manually from GitHub.",
+                reinstall ? "Reinstall failed" : "Update failed",
                 MessageBoxButtons.OK,
                 MessageBoxIcon.Error);
             OpenUrl(info.ReleaseUrl);
@@ -3653,7 +4499,7 @@ public sealed class MainForm : Form
             Margin = new Padding(0, 0, 0, 8),
         };
         var supportedGameNames = GameConfig.All
-            .Where(game => game.Id != GameId.Generic)
+            .Where(game => game.Id != GameId.Generic && !game.IsGameMenuGroup)
             .Select(game => game.DisplayName)
             .ToList();
         foreach (var gameName in supportedGameNames)
@@ -3860,7 +4706,7 @@ public sealed class MainForm : Form
             MaximizeBox = false,
             MinimizeBox = false,
             ShowInTaskbar = false,
-            ClientSize = new Size(540, 350),
+            ClientSize = new Size(540, 1),
             Font = Font,
         };
 
@@ -3876,6 +4722,9 @@ public sealed class MainForm : Form
         layout.RowStyles.Add(new RowStyle(SizeType.AutoSize));
         layout.RowStyles.Add(new RowStyle(SizeType.AutoSize));
         layout.RowStyles.Add(new RowStyle(SizeType.AutoSize));
+        layout.RowStyles.Add(new RowStyle(SizeType.AutoSize));
+        layout.RowStyles.Add(new RowStyle(SizeType.AutoSize));
+        layout.RowStyles.Add(new RowStyle(SizeType.AutoSize));
 
         var title = new Label
         {
@@ -3885,12 +4734,24 @@ public sealed class MainForm : Form
             Margin = new Padding(0, 0, 0, 6),
         };
 
-        var madeBy = new Label
+        const string authorName = "HeitorSpectre";
+        const string authorUrl = "https://github.com/HeitorSpectre";
+        var madeBy = new LinkLabel
         {
-            Text = "Made by Heitor Spectre.",
+            Text = $"Made by {authorName}.",
             AutoSize = true,
+            LinkArea = new LinkArea("Made by ".Length, authorName.Length),
             Margin = new Padding(0, 0, 0, 10),
         };
+        madeBy.Links[0].LinkData = authorUrl;
+        madeBy.LinkClicked += (_, e) =>
+        {
+            if (e.Link?.LinkData is string target)
+            {
+                Process.Start(new ProcessStartInfo(target) { UseShellExecute = true });
+            }
+        };
+        WireCreditLinkStatus(madeBy, authorUrl);
 
         var thanks = new Label
         {
@@ -3912,23 +4773,57 @@ public sealed class MainForm : Form
         AddCreditLink(links, "RandomTBush", "https://github.com/RandomTBush");
         AddCreditLink(links, "Aabii / Arizzble", "https://github.com/Arizzble");
 
-        var paragraph = new TextBox
+        var paragraph = new Label
         {
             Text = "Without their analysis and the documentation available in their repositories, none of this would have happened. I would like to thank them for supporting the community, creating tools, and documenting the formats. Their work made it possible to build an editor capable of both extracting assets from the game and reinserting them back into it.",
-            ReadOnly = true,
-            Multiline = true,
-            BorderStyle = BorderStyle.None,
-            BackColor = dialog.BackColor,
-            TabStop = false,
-            Width = 500,
-            Height = 82,
+            AutoSize = true,
+            MaximumSize = new Size(500, 0),
             Margin = new Padding(0, 0, 0, 10),
+        };
+
+        const string telltaleName = "Telltale Games";
+        const string skunkapeName = "Skunkape Games";
+        const string telltaleUrl = "https://telltale.com";
+        const string skunkapeUrl = "https://skunkapegames.com";
+        var specialThanksText =
+            $"And a very special thank you to {telltaleName} and {skunkapeName} for their incredible games and their dedication to these wonderful experiences. Without them, we would never have these models to view, edit, and extract. This is a heartfelt tribute for creating such amazing games that helped shape video game culture.";
+        var specialThanks = new CreditLinkLabel
+        {
+            Text = specialThanksText,
+            AutoSize = true,
+            MaximumSize = new Size(500, 0),
+            Margin = new Padding(0, 0, 0, 12),
+        };
+        var telltaleStart = specialThanksText.IndexOf(telltaleName, StringComparison.Ordinal);
+        var skunkapeStart = specialThanksText.IndexOf(skunkapeName, StringComparison.Ordinal);
+        specialThanks.Links.Add(telltaleStart, telltaleName.Length, telltaleUrl);
+        specialThanks.Links.Add(skunkapeStart, skunkapeName.Length, skunkapeUrl);
+        specialThanks.LinkClicked += (_, e) =>
+        {
+            if (e.Link?.LinkData is string target)
+            {
+                Process.Start(new ProcessStartInfo(target) { UseShellExecute = true });
+            }
+        };
+        WireCreditLinkStatusByLink(specialThanks);
+
+        var legalFooter = new Label
+        {
+            Text = $"© {DateTime.Now.Year} All trademarks, copyrights, characters, worlds, game assets, names, and logos remain the property of their respective creators, publishers, licensors, and rights holders, including but not limited to Telltale Games, Skunkape Games, LCG Entertainment, Steve Purcell, Jeff Smith and Cartoon Books, CBS Studios, Ubisoft, NBCUniversal, Universal Pictures, Aardman Animations, Lucasfilm Games and Disney, Ron Gilbert, The Brothers Chaps, Valve Corporation, Penny Arcade, Skybound Entertainment, Robert Kirkman, DC Comics, Vertigo, Warner Bros., Bob Kane, Bill Finger, Bill Willingham, Gearbox Software, 2K and Take-Two Interactive, HBO and Warner Bros. Discovery, George R. R. Martin, Mojang Studios and Microsoft, Marvel and Disney, Netflix, Alcon Entertainment, Alcon Interactive Group, Deck Nine Games, Graham Annable, Straandlooper Animation, Adult Swim, Williams Street, Cartoon Network, Renaissance Pictures, Lionsgate, StudioCanal, Sierra Entertainment, Activision, and all other respective owners. This fan-made tool is not affiliated with, endorsed by, or sponsored by those owners.",
+            AutoSize = true,
+            MaximumSize = new Size(500, 0),
+            ForeColor = SystemColors.GrayText,
+            Font = new Font(Font.FontFamily, Math.Max(7f, Font.Size - 1f), FontStyle.Regular),
+            Margin = new Padding(0, 0, 0, 12),
         };
 
         var buttons = new FlowLayoutPanel
         {
-            Dock = DockStyle.Fill,
+            Anchor = AnchorStyles.Right,
+            AutoSize = true,
             FlowDirection = FlowDirection.RightToLeft,
+            Margin = new Padding(0),
+            WrapContents = false,
         };
         var ok = new Button
         {
@@ -3943,14 +4838,17 @@ public sealed class MainForm : Form
         layout.Controls.Add(thanks, 0, 2);
         layout.Controls.Add(links, 0, 3);
         layout.Controls.Add(paragraph, 0, 4);
-        layout.Controls.Add(buttons, 0, 5);
+        layout.Controls.Add(specialThanks, 0, 5);
+        layout.Controls.Add(legalFooter, 0, 6);
+        layout.Controls.Add(buttons, 0, 7);
 
         dialog.Controls.Add(layout);
+        dialog.ClientSize = new Size(540, layout.GetPreferredSize(new Size(540, 0)).Height);
         dialog.AcceptButton = ok;
         dialog.ShowDialog(this);
     }
 
-    private static void AddCreditLink(FlowLayoutPanel links, string name, string url)
+    private void AddCreditLink(FlowLayoutPanel links, string name, string url)
     {
         var link = new LinkLabel
         {
@@ -3967,7 +4865,52 @@ public sealed class MainForm : Form
                 Process.Start(new ProcessStartInfo(target) { UseShellExecute = true });
             }
         };
+        WireCreditLinkStatus(link, url);
         links.Controls.Add(link);
+    }
+
+    private void WireCreditLinkStatus(Control control, string statusText)
+    {
+        control.MouseEnter += (_, _) => ShowCreditLinkStatus(statusText);
+        control.MouseLeave += (_, _) => RestoreCreditLinkStatus();
+    }
+
+    private void WireCreditLinkStatusByLink(CreditLinkLabel control)
+    {
+        control.MouseMove += (_, e) =>
+        {
+            if (control.LinkAt(e.Location)?.LinkData is string target)
+            {
+                ShowCreditLinkStatus(target);
+            }
+            else
+            {
+                RestoreCreditLinkStatus();
+            }
+        };
+        control.MouseLeave += (_, _) => RestoreCreditLinkStatus();
+    }
+
+    private void ShowCreditLinkStatus(string statusText)
+    {
+        _statusTextBeforeCreditLinkHover ??= _statusLabel.Text;
+        SetStatusText(statusText);
+    }
+
+    private void RestoreCreditLinkStatus()
+    {
+        if (_statusTextBeforeCreditLinkHover is not { } previous)
+        {
+            return;
+        }
+
+        _statusTextBeforeCreditLinkHover = null;
+        SetStatusText(previous);
+    }
+
+    private sealed class CreditLinkLabel : LinkLabel
+    {
+        public Link? LinkAt(Point location) => PointInLink(location.X, location.Y);
     }
 
     private void AutoFitTreeWidth()

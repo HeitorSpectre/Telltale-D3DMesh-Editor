@@ -8,12 +8,13 @@ namespace TelltaleD3DMeshEditor.Formats.Texture;
 // and albedo export. Pixels are row-major ARGB ints.
 public sealed class TextureImage
 {
-    public TextureImage(int width, int height, int[] pixels, string sourcePath)
+    public TextureImage(int width, int height, int[] pixels, string sourcePath, int? alphaMode = null)
     {
         Width = width;
         Height = height;
         Pixels = pixels;
         SourcePath = sourcePath;
+        AlphaMode = alphaMode;
         AverageAlpha = ComputeAverageAlpha(pixels);
         NonOpaqueAlphaRatio = ComputeNonOpaqueAlphaRatio(pixels);
     }
@@ -22,6 +23,7 @@ public sealed class TextureImage
     public int Height { get; }
     public int[] Pixels { get; }
     public string SourcePath { get; }
+    public int? AlphaMode { get; }
     public float AverageAlpha { get; }
     public float NonOpaqueAlphaRatio { get; }
 

@@ -84,6 +84,8 @@ internal static class AssetGltfBuilder
         }
 
         var materialMap = new Dictionary<string, int>(StringComparer.OrdinalIgnoreCase);
+        var exportSkinning = skeleton is { Bones.Count: > 0 };
+        var usesLineOverlayMaterials = false;
         foreach (var submesh in mesh.Submeshes)
         {
             var vertexCount = submesh.Vertices.Count;
@@ -97,7 +99,7 @@ internal static class AssetGltfBuilder
             var uv3s = new List<byte>();
             var uv4s = new List<byte>();
             var colors = new List<byte>();
-            var tangents = BuildTangents(submesh);
+            var tangents = BuildTangents(submesh, out var originalTangentWs);
             var hasStoredBinormals = submesh.Vertices.Any(HasStoredBinormal);
             var hasStoredUnknown1 = submesh.Vertices.Any(vertex => Math.Abs(vertex.Unknown1) > 0.000001f);
             var joints = new List<byte>();
@@ -129,6 +131,9 @@ internal static class AssetGltfBuilder
                 if (hasStoredUnknown1)
                 {
                     GltfCommon.AddFloat(unknown1s, v.Unknown1);
+                    GltfCommon.AddFloat(unknown1s, 0f);
+                    GltfCommon.AddFloat(unknown1s, 0f);
+                    GltfCommon.AddFloat(unknown1s, 0f);
                 }
                 var overlayNormal = SafeNormalize(new Vector3(v.Nx, v.Ny, v.Nz), Vector3.Zero);
                 var lineX = v.X + overlayNormal.X * LineOverlayNormalOffset;
@@ -146,12 +151,15 @@ internal static class AssetGltfBuilder
                                    Math.Abs(vertexColor.G - 1f) > 0.001f ||
                                    Math.Abs(vertexColor.B - 1f) > 0.001f ||
                                    Math.Abs(vertexColor.A - 1f) > 0.001f;
-                GltfCommon.AddUInt16(joints, GltfCommon.RemapJoint(v.Bone0, mesh.Version, palette, boneIndexByHash));
-                GltfCommon.AddUInt16(joints, GltfCommon.RemapJoint(v.Bone1, mesh.Version, palette, boneIndexByHash));
-                GltfCommon.AddUInt16(joints, GltfCommon.RemapJoint(v.Bone2, mesh.Version, palette, boneIndexByHash));
-                GltfCommon.AddUInt16(joints, GltfCommon.RemapJoint(v.Bone3, mesh.Version, palette, boneIndexByHash));
-                GltfCommon.AddFloat(weights, v.Weight0); GltfCommon.AddFloat(weights, v.Weight1);
-                GltfCommon.AddFloat(weights, v.Weight2); GltfCommon.AddFloat(weights, v.Weight3);
+                if (exportSkinning)
+                {
+                    AddWeightedJoint(joints, v.Weight0, GltfCommon.RemapJoint(v.Bone0, mesh.Version, palette, boneIndexByHash));
+                    AddWeightedJoint(joints, v.Weight1, GltfCommon.RemapJoint(v.Bone1, mesh.Version, palette, boneIndexByHash));
+                    AddWeightedJoint(joints, v.Weight2, GltfCommon.RemapJoint(v.Bone2, mesh.Version, palette, boneIndexByHash));
+                    AddWeightedJoint(joints, v.Weight3, GltfCommon.RemapJoint(v.Bone3, mesh.Version, palette, boneIndexByHash));
+                    GltfCommon.AddFloat(weights, v.Weight0); GltfCommon.AddFloat(weights, v.Weight1);
+                    GltfCommon.AddFloat(weights, v.Weight2); GltfCommon.AddFloat(weights, v.Weight3);
+                }
                 xs.Add(v.X); ys.Add(v.Y); zs.Add(v.Z);
                 lineXs.Add(lineX); lineYs.Add(lineY); lineZs.Add(lineZ);
             }
@@ -160,11 +168,14 @@ internal static class AssetGltfBuilder
                 new[] { xs.Min(), ys.Min(), zs.Min() }, new[] { xs.Max(), ys.Max(), zs.Max() });
             var normalAccessor = GltfCommon.AddAccessor(bin, bufferViews, accessors, normals.ToArray(), 34962, 5126, vertexCount, "VEC3", null, null);
             var tangentAccessor = GltfCommon.AddAccessor(bin, bufferViews, accessors, tangents, 34962, 5126, vertexCount, "VEC4", null, null);
+            var originalTangentWAccessor = originalTangentWs is not null
+                ? GltfCommon.AddAccessor(bin, bufferViews, accessors, originalTangentWs, 34962, 5126, vertexCount, "VEC4", null, null)
+                : (int?)null;
             var binormalAccessor = hasStoredBinormals
                 ? GltfCommon.AddAccessor(bin, bufferViews, accessors, binormals.ToArray(), 34962, 5126, vertexCount, "VEC4", null, null)
                 : (int?)null;
             var unknown1Accessor = hasStoredUnknown1
-                ? GltfCommon.AddAccessor(bin, bufferViews, accessors, unknown1s.ToArray(), 34962, 5126, vertexCount, "SCALAR", null, null)
+                ? GltfCommon.AddAccessor(bin, bufferViews, accessors, unknown1s.ToArray(), 34962, 5126, vertexCount, "VEC4", null, null)
                 : (int?)null;
             var uvAccessor = GltfCommon.AddAccessor(bin, bufferViews, accessors, uvs.ToArray(), 34962, 5126, vertexCount, "VEC2", null, null);
             var uv2Accessor = GltfCommon.AddAccessor(bin, bufferViews, accessors, uv2s.ToArray(), 34962, 5126, vertexCount, "VEC2", null, null);
@@ -173,8 +184,12 @@ internal static class AssetGltfBuilder
             var colorAccessor = hasVertexColors
                 ? GltfCommon.AddAccessor(bin, bufferViews, accessors, colors.ToArray(), 34962, 5126, vertexCount, "VEC4", null, null)
                 : (int?)null;
-            var jointAccessor = GltfCommon.AddAccessor(bin, bufferViews, accessors, joints.ToArray(), 34962, 5123, vertexCount, "VEC4", null, null);
-            var weightAccessor = GltfCommon.AddAccessor(bin, bufferViews, accessors, weights.ToArray(), 34962, 5126, vertexCount, "VEC4", null, null);
+            var jointAccessor = exportSkinning
+                ? GltfCommon.AddAccessor(bin, bufferViews, accessors, joints.ToArray(), 34962, 5123, vertexCount, "VEC4", null, null)
+                : (int?)null;
+            var weightAccessor = exportSkinning
+                ? GltfCommon.AddAccessor(bin, bufferViews, accessors, weights.ToArray(), 34962, 5126, vertexCount, "VEC4", null, null)
+                : (int?)null;
             int? linePosAccessor = null;
 
             var indexBytes = new List<byte>();
@@ -274,9 +289,12 @@ internal static class AssetGltfBuilder
                 ["TEXCOORD_1"] = uv2Accessor,
                 ["TEXCOORD_2"] = uv3Accessor,
                 ["TEXCOORD_3"] = uv4Accessor,
-                ["JOINTS_0"] = jointAccessor,
-                ["WEIGHTS_0"] = weightAccessor,
             };
+            if (jointAccessor is not null && weightAccessor is not null)
+            {
+                attributes["JOINTS_0"] = jointAccessor.Value;
+                attributes["WEIGHTS_0"] = weightAccessor.Value;
+            }
             if (binormalAccessor is not null)
             {
                 attributes["_TT_BINORMAL"] = binormalAccessor.Value;
@@ -284,6 +302,10 @@ internal static class AssetGltfBuilder
             if (unknown1Accessor is not null)
             {
                 attributes["_TT_UNKNOWN1"] = unknown1Accessor.Value;
+            }
+            if (originalTangentWAccessor is not null)
+            {
+                attributes["_TT_TANGENT_W"] = originalTangentWAccessor.Value;
             }
             if (colorAccessor is not null)
             {
@@ -311,6 +333,7 @@ internal static class AssetGltfBuilder
                     materialMap[lineMaterialKey] = existingLineMaterialIndex;
                     materials.Add(BuildLineOverlayMaterial(materialName, lineOverlaySlot, lineTextureName, lineOverlayTexture.TextureIndex, lineTextureIndex, lineTexCoord, lineOverlayTexture.AlphaMode));
                 }
+                usesLineOverlayMaterials = true;
                 lineOverlayMaterialIndex = existingLineMaterialIndex;
             }
 
@@ -386,6 +409,7 @@ internal static class AssetGltfBuilder
             for (var i = 0; i < skeleton.Bones.Count; i++)
             {
                 Matrix4x4.Invert(world[i], out var inv);
+                inv = NormalizeInverseBindMatrix(inv);
                 foreach (var f in GltfCommon.MatrixColumnMajor(inv)) GltfCommon.AddFloat(ibmBytes, f);
             }
             var ibmAccessor = GltfCommon.AddAccessor(bin, bufferViews, accessors, ibmBytes.ToArray(), 0, 5126, skeleton.Bones.Count, "MAT4", null, null);
@@ -450,7 +474,11 @@ internal static class AssetGltfBuilder
         if (textures.Count > 0)
         {
             gltf["textures"] = textures;
-            gltf["samplers"] = new[] { BuildSampler() };
+            gltf["samplers"] = new[] { BuildSampler(), BuildLineOverlaySampler() };
+        }
+        if (usesLineOverlayMaterials)
+        {
+            gltf["extensionsUsed"] = new[] { "KHR_materials_unlit" };
         }
         if (skin is not null) gltf["skins"] = new[] { skin };
 
@@ -531,6 +559,17 @@ internal static class AssetGltfBuilder
         return sampler;
     }
 
+    private static Dictionary<string, object> BuildLineOverlaySampler()
+        => new()
+        {
+            // Avoid mipmap averaging on thin ink/detail alpha masks; otherwise lines fade out
+            // aggressively in external glTF viewers when the camera moves away.
+            ["magFilter"] = 9729,
+            ["minFilter"] = 9729,
+            ["wrapS"] = 10497,
+            ["wrapT"] = 10497,
+        };
+
     private static (float R, float G, float B, float A) NormalizeVertexColor(VertexData vertex)
     {
         var r = vertex.ColorR;
@@ -560,6 +599,22 @@ internal static class AssetGltfBuilder
                Math.Abs(vertex.TangentY) > 0.000001f ||
                Math.Abs(vertex.TangentZ) > 0.000001f ||
                Math.Abs(vertex.TangentW) > 0.000001f;
+    }
+
+    private static void AddWeightedJoint(List<byte> joints, float weight, int joint)
+    {
+        // glTF validators require joints with zero weight to be zero as well. Telltale sometimes
+        // leaves placeholder joint indices in unused influence slots; reimport ignores them.
+        GltfCommon.AddUInt16(joints, weight > 0.000001f ? (ushort)joint : (ushort)0);
+    }
+
+    private static Matrix4x4 NormalizeInverseBindMatrix(Matrix4x4 matrix)
+    {
+        matrix.M14 = 0f;
+        matrix.M24 = 0f;
+        matrix.M34 = 0f;
+        matrix.M44 = 1f;
+        return matrix;
     }
 
     private static string BuildMaterialKey(SubmeshData submesh, string materialName)
@@ -614,19 +669,35 @@ internal static class AssetGltfBuilder
         return stem;
     }
 
-    private static byte[] BuildTangents(SubmeshData submesh)
+    private static byte[] BuildTangents(SubmeshData submesh, out byte[]? originalTangentWs)
     {
+        originalTangentWs = null;
         if (submesh.Vertices.Any(HasStoredTangent))
         {
             var stored = new List<byte>(submesh.Vertices.Count * 16);
+            var originalW = new List<byte>();
+            var hasNonGltfW = false;
             foreach (var vertex in submesh.Vertices)
             {
                 GltfCommon.AddFloat(stored, vertex.TangentX);
                 GltfCommon.AddFloat(stored, vertex.TangentY);
                 GltfCommon.AddFloat(stored, vertex.TangentZ);
-                GltfCommon.AddFloat(stored, vertex.TangentW);
+                GltfCommon.AddFloat(stored, ToGltfTangentSign(vertex.TangentW));
+
+                if (!IsGltfTangentSign(vertex.TangentW))
+                {
+                    hasNonGltfW = true;
+                }
+
+                // Keep this VEC4, not SCALAR. Blender's importer can misalign custom attributes
+                // of different widths on a multi-primitive mesh; all _TT_* attributes stay VEC4.
+                GltfCommon.AddFloat(originalW, vertex.TangentW);
+                GltfCommon.AddFloat(originalW, 0f);
+                GltfCommon.AddFloat(originalW, 0f);
+                GltfCommon.AddFloat(originalW, 0f);
             }
 
+            originalTangentWs = hasNonGltfW ? originalW.ToArray() : null;
             return stored.ToArray();
         }
 
@@ -689,6 +760,12 @@ internal static class AssetGltfBuilder
 
         return bytes.ToArray();
     }
+
+    private static bool IsGltfTangentSign(float value)
+        => Math.Abs(value - 1f) <= 0.000001f || Math.Abs(value + 1f) <= 0.000001f;
+
+    private static float ToGltfTangentSign(float value)
+        => value < 0f ? -1f : 1f;
 
     private static Vector3 SafeNormalize(Vector3 value, Vector3 fallback)
     {
@@ -837,6 +914,10 @@ internal static class AssetGltfBuilder
             },
             ["alphaMode"] = "BLEND",
             ["doubleSided"] = true,
+            ["extensions"] = new Dictionary<string, object>
+            {
+                ["KHR_materials_unlit"] = new Dictionary<string, object>(),
+            },
             ["extras"] = new Dictionary<string, object>
             {
                 ["telltaleLineOverlay"] = new Dictionary<string, object>
@@ -882,7 +963,7 @@ internal static class AssetGltfBuilder
         imageIndexByName[overlayName] = imageIndex;
 
         var textureIndex = textures.Count;
-        textures.Add(new Dictionary<string, object> { ["source"] = imageIndex, ["sampler"] = 0 });
+        textures.Add(new Dictionary<string, object> { ["source"] = imageIndex, ["sampler"] = 1 });
         textureIndexByName[overlayName] = textureIndex;
         lineOverlayAlphaModeByName[overlayName] = alphaMode;
         return (textureIndex, alphaMode);

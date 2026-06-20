@@ -12,7 +12,7 @@ public sealed record UpdateInfo(string Version, string Title, string Changelog, 
 public static class UpdateChecker
 {
     // Bump this on every release so the checker can tell when a newer one is published.
-    public const string CurrentVersion = "2.0";
+    public const string CurrentVersion = "1.10";
 
     private const string LatestReleaseApi =
         "https://api.github.com/repos/HeitorSpectre/Telltale-D3DMesh-Editor/releases/latest";
@@ -25,7 +25,7 @@ public static class UpdateChecker
     public static async Task<UpdateInfo?> CheckForUpdateAsync(CancellationToken cancellationToken = default)
     {
         var latest = await FetchLatestReleaseAsync(cancellationToken);
-        return latest is not null && IsNewer(latest.Version, CurrentVersion) ? latest : null;
+        return latest is not null && IsNewerVersion(latest.Version, CurrentVersion) ? latest : null;
     }
 
     // Fetches the latest published release as-is, WITHOUT comparing versions. Used by the debug-only
@@ -98,7 +98,7 @@ public static class UpdateChecker
 
     // True when the release tag parses to a higher version than the running one. Tolerates a leading
     // "v" and single-number tags (e.g. "2" -> "2.0").
-    private static bool IsNewer(string latestTag, string current) =>
+    public static bool IsNewerVersion(string latestTag, string current) =>
         System.Version.TryParse(Normalize(latestTag), out var latest) &&
         System.Version.TryParse(Normalize(current), out var running) &&
         latest > running;

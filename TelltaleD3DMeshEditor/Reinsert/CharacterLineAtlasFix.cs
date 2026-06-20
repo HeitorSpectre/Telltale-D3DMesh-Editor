@@ -215,6 +215,7 @@ public static class CharacterLineAtlasFix
             SourceMeshPath = primitive.SourceMeshPath,
             SourceSubmeshIndex = primitive.SourceSubmeshIndex,
             RecoveredDetailLineTextureName = primitive.RecoveredDetailLineTextureName,
+            RecoveredDetailLineImage = primitive.RecoveredDetailLineImage,
             IsSkinned = primitive.IsSkinned,
             BaseColor = baseColor,
             TextureSlots = textureSlots,

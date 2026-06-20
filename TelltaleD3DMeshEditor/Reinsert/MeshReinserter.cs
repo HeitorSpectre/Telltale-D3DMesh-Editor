@@ -60,7 +60,7 @@ public static class MeshReinserter
             throw new InvalidOperationException("Template has no submesh table to use as a base.");
         }
 
-        var preparedPrimitives = PreparePrimitives(layout, model, textureSlotsByPrimitive, referenceSkeleton);
+        var preparedPrimitives = PreparePrimitives(layout, model, textureSlotsByPrimitive, referenceSkeleton, gameConfig);
         var preparedTextureSlotsByPrimitive = textureSlotsByPrimitive is null
             ? null
             : preparedPrimitives
@@ -78,14 +78,26 @@ public static class MeshReinserter
             var vertexStart = verts.Count;
             var faceStart = faceIndices.Count;
 
+            // When the GLB carries no per-vertex colors (the exporter drops an all-neutral COLOR_0),
+            // restore the template submesh's original colors for games that store baked data there
+            // (TFTB E3 env props). Only valid when the vertex count is unchanged, so the per-index
+            // mapping holds; full swaps with a different count keep the neutral-white fallback.
+            var templateSubmeshIndex = ResolveTemplateSubmeshIndex(layout, prim, k);
+            var preserveTemplateVertexData = gameConfig?.PreserveTemplateVertexDataOnReimport == true;
+            var copyTemplateColors = preserveTemplateVertexData &&
+                !HasVertexChannel(prim.Color0, prim.VertexCount) &&
+                TemplateSubmeshVertexCount(layout, templateSubmeshIndex) == prim.VertexCount;
+
             var normals = HasVertexChannel(prim.Normals, prim.VertexCount) ? prim.Normals! : ComputeNormals(prim);
+            // Keep the GLB's stored tangent.w (including 0) on games whose meshes ship a zero handedness
+            // (TFTB E3); other games force a unit sign so a degenerate w never zeroes the bitangent.
             var (tanX, tanY, tanZ, tanW) = HasVertexChannel(prim.Tangents, prim.VertexCount)
-                ? UseTangents(prim.Tangents!)
+                ? UseTangents(prim.Tangents!, preserveStoredW: preserveTemplateVertexData)
                 : ComputeTangents(prim, normals);
             var binormals = HasVertexChannel(prim.Binormals, prim.VertexCount)
                 ? prim.Binormals!
                 : ComputeBinormals(normals, tanX, tanY, tanZ, tanW);
-            var skinning = BuildSkinningMap(layout, model, prim, k, referenceSkeleton, prepared.BonePaletteIndex);
+            var skinning = BuildSkinningMap(layout, model, prim, k, referenceSkeleton, prepared.BonePaletteIndex, gameConfig);
 
             for (var i = 0; i < prim.VertexCount; i++)
             {
@@ -95,7 +107,11 @@ public static class MeshReinserter
                 var uv1 = HasVertexChannel(prim.Uv1, prim.VertexCount) ? prim.Uv1![i] : uv0;
                 var uv2 = HasVertexChannel(prim.Uv2, prim.VertexCount) ? prim.Uv2![i] : uv1;
                 var uv3 = HasVertexChannel(prim.Uv3, prim.VertexCount) ? prim.Uv3![i] : uv2;
-                var col = HasVertexChannel(prim.Color0, prim.VertexCount) ? prim.Color0![i] : new Vector4(1, 1, 1, 1);
+                var col = HasVertexChannel(prim.Color0, prim.VertexCount)
+                    ? prim.Color0![i]
+                    : copyTemplateColors && TryReadTemplateVertexColor(layout, templateSubmeshIndex, i) is { } templateColor
+                        ? templateColor
+                        : new Vector4(1, 1, 1, 1);
                 var unknown1 = HasVertexChannel(prim.Unknown1, prim.VertexCount) ? prim.Unknown1![i] : 0f;
                 var binormal = binormals[i];
                 var skin = ReadSkinning(prim, i, skinning);
@@ -240,7 +256,8 @@ public static class MeshReinserter
         D3DMeshLayout layout,
         GltfModel model,
         IReadOnlyList<IReadOnlyDictionary<string, string>>? textureSlotsByPrimitive,
-        SkeletonData? referenceSkeleton)
+        SkeletonData? referenceSkeleton,
+        GameConfig? gameConfig)
     {
         var result = new List<PreparedPrimitive>();
         int? staticImportPaletteIndex = null;
@@ -251,7 +268,13 @@ public static class MeshReinserter
                 ? textureSlotsByPrimitive[primitiveIndex]
                 : null;
 
-            if (!HasUsableSkin(primitive) || layout.BonePalettes.Count == 0)
+            // A static prop can still carry a (trivial) bone palette; the GLB exporter then writes
+            // JOINTS_0/WEIGHTS_0 that all point at palette bone 0. Without any skeleton to resolve
+            // those joint indices to Telltale hashes (no reference .skl, no GLB skeleton/joints), the
+            // skinning analysis used to throw and the whole reinsert failed. Treat these as static and
+            // bind them to the existing palette instead. Real skinned reinserts always provide a
+            // skeleton, so their path is unchanged.
+            if (!HasUsableSkin(primitive) || layout.BonePalettes.Count == 0 || !HasResolvableSkeleton(model, referenceSkeleton))
             {
                 var paletteIndex = layout.BonePalettes.Count > 0
                     ? (staticImportPaletteIndex ??= ResolveStaticImportPaletteIndex(layout, referenceSkeleton))
@@ -260,7 +283,7 @@ public static class MeshReinserter
                 continue;
             }
 
-            var usage = AnalyzeJointUsage(primitive, model, referenceSkeleton);
+            var usage = AnalyzeJointUsage(primitive, model, referenceSkeleton, gameConfig);
             if (usage.UnresolvedJoints.Count > 0)
             {
                 throw new InvalidOperationException(
@@ -319,10 +342,19 @@ public static class MeshReinserter
            joints.Length >= primitive.VertexCount * 4 &&
            weights.Length == primitive.VertexCount;
 
+    // True only when there is some skeleton to resolve GLB joint indices to Telltale bone hashes:
+    // an explicit reference .skl, a skeleton embedded in the GLB, or named joints. Without any of
+    // these the joints cannot be skinned and the geometry must be bound statically.
+    private static bool HasResolvableSkeleton(GltfModel model, SkeletonData? referenceSkeleton)
+        => referenceSkeleton is { Bones.Count: > 0 } ||
+           model.Skeleton is { Bones.Count: > 0 } ||
+           model.Joints.Count > 0;
+
     private static PrimitiveJointUsage AnalyzeJointUsage(
         GltfPrimitive primitive,
         GltfModel model,
-        SkeletonData? referenceSkeleton)
+        SkeletonData? referenceSkeleton,
+        GameConfig? gameConfig)
     {
         var vertexHashes = new HashSet<ulong>[primitive.VertexCount];
         var allHashes = new HashSet<ulong>();
@@ -355,7 +387,7 @@ public static class MeshReinserter
                 }
 
                 var gltfJoint = primitive.Joints0[jointOffset + influence];
-                if (TryResolveJointHash(gltfJoint, model, referenceSkeleton, out var hash) && hash != 0)
+                if (TryResolveJointHash(gltfJoint, model, referenceSkeleton, gameConfig, out var hash) && hash != 0)
                 {
                     hashes.Add(hash);
                     allHashes.Add(hash);
@@ -455,6 +487,25 @@ public static class MeshReinserter
             if (layout.BonePalettes[i].Length == palette.Length &&
                 paletteSet.SetEquals(layout.BonePalettes[i]))
             {
+                return i;
+            }
+        }
+
+        // A combined import that pulls bones from many source parts (Combine Parts reimport) would
+        // otherwise create one custom palette per primitive. The game's runtime supports only a few bone
+        // palettes per mesh — the original Tales from the Borderlands characters never use more than three,
+        // and a 7-palette result crashed it on load. So pack the new bones into an existing custom palette
+        // whenever their union still fits the per-palette bone cap, instead of always appending a new one.
+        // Skinning stays correct because each primitive's bone indices are resolved by hash against the
+        // final palette (computed after all palettes are settled), and the original template palettes are
+        // left untouched so meshes that already cover their bones are byte-unaffected.
+        for (var i = layout.OriginalBonePaletteCount; i < layout.BonePalettes.Count; i++)
+        {
+            var union = new HashSet<ulong>(layout.BonePalettes[i]);
+            union.UnionWith(paletteSet);
+            if (union.Count <= maxPaletteBones)
+            {
+                layout.BonePalettes[i] = union.OrderBy(static hash => hash).ToArray();
                 return i;
             }
         }
@@ -665,7 +716,8 @@ public static class MeshReinserter
         GltfPrimitive prim,
         int primitiveIndex,
         SkeletonData? referenceSkeleton,
-        int? preparedPaletteIndex)
+        int? preparedPaletteIndex,
+        GameConfig? gameConfig)
     {
         if (prim.Joints0 is null ||
             prim.Weights0 is null ||
@@ -691,7 +743,7 @@ public static class MeshReinserter
         var mapped = new Dictionary<int, int>();
         foreach (var gltfJoint in EnumerateWeightedJoints(prim).Distinct())
         {
-            var localPaletteIndex = ResolvePaletteLocalIndex(gltfJoint, model, referenceSkeleton, palette);
+            var localPaletteIndex = ResolvePaletteLocalIndex(gltfJoint, model, referenceSkeleton, gameConfig, palette);
             mapped[gltfJoint] = localPaletteIndex >= 0 ? localPaletteIndex * rawMultiplier : -1;
         }
 
@@ -711,6 +763,60 @@ public static class MeshReinserter
         }
 
         return Math.Min(primitiveIndex, layout.Submeshes.Count - 1);
+    }
+
+    // Vertex count of a template submesh (raw inclusive [VMin, VMax] range), or -1 if out of range.
+    private static int TemplateSubmeshVertexCount(D3DMeshLayout layout, int templateSubmeshIndex)
+    {
+        if (templateSubmeshIndex < 0 || templateSubmeshIndex >= layout.Submeshes.Count)
+        {
+            return -1;
+        }
+
+        var sub = layout.Submeshes[templateSubmeshIndex];
+        return sub.VertexMax - sub.VertexMin + 1;
+    }
+
+    // Reads the original per-vertex color of a template submesh's local vertex straight from the
+    // template's interleaved vertex buffer, so a count-preserving reimport can restore baked vertex
+    // colors the GLB no longer carries. Mirrors D3DMeshParser.ReadColor for formats 1 (4 floats) and
+    // 3 (4 bytes). Returns null when the template has no color attribute or the index is out of range.
+    private static Vector4? TryReadTemplateVertexColor(D3DMeshLayout layout, int templateSubmeshIndex, int localVertexIndex)
+    {
+        if (layout.VertexBuffers.Count == 0 ||
+            templateSubmeshIndex < 0 ||
+            templateSubmeshIndex >= layout.Submeshes.Count)
+        {
+            return null;
+        }
+
+        var buffer = layout.VertexBuffers[0];
+        var color = buffer.Attributes.Colors;
+        if (color.Format is not (1 or 3))
+        {
+            return null;
+        }
+
+        var bufferIndex = layout.Submeshes[templateSubmeshIndex].VertexMin + localVertexIndex;
+        if (bufferIndex < 0 || bufferIndex >= buffer.VertexCount)
+        {
+            return null;
+        }
+
+        var offset = buffer.DataOffset + bufferIndex * buffer.VertexStride + (int)color.Offset;
+        var span = layout.Original.AsSpan();
+        if (offset < 0 || offset + (color.Format == 1 ? 16 : 4) > span.Length)
+        {
+            return null;
+        }
+
+        return color.Format == 1
+            ? new Vector4(
+                BinaryPrimitives.ReadSingleLittleEndian(span[offset..]),
+                BinaryPrimitives.ReadSingleLittleEndian(span[(offset + 4)..]),
+                BinaryPrimitives.ReadSingleLittleEndian(span[(offset + 8)..]),
+                BinaryPrimitives.ReadSingleLittleEndian(span[(offset + 12)..]))
+            : new Vector4(span[offset] / 255f, span[offset + 1] / 255f, span[offset + 2] / 255f, span[offset + 3] / 255f);
     }
 
     private static int ResolvePrimitivePaletteIndex(D3DMeshLayout layout, GltfPrimitive prim, int primitiveIndex, int? preparedPaletteIndex)
@@ -737,9 +843,10 @@ public static class MeshReinserter
         int gltfJoint,
         GltfModel model,
         SkeletonData? referenceSkeleton,
+        GameConfig? gameConfig,
         IReadOnlyList<ulong> palette)
     {
-        if (TryResolveJointHash(gltfJoint, model, referenceSkeleton, out var hash))
+        if (TryResolveJointHash(gltfJoint, model, referenceSkeleton, gameConfig, out var hash))
         {
             for (var i = 0; i < palette.Count; i++)
             {
@@ -757,8 +864,21 @@ public static class MeshReinserter
         int gltfJoint,
         GltfModel model,
         SkeletonData? referenceSkeleton,
+        GameConfig? gameConfig,
         out ulong hash)
     {
+        if (gameConfig?.IsOriginalTalesFromTheBorderlandsPc == true &&
+            referenceSkeleton is not null)
+        {
+            if (TryResolveTftbJointHash(gltfJoint, model, referenceSkeleton, gameConfig, out hash))
+            {
+                return true;
+            }
+
+            hash = 0;
+            return false;
+        }
+
         if (gltfJoint >= 0 && gltfJoint < model.Joints.Count)
         {
             var joint = model.Joints[gltfJoint];
@@ -787,6 +907,118 @@ public static class MeshReinserter
         {
             hash = referenceSkeleton.Bones[gltfJoint].Hash;
             return true;
+        }
+
+        hash = 0;
+        return false;
+    }
+
+    private static bool TryResolveTftbJointHash(
+        int gltfJoint,
+        GltfModel model,
+        SkeletonData referenceSkeleton,
+        GameConfig? gameConfig,
+        out ulong hash)
+    {
+        if (TryResolveTftbJointHashDirect(gltfJoint, model, referenceSkeleton, gameConfig, out hash))
+        {
+            return true;
+        }
+
+        if (model.Skeleton is null ||
+            gltfJoint < 0 ||
+            gltfJoint >= model.Skeleton.Bones.Count)
+        {
+            return false;
+        }
+
+        var visited = new HashSet<int>();
+        var parent = model.Skeleton.Bones[gltfJoint].ParentIndex;
+        while (parent >= 0 && parent < model.Skeleton.Bones.Count && visited.Add(parent))
+        {
+            if (TryResolveTftbJointHashDirect(parent, model, referenceSkeleton, gameConfig, out hash))
+            {
+                return true;
+            }
+
+            parent = model.Skeleton.Bones[parent].ParentIndex;
+        }
+
+        return false;
+    }
+
+    private static bool TryResolveTftbJointHashDirect(
+        int gltfJoint,
+        GltfModel model,
+        SkeletonData referenceSkeleton,
+        GameConfig? gameConfig,
+        out ulong hash)
+    {
+        if (gltfJoint >= 0 && gltfJoint < model.Joints.Count)
+        {
+            var joint = model.Joints[gltfJoint];
+            if (joint.Hash is { } explicitHash &&
+                referenceSkeleton.Bones.Any(bone => bone.Hash == explicitHash))
+            {
+                hash = explicitHash;
+                return true;
+            }
+
+            if (TryResolveReferenceHashByName(joint.Name, referenceSkeleton, gameConfig, out hash))
+            {
+                return true;
+            }
+        }
+
+        if (model.Skeleton is not null &&
+            gltfJoint >= 0 &&
+            gltfJoint < model.Skeleton.Bones.Count)
+        {
+            var bone = model.Skeleton.Bones[gltfJoint];
+            if (referenceSkeleton.Bones.Any(reference => reference.Hash == bone.Hash))
+            {
+                hash = bone.Hash;
+                return true;
+            }
+
+            if (TryResolveReferenceHashByName(bone.Name, referenceSkeleton, gameConfig, out hash))
+            {
+                return true;
+            }
+        }
+
+        hash = 0;
+        return false;
+    }
+
+    private static bool TryResolveReferenceHashByName(
+        string? name,
+        SkeletonData referenceSkeleton,
+        GameConfig? gameConfig,
+        out ulong hash)
+    {
+        if (!string.IsNullOrWhiteSpace(name))
+        {
+            var exact = referenceSkeleton.Bones.FirstOrDefault(bone =>
+                string.Equals(bone.Name, name, StringComparison.OrdinalIgnoreCase));
+            if (exact is not null)
+            {
+                hash = exact.Hash;
+                return true;
+            }
+
+            if (gameConfig?.DisableCharacterSpecificFacialRetargetOnReimport != true &&
+                BoneNameAliases.TryGetCharacterSpecificAlias(name, out var alias))
+            {
+                var aliased = referenceSkeleton.Bones.FirstOrDefault(bone =>
+                    BoneNameAliases.TryGetCharacterSpecificAlias(bone.Name, out var referenceAlias) &&
+                    string.Equals(referenceAlias, alias, StringComparison.OrdinalIgnoreCase));
+                if (aliased is not null)
+                {
+                    hash = aliased.Hash;
+                    return true;
+                }
+            }
         }
 
         hash = 0;
@@ -1204,7 +1436,15 @@ public static class MeshReinserter
         }
 
         var result = ms.ToArray();
-        BinaryPrimitives.WriteUInt32LittleEndian(result.AsSpan(0, 4), (uint)result.Length);
+        // The texture-group block's leading u32 is NOT the raw block length. In TFTB E3 (v14) the
+        // original stores (blockLength + 4); writing the raw length corrupts the value the game reads
+        // to locate the following blocks (uvScales/faces/vertices) and crashes on load. Preserve the
+        // original leading value, shifted only by the change in block length, so the per-game
+        // convention is kept whether or not the block size actually changed.
+        var originalTextureLeading = BinaryPrimitives.ReadUInt32LittleEndian(
+            layout.Original.AsSpan(layout.TextureGroupBlockOffset, 4));
+        var textureLeading = unchecked((uint)(originalTextureLeading + (result.Length - layout.TextureGroupBlockLength)));
+        BinaryPrimitives.WriteUInt32LittleEndian(result.AsSpan(0, 4), textureLeading);
         return result;
     }
 
@@ -1540,24 +1780,38 @@ public static class MeshReinserter
 
     private static byte[] BuildUvScaleBytes(D3DMeshLayout layout, UvMults m)
     {
-        var b = new byte[layout.UvScalesLength];
-        var values = layout.UvScalesLength >= 40
-            ? BuildV18UvScaleValues(layout, m)
-            : [m.Uv1X, m.Uv1Y, m.Uv4X, m.Uv4Y, m.Uv2X, m.Uv2Y, m.Uv3X, m.Uv3Y];
-        for (var i = 0; i < values.Length; i++)
+        var b = layout.Original.AsSpan(layout.UvScalesOffset, layout.UvScalesLength).ToArray();
+        if (layout.Version is 17 or 18)
         {
-            BinaryPrimitives.WriteSingleLittleEndian(b.AsSpan(i * 4), values[i]);
+            WriteUvScaleValue(b, 0, m.Uv1X);
+            WriteUvScaleValue(b, 4, m.Uv1Y);
+            WriteUvScaleValue(b, 16, m.Uv2X);
+            WriteUvScaleValue(b, 20, m.Uv2Y);
+            WriteUvScaleValue(b, 24, m.Uv3X);
+            WriteUvScaleValue(b, 28, m.Uv3Y);
+            WriteUvScaleValue(b, 32, m.Uv4X);
+            WriteUvScaleValue(b, 36, m.Uv4Y);
+            return b;
         }
 
+        var baseOffset = V13UvScaleBaseOffset(layout);
+        WriteUvScaleValue(b, baseOffset, m.Uv1X);
+        WriteUvScaleValue(b, baseOffset + 4, m.Uv1Y);
+        WriteUvScaleValue(b, baseOffset + 8, m.Uv4X);
+        WriteUvScaleValue(b, baseOffset + 12, m.Uv4Y);
+        WriteUvScaleValue(b, baseOffset + 16, m.Uv2X);
+        WriteUvScaleValue(b, baseOffset + 20, m.Uv2Y);
+        WriteUvScaleValue(b, baseOffset + 24, m.Uv3X);
+        WriteUvScaleValue(b, baseOffset + 28, m.Uv3Y);
         return b;
     }
 
-    private static float[] BuildV18UvScaleValues(D3DMeshLayout layout, UvMults m)
+    private static void WriteUvScaleValue(byte[] bytes, int offset, float value)
     {
-        var span = layout.Original.AsSpan(layout.UvScalesOffset, layout.UvScalesLength);
-        var extraX = BinaryPrimitives.ReadSingleLittleEndian(span[8..]);
-        var extraY = BinaryPrimitives.ReadSingleLittleEndian(span[12..]);
-        return [m.Uv1X, m.Uv1Y, extraX, extraY, m.Uv2X, m.Uv2Y, m.Uv3X, m.Uv3Y, m.Uv4X, m.Uv4Y];
+        if (offset >= 0 && offset + 4 <= bytes.Length)
+        {
+            BinaryPrimitives.WriteSingleLittleEndian(bytes.AsSpan(offset), value);
+        }
     }
 
     private static UvMults ChooseUvMults(D3DMeshLayout layout, List<EncVertex> verts)
@@ -1571,11 +1825,12 @@ public static class MeshReinserter
     private static UvMults ReadOriginalUvMults(D3DMeshLayout layout)
     {
         var span = layout.Original.AsSpan(layout.UvScalesOffset, layout.UvScalesLength);
-        var uv1X = BinaryPrimitives.ReadSingleLittleEndian(span[0..]);
-        var uv1Y = BinaryPrimitives.ReadSingleLittleEndian(span[4..]);
-        const int uv2Offset = 16;
-        const int uv3Offset = 24;
-        var uv4Offset = layout.UvScalesLength >= 40 ? 32 : 8;
+        var baseOffset = layout.Version is 17 or 18 ? 0 : V13UvScaleBaseOffset(layout);
+        var uv1X = BinaryPrimitives.ReadSingleLittleEndian(span[baseOffset..]);
+        var uv1Y = BinaryPrimitives.ReadSingleLittleEndian(span[(baseOffset + 4)..]);
+        var uv2Offset = baseOffset + 16;
+        var uv3Offset = baseOffset + 24;
+        var uv4Offset = layout.Version is 17 or 18 ? 32 : baseOffset + 8;
         var uv2X = BinaryPrimitives.ReadSingleLittleEndian(span[uv2Offset..]);
         var uv2Y = BinaryPrimitives.ReadSingleLittleEndian(span[(uv2Offset + 4)..]);
         var uv3X = BinaryPrimitives.ReadSingleLittleEndian(span[uv3Offset..]);
@@ -1583,6 +1838,12 @@ public static class MeshReinserter
         var uv4X = BinaryPrimitives.ReadSingleLittleEndian(span[uv4Offset..]);
         var uv4Y = BinaryPrimitives.ReadSingleLittleEndian(span[(uv4Offset + 4)..]);
         return new UvMults(uv1X, uv1Y, uv2X, uv2Y, uv3X, uv3Y, uv4X, uv4Y);
+    }
+
+    private static int V13UvScaleBaseOffset(D3DMeshLayout layout)
+    {
+        var floatCount = Math.Max(8, layout.UvScalesLength / 4);
+        return Math.Max(0, floatCount - 8) * 4;
     }
 
     private static bool CanEncodeUvs(D3DMeshLayout layout, UvMults mults, IReadOnlyList<EncVertex> verts)
@@ -1681,7 +1942,7 @@ public static class MeshReinserter
     }
 
     // Per-vertex tangents using Lengyel's method (UV0 gradient). w = handedness (+1/-1).
-    private static (float[] X, float[] Y, float[] Z, float[] W) UseTangents(IReadOnlyList<Vector4> tangents)
+    private static (float[] X, float[] Y, float[] Z, float[] W) UseTangents(IReadOnlyList<Vector4> tangents, bool preserveStoredW = false)
     {
         var x = new float[tangents.Count];
         var y = new float[tangents.Count];
@@ -1693,7 +1954,9 @@ public static class MeshReinserter
             x[i] = t.X;
             y[i] = t.Y;
             z[i] = t.Z;
-            w[i] = Math.Abs(t.W) > 0.000001f ? t.W : 1f;
+            // preserveStoredW keeps the original handedness byte-for-byte (TFTB E3 ships tangent.w = 0);
+            // otherwise a degenerate zero is promoted to +1 so the derived bitangent is never zeroed.
+            w[i] = preserveStoredW || Math.Abs(t.W) > 0.000001f ? t.W : 1f;
         }
 
         return (x, y, z, w);

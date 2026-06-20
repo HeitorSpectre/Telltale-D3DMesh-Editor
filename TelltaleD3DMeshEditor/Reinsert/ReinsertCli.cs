@@ -86,7 +86,11 @@ public static class ReinsertCli
                 return;
             case "--reinsert-prop":
                 Require(args, 4);
-                ReinsertProp(args[1], args[2], args[3], HasFlag(args, "--diffuse-atlas"));
+                ReinsertProp(args[1], args[2], args[3], HasFlag(args, "--diffuse-atlas"), HasFlag(args, "--match-original-size"));
+                return;
+            case "--bttf-texture-tests":
+                Require(args, 4);
+                ReinsertBttfTextureTests(args[1], args[2], args[3], HasFlag(args, "--match-original-size"));
                 return;
             case "--reinsert-character":
                 Require(args, 5);
@@ -139,7 +143,7 @@ public static class ReinsertCli
     {
         var data = File.ReadAllBytes(input);
         var layout = D3DMeshLayout.Build(data);
-        var mesh = D3DMeshParser.Parse(data);
+        var mesh = D3DMeshParser.ParseFile(input);
 
         Console.WriteLine($"file        : {Path.GetFileName(input)} ({data.Length} bytes)");
         Console.WriteLine($"name        : {layout.Name}");
@@ -152,6 +156,12 @@ public static class ReinsertCli
             Console.WriteLine($"vertex data : #{vertexBuffer.Index} 0x{vertexBuffer.DataOffset:X} stride {vertexBuffer.VertexStride} len {vertexBuffer.DataLength}");
         }
         Console.WriteLine($"tail        : 0x{layout.TailOffset:X} len {layout.TailLength}");
+        Console.WriteLine($"submeshBlkSz: field@0x{layout.SubmeshBlockSizeFieldOffset:X} value {layout.SubmeshBlockSize}");
+        Console.WriteLine($"submeshTable: 0x{layout.SubmeshTableOffset:X} len {layout.SubmeshTableLength}");
+        Console.WriteLine($"paletteBlock: 0x{layout.BonePaletteBlockOffset:X} len {layout.BonePaletteBlockLength} entrySize {layout.BonePaletteEntrySize} count {layout.OriginalBonePaletteCount}");
+        Console.WriteLine($"texGroupBlk : 0x{layout.TextureGroupBlockOffset:X} len {layout.TextureGroupBlockLength}");
+        Console.WriteLine($"uvScales    : 0x{layout.UvScalesOffset:X} len {layout.UvScalesLength}");
+        Console.WriteLine($"faceData    : countField@0x{layout.FaceCountFieldOffset:X} data@0x{layout.FaceDataOffset:X} len {layout.FaceDataLength}");
         Console.WriteLine($"parsed      : {mesh.Submeshes.Count} submeshes, {mesh.VertexCount} verts, {mesh.FaceCount} tris");
         PrintBounds("bounds      ", mesh.GetBounds());
         foreach (var vertexBuffer in layout.VertexBuffers)
@@ -200,7 +210,7 @@ public static class ReinsertCli
 
     private static void DumpMaterials(string input)
     {
-        var mesh = D3DMeshParser.Parse(File.ReadAllBytes(input));
+        var mesh = D3DMeshParser.ParseFile(input);
         Console.WriteLine($"file       : {Path.GetFileName(input)}");
         Console.WriteLine($"submeshes  : {mesh.Submeshes.Count}");
         Console.WriteLine($"vertices   : {mesh.VertexCount}");
@@ -602,16 +612,32 @@ public static class ReinsertCli
         }
 
         var sameStem = Path.ChangeExtension(meshPath, ".skl");
-        return File.Exists(sameStem) ? sameStem : null;
+        if (File.Exists(sameStem))
+        {
+            return sameStem;
+        }
+
+        // Match the viewer's discovery: a part mesh (sk54_lee_body) shares one character skeleton
+        // (sk54_lee.skl), found by stem prefix across the folder.
+        var folder = Path.GetDirectoryName(meshPath);
+        return folder is not null
+            ? Formats.Skeleton.SkeletonResolver.FindForMesh(folder, meshPath)
+            : null;
     }
 
-    private static void ReinsertProp(string template, string glb, string output, bool useDiffuseAtlas)
+    private static void ReinsertProp(string template, string glb, string output, bool useDiffuseAtlas, bool matchOriginalSize = false)
     {
         Directory.CreateDirectory(Path.GetDirectoryName(Path.GetFullPath(output)) ?? ".");
 
-        var layout = D3DMeshLayout.Build(File.ReadAllBytes(template));
-        var gameConfig = InferGameConfig(template);
+        var templateBytes = File.ReadAllBytes(template);
+        var gameConfig = ApplySavedReimportSettings(InferGameConfig(template));
         var model = GltfModelPreprocessor.ApplyGameReinsertRules(GltfReader.Load(glb), gameConfig);
+        if (matchOriginalSize)
+        {
+            var templateBounds = D3DMeshParser.Parse(templateBytes).GetBounds();
+            GltfModelScaler.MatchBounds(model, templateBounds);
+            Console.WriteLine($"match-size  : scaled import to template size ({templateBounds.MaxX - templateBounds.MinX:0.###} x {templateBounds.MaxY - templateBounds.MinY:0.###} x {templateBounds.MaxZ - templateBounds.MinZ:0.###})");
+        }
         if (useDiffuseAtlas)
         {
             model = StrippedLineTextureRecovery.RestoreStrippedTextures(model, template);
@@ -623,8 +649,18 @@ public static class ReinsertCli
         }
         var atlas = ApplyDiffuseAtlasIfRequested(model, useDiffuseAtlas, template, gameConfig);
         model = atlas.Model;
+
+        if (BttfMeshSupport.IsBackToTheFutureMesh(templateBytes))
+        {
+            ReinsertBttfProp(templateBytes, template, glb, output, gameConfig, model, atlas);
+            return;
+        }
+
         var textureOptions = BuildReinsertTextureOptions(useDiffuseAtlas);
         var textures = ReinsertTextureService.WriteAllReferencedTextures(model, template, output, gameConfig, textureOptions);
+
+
+        var layout = D3DMeshLayout.Build(templateBytes);
         var result = MeshReinserter.ReinsertGeometry(layout, model, textures, gameConfig: gameConfig);
         File.WriteAllBytes(output, result);
 
@@ -649,13 +685,149 @@ public static class ReinsertCli
             : "layout      : warning, does not close at EOF");
     }
 
+    private static void ReinsertBttfProp(
+        byte[] templateBytes,
+        string template,
+        string glb,
+        string output,
+        GameConfig gameConfig,
+        GltfModel model,
+        GltfDiffuseAtlasResult atlas)
+    {
+        var textureCount = BttfMeshSupport.WriteAlignedTextures(template, output, model, uncompressed: false);
+        var result = BttfMeshSupport.ReinsertGeometry(templateBytes, model, model.Skeleton);
+        var removedBakeRefs = 0;
+        if (gameConfig.ClearInheritedBakeOnReimport && !BttfMeshSupport.ModelDeclaresBake(model))
+        {
+            (result, removedBakeRefs) = BttfMeshSupport.BreakInheritedBakeReference(result, template);
+        }
+
+        File.WriteAllBytes(output, result);
+
+        // Skinned BTTF model: rebuild the .skl from the GLB skeleton next to the output (ERTM header from
+        // the target's own .skl).
+        var skeletonLine = RebuildBttfSkeletonNextToOutput(template, output, model);
+
+        var reparsed = D3DMeshParser.Parse(result);
+
+        Console.WriteLine($"reinserted  : {output}");
+        Console.WriteLine($"template    : {Path.GetFileName(template)} (Back to the Future v1)");
+        Console.WriteLine($"input       : {Path.GetFileName(glb)}");
+        Console.WriteLine($"game        : {gameConfig.DisplayName}");
+        Console.WriteLine($"mesh        : {result.Length} bytes, {reparsed.Submeshes.Count} submeshes, {reparsed.VertexCount} verts, {reparsed.FaceCount} tris");
+        PrintBounds("bounds      ", reparsed.GetBounds());
+        Console.WriteLine($"textures    : {textureCount} (written under the template's own slot names, part-aligned)");
+        if (removedBakeRefs > 0)
+        {
+            Console.WriteLine($"bake        : removed {removedBakeRefs} inherited lightmap reference(s) (model has no bake)");
+        }
+        if (!string.IsNullOrEmpty(skeletonLine))
+        {
+            Console.WriteLine(skeletonLine);
+        }
+        PrintAtlasSummary(atlas);
+
+        Console.WriteLine(BttfMeshSupport.VerifyClosesAtEof(result)
+            ? "layout      : closes at EOF"
+            : "layout      : warning, does not close at EOF");
+    }
+
+    // Rebuilds the .skl next to a reinserted skinned BTTF mesh from the GLB skeleton, reusing the target
+    // .skl's ERTM header. The target .skl is the one sharing the template mesh's name.
+    private static string RebuildBttfSkeletonNextToOutput(string templateMeshPath, string output, GltfModel model)
+    {
+        if (model.Skeleton is null || model.Skeleton.Bones.Count == 0)
+        {
+            return "";
+        }
+
+        var referenceSkl = Path.ChangeExtension(templateMeshPath, ".skl");
+        if (!File.Exists(referenceSkl))
+        {
+            return "skeleton    : skipped (no reference .skl next to the template).";
+        }
+
+        try
+        {
+            var sklBytes = BttfSkeletonWriter.Build(File.ReadAllBytes(referenceSkl), model.Skeleton);
+            var sklOutput = Path.Combine(Path.GetDirectoryName(Path.GetFullPath(output)) ?? ".", Path.GetFileName(referenceSkl));
+            File.WriteAllBytes(sklOutput, sklBytes);
+            return $"skeleton    : {Path.GetFileName(referenceSkl)} rebuilt from GLB ({model.Skeleton.Bones.Count} bones)";
+        }
+        catch (Exception ex)
+        {
+            return $"skeleton    : could not rebuild .skl ({ex.Message})";
+        }
+    }
+
+    // Generates two side-by-side Back to the Future test outputs for the same prop so the inherited-bake
+    // handling can be compared in-game: A = neutralize the bake (white texture shipped), B = remove the
+    // bake reference from the mesh (no bake shipped). Both map only the GLB's diffuse.
+    private static void ReinsertBttfTextureTests(string template, string glb, string outRoot, bool matchOriginalSize)
+    {
+        var templateBytes = File.ReadAllBytes(template);
+        if (!BttfMeshSupport.IsBackToTheFutureMesh(templateBytes))
+        {
+            Console.WriteLine("Not a Back to the Future (v1/ERTM) mesh; this command is BTTF-only.");
+            return;
+        }
+
+        var gameConfig = ApplySavedReimportSettings(InferGameConfig(template));
+        var meshName = Path.GetFileName(template);
+
+        var dirA = Path.Combine(outRoot, "A_neutralize_bake");
+        var dirB = Path.Combine(outRoot, "B_remove_bake_reference");
+        Directory.CreateDirectory(dirA);
+        Directory.CreateDirectory(dirB);
+
+        // Variant A: neutralize the inherited bake with a white texture.
+        var outA = Path.Combine(dirA, meshName);
+        var modelA = PrepareBttfTestModel(glb, gameConfig, templateBytes, matchOriginalSize);
+        var texA = BttfMeshSupport.WriteAlignedTextures(template, outA, modelA, uncompressed: false);
+        var bytesA = BttfMeshSupport.ReinsertGeometry(templateBytes, modelA, modelA.Skeleton);
+        File.WriteAllBytes(outA, bytesA);
+        var neutralBakes = BttfMeshSupport.NeutralizeInheritedBake(template, outA);
+
+        // Variant B: remove the bake reference from the mesh; ship no bake texture.
+        var outB = Path.Combine(dirB, meshName);
+        var modelB = PrepareBttfTestModel(glb, gameConfig, templateBytes, matchOriginalSize);
+        var texB = BttfMeshSupport.WriteAlignedTextures(template, outB, modelB, uncompressed: false);
+        var bytesB = BttfMeshSupport.ReinsertGeometry(templateBytes, modelB, modelB.Skeleton);
+        var (brokenB, replaced) = BttfMeshSupport.BreakInheritedBakeReference(bytesB, template);
+        File.WriteAllBytes(outB, brokenB);
+
+        Console.WriteLine($"template    : {meshName} (Back to the Future v1)");
+        Console.WriteLine($"input       : {Path.GetFileName(glb)}");
+        Console.WriteLine();
+        Console.WriteLine($"A (neutralize bake) : {dirA}");
+        Console.WriteLine($"  textures          : {texA}");
+        Console.WriteLine($"  white bakes       : {neutralBakes}");
+        Console.WriteLine($"  layout            : {(BttfMeshSupport.VerifyClosesAtEof(bytesA) ? "closes at EOF" : "WARNING not closed")}");
+        Console.WriteLine();
+        Console.WriteLine($"B (remove bake ref) : {dirB}");
+        Console.WriteLine($"  textures          : {texB}");
+        Console.WriteLine($"  bake refs removed : {replaced} (no bake .d3dtx shipped)");
+        Console.WriteLine($"  layout            : {(BttfMeshSupport.VerifyClosesAtEof(brokenB) ? "closes at EOF" : "WARNING not closed")}");
+    }
+
+    private static GltfModel PrepareBttfTestModel(string glb, GameConfig gameConfig, byte[] templateBytes, bool matchOriginalSize)
+    {
+        var model = GltfModelPreprocessor.ApplyGameReinsertRules(GltfReader.Load(glb), gameConfig);
+        if (matchOriginalSize)
+        {
+            GltfModelScaler.MatchBounds(model, D3DMeshParser.Parse(templateBytes).GetBounds());
+        }
+
+        return model;
+    }
+
     private static void ReinsertCharacter(string template, string skeletonPath, string glb, string output, bool useDiffuseAtlas)
     {
         Directory.CreateDirectory(Path.GetDirectoryName(Path.GetFullPath(output)) ?? ".");
 
         var layout = D3DMeshLayout.Build(File.ReadAllBytes(template));
         var skeleton = SkeletonLoader.Load(skeletonPath, layout.Version);
-        var gameConfig = InferGameConfig(template);
+        var gameConfig = ApplySavedReimportSettings(InferGameConfig(template));
         var model = GltfModelPreprocessor.ApplyGameReinsertRules(GltfReader.Load(glb), gameConfig);
         if (useDiffuseAtlas)
         {
@@ -677,7 +849,7 @@ public static class ReinsertCli
         if (model.Skeleton is not null && model.Skeleton.Bones.Count > 0)
         {
             var skeletonOutput = Path.Combine(Path.GetDirectoryName(Path.GetFullPath(output)) ?? ".", Path.GetFileName(skeletonPath));
-            var skeletonBytes = SkeletonRebuilder.RebuildWithEdits(skeletonPath, model.Skeleton);
+            var skeletonBytes = RebuildSkeletonBytesForGame(skeletonPath, model.Skeleton, gameConfig);
             File.WriteAllBytes(skeletonOutput, skeletonBytes);
             skeletonLine = $"{Path.GetFileName(skeletonOutput)} ({model.Skeleton.Bones.Count} edited/imported bones)";
         }
@@ -722,6 +894,10 @@ public static class ReinsertCli
                     "tex8",
                     "bump",
                     "normal",
+                    // Lightmap (bake) and baked shadow are per-object and not atlased, but must still be
+                    // written/preserved so atlasing a lightmapped mesh does not drop its lightmap section.
+                    "bake",
+                    "shadow",
                 },
             }
             : ReinsertTextureOptions.Default;
@@ -740,7 +916,7 @@ public static class ReinsertCli
         var packSharedPartsTextures = true;
         return names is null
             ? new GltfDiffuseAtlasOptions(PackSharedPartsTextures: packSharedPartsTextures)
-            : new GltfDiffuseAtlasOptions(AtlasName: names.Diffuse, NormalAtlasName: names.Normal, PackSharedPartsTextures: packSharedPartsTextures);
+            : new GltfDiffuseAtlasOptions(AtlasName: names.Diffuse, NormalAtlasName: names.Normal, DetailAtlasName: names.Detail, PackSharedPartsTextures: packSharedPartsTextures);
     }
 
     private static void PrintAtlasSummary(GltfDiffuseAtlasResult atlas)
@@ -1185,7 +1361,7 @@ public static class ReinsertCli
             if (variantModel.Skeleton is not null && variantModel.Skeleton.Bones.Count > 0)
             {
                 var skeletonOutput = Path.Combine(variantFolder, Path.GetFileName(skeletonPath));
-                var skeletonBytes = SkeletonRebuilder.RebuildWithEdits(skeletonPath, variantModel.Skeleton);
+                var skeletonBytes = RebuildSkeletonBytesForGame(skeletonPath, variantModel.Skeleton, gameConfig);
                 File.WriteAllBytes(skeletonOutput, skeletonBytes);
                 skeletonLine = Path.GetFileName(skeletonOutput);
             }
@@ -1753,6 +1929,9 @@ public static class ReinsertCli
     private static string NormalizeTextureSlotName(string slot)
         => slot.Equals("normal", StringComparison.OrdinalIgnoreCase) ? "bump" : slot;
 
+    private static byte[] RebuildSkeletonBytesForGame(string skeletonPath, SkeletonData skeleton, GameConfig gameConfig)
+        => SkeletonRebuilder.RebuildWithEdits(skeletonPath, skeleton, gameConfig);
+
     private static void PrintAttrs(VertexAttrLayout a)
     {
         PrintAttr("position", a.Position);
@@ -1780,7 +1959,7 @@ public static class ReinsertCli
     // variant ports), so the full character-swap flow can be exercised and validated headlessly.
     private static void ReinsertCombined(string inputRoot, string groupName, string glb, string outputFolder, bool useDiffuseAtlas)
     {
-        GameConfig.Current = InferGameConfig(inputRoot);
+        GameConfig.Current = ApplySavedReimportSettings(InferGameConfig(inputRoot));
         var assets = UI.ModelAsset.Discover(inputRoot);
         var groups = UI.ModelAssetGroup.Discover(assets, inputRoot);
         var group = groups.FirstOrDefault(candidate => candidate.Name.Equals(groupName, StringComparison.OrdinalIgnoreCase))
@@ -1796,7 +1975,8 @@ public static class ReinsertCli
             glb,
             outputFolder,
             useDiffuseAtlas,
-            uncompressedTextures: false);
+            uncompressedTextures: false,
+            normalizeFacialBonesOnReimport: AppPreferences.Load().NormalizeFacialBonesOnReimport);
         Console.WriteLine($"game        : {GameConfig.Current.DisplayName}");
         Console.WriteLine(result);
     }
@@ -1824,6 +2004,21 @@ public static class ReinsertCli
             return GameConfig.MinecraftStoryMode;
         }
 
+        if (IsTalesFromTheBorderlandsOldPath(text))
+        {
+            return GameConfig.TalesFromTheBorderlandsOld;
+        }
+
+        if (IsTalesFromTheBorderlandsE3Path(text))
+        {
+            return GameConfig.TalesFromTheBorderlandsE3;
+        }
+
+        if (IsTalesFromTheBorderlands2014Path(text))
+        {
+            return GameConfig.TalesFromTheBorderlands2014;
+        }
+
         if (text.Contains("BTTF", StringComparison.OrdinalIgnoreCase) ||
             text.Contains("Back to the Future", StringComparison.OrdinalIgnoreCase) ||
             text.Contains("BackToTheFuture", StringComparison.OrdinalIgnoreCase))
@@ -1833,6 +2028,32 @@ public static class ReinsertCli
 
         return GameConfig.Current;
     }
+
+    private static bool IsTalesFromTheBorderlands2014Path(string text)
+    {
+        if (text.Contains("2021", StringComparison.OrdinalIgnoreCase))
+        {
+            return false;
+        }
+
+        return text.Contains("TFTB2014", StringComparison.OrdinalIgnoreCase) ||
+               text.Contains("TftBL", StringComparison.OrdinalIgnoreCase) ||
+               text.Contains("Tales from the Borderlands", StringComparison.OrdinalIgnoreCase) ||
+               text.Contains("Borderlands", StringComparison.OrdinalIgnoreCase);
+    }
+
+    private static bool IsTalesFromTheBorderlandsOldPath(string text)
+        => !text.Contains("2021", StringComparison.OrdinalIgnoreCase) &&
+           (text.Contains("Source Code Leaked", StringComparison.OrdinalIgnoreCase) ||
+            text.Contains("TFTBOLD", StringComparison.OrdinalIgnoreCase) ||
+            text.Contains("Tales from the Borderlands (Old)", StringComparison.OrdinalIgnoreCase));
+
+    private static bool IsTalesFromTheBorderlandsE3Path(string text)
+        => !text.Contains("2021", StringComparison.OrdinalIgnoreCase) &&
+           (text.Contains("TFTBE3", StringComparison.OrdinalIgnoreCase) ||
+            text.Contains("E3 Leak", StringComparison.OrdinalIgnoreCase) ||
+            text.Contains("TFTB E3", StringComparison.OrdinalIgnoreCase) ||
+            text.Contains("Tales from the Borderlands E3", StringComparison.OrdinalIgnoreCase));
 
     private static GameConfig InferBackToTheFutureConfig(string text)
     {
@@ -1980,4 +2201,7 @@ public static class ReinsertCli
 
     private static string F(float value)
         => value.ToString("0.####", CultureInfo.InvariantCulture);
+
+    private static GameConfig ApplySavedReimportSettings(GameConfig gameConfig)
+        => gameConfig.WithNormalizeFacialBonesOnReimport(AppPreferences.Load().NormalizeFacialBonesOnReimport);
 }

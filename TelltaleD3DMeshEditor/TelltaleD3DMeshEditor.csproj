@@ -9,6 +9,17 @@
     <RootNamespace>TelltaleD3DMeshEditor</RootNamespace>
     <AssemblyName>TelltaleD3DMeshEditor</AssemblyName>
     <ApplicationIcon>Resources\Icons\logo.ico</ApplicationIcon>
+    <AssemblyTitle>A tool to view, edit, export, and reimport 3D mesh files (d3dmesh, skl and d3dtx) from Telltale Games titles.</AssemblyTitle>
+    <Product>Telltale D3DMesh Editor</Product>
+    <FileDescription>A tool to view, edit, export, and reimport 3D mesh files (d3dmesh, skl and d3dtx) from Telltale Games titles.</FileDescription>
+    <Description>A tool to view, edit, export, and reimport 3D mesh files (d3dmesh, skl and d3dtx) from Telltale Games titles.</Description>
+    <Company>HeitorSpectre</Company>
+    <Authors>HeitorSpectre</Authors>
+    <Copyright>Tool by HeitorSpectre - 2026</Copyright>
+    <Version>1.10.0</Version>
+    <AssemblyVersion>1.10.0.0</AssemblyVersion>
+    <FileVersion>1.10.0.0</FileVersion>
+    <InformationalVersion>1.10</InformationalVersion>
   </PropertyGroup>
 
   <PropertyGroup Condition="'$(Configuration)' == 'Release'">
@@ -58,6 +69,45 @@
     </EmbeddedResource>
     <EmbeddedResource Include="Resources\Images\Logo Background.png">
       <LogicalName>TelltaleD3DMeshEditor.Resources.Images.LogoBackground.png</LogicalName>
+    </EmbeddedResource>
+    <EmbeddedResource Include="Resources\Images\Auto-Generic.png">
+      <LogicalName>TelltaleD3DMeshEditor.Resources.Images.Auto-Generic.png</LogicalName>
+    </EmbeddedResource>
+    <EmbeddedResource Include="Resources\Images\BTTF.png">
+      <LogicalName>TelltaleD3DMeshEditor.Resources.Images.BTTF.png</LogicalName>
+    </EmbeddedResource>
+    <EmbeddedResource Include="Resources\Images\MCSM.png">
+      <LogicalName>TelltaleD3DMeshEditor.Resources.Images.MCSM.png</LogicalName>
+    </EmbeddedResource>
+    <EmbeddedResource Include="Resources\Images\MCSMS1.png">
+      <LogicalName>TelltaleD3DMeshEditor.Resources.Images.MCSMS1.png</LogicalName>
+    </EmbeddedResource>
+    <EmbeddedResource Include="Resources\Images\MCSMS2.png">
+      <LogicalName>TelltaleD3DMeshEditor.Resources.Images.MCSMS2.png</LogicalName>
+    </EmbeddedResource>
+    <EmbeddedResource Include="Resources\Images\TFTB.png">
+      <LogicalName>TelltaleD3DMeshEditor.Resources.Images.TFTB.png</LogicalName>
+    </EmbeddedResource>
+    <EmbeddedResource Include="Resources\Images\TFTB2014.png">
+      <LogicalName>TelltaleD3DMeshEditor.Resources.Images.TFTB2014.png</LogicalName>
+    </EmbeddedResource>
+    <EmbeddedResource Include="Resources\Images\TFTBE3.png">
+      <LogicalName>TelltaleD3DMeshEditor.Resources.Images.TFTBE3.png</LogicalName>
+    </EmbeddedResource>
+    <EmbeddedResource Include="Resources\Images\TFTBOLD.png">
+      <LogicalName>TelltaleD3DMeshEditor.Resources.Images.TFTBOLD.png</LogicalName>
+    </EmbeddedResource>
+    <EmbeddedResource Include="Resources\Images\TFTB2021.png">
+      <LogicalName>TelltaleD3DMeshEditor.Resources.Images.TFTB2021.png</LogicalName>
+    </EmbeddedResource>
+    <EmbeddedResource Include="Resources\Images\TWAU.png">
+      <LogicalName>TelltaleD3DMeshEditor.Resources.Images.TWAU.png</LogicalName>
+    </EmbeddedResource>
+    <EmbeddedResource Include="Resources\Images\TWD.png">
+      <LogicalName>TelltaleD3DMeshEditor.Resources.Images.TWD.png</LogicalName>
+    </EmbeddedResource>
+    <EmbeddedResource Include="Resources\Images\TWDS2.png">
+      <LogicalName>TelltaleD3DMeshEditor.Resources.Images.TWDS2.png</LogicalName>
     </EmbeddedResource>
     <EmbeddedResource Include="Resources\Images\BTTF101.png">
       <LogicalName>TelltaleD3DMeshEditor.Resources.Images.BTTF101.png</LogicalName>

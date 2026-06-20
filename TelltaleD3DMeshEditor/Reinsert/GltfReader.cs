@@ -51,6 +51,7 @@ public sealed class GltfPrimitive
     // reimport and the character outlines would vanish. Set during parsing, consumed by the reinsert
     // texture service to keep the template's original line binding.
     public string? RecoveredDetailLineTextureName { get; set; }
+    public GltfImage? RecoveredDetailLineImage { get; set; }
     public bool IsSkinned { get; init; }
     public GltfImage? BaseColor { get; init; }
     public IReadOnlyDictionary<string, GltfImage> TextureSlots { get; init; } =
@@ -741,6 +742,16 @@ public static class GltfReader
             if (overlayIndexCount < 0 || candidate.Indices.Length == overlayIndexCount)
             {
                 candidate.RecoveredDetailLineTextureName = lineTextureName;
+                var overlayTextures = ResolveMaterialTextures(material, ctx, includePbrExtras: false);
+                if (overlayTextures.TryGetValue("diffuse", out var overlayImage))
+                {
+                    candidate.RecoveredDetailLineImage = new GltfImage
+                    {
+                        Name = lineTextureName,
+                        Data = overlayImage.Data,
+                        MimeType = overlayImage.MimeType,
+                    };
+                }
                 return;
             }
         }
@@ -1007,6 +1018,7 @@ public static class GltfReader
         var normals = ReadVec3(ctx, GetAttr(attrs, "NORMAL"));
         var tangents = ReadVec4(ctx, GetAttr(attrs, "TANGENT"));
         var binormals = ReadVec4(ctx, GetAttr(attrs, "_TT_BINORMAL"));
+        ApplyOriginalTangentWs(tangents, ReadScalarFloats(ctx, GetAttr(attrs, "_TT_TANGENT_W")));
         ApplyTransform(positions, normals, tangents, binormals, effectiveTransform);
         var uv0 = ReadVec2(ctx, GetAttr(attrs, "TEXCOORD_0"));
         var uv1 = ReadVec2(ctx, GetAttr(attrs, "TEXCOORD_1"));
@@ -1572,7 +1584,20 @@ public static class GltfReader
 
     private static float[]? ReadScalarFloats(ParseContext ctx, int accessor)
     {
-        return accessor < 0 ? null : ctx.ReadFloats(accessor, 1);
+        return accessor < 0 ? null : ctx.ReadFirstFloatComponents(accessor);
+    }
+
+    private static void ApplyOriginalTangentWs(Vector4[]? tangents, float[]? originalWs)
+    {
+        if (tangents is null || originalWs is null || originalWs.Length != tangents.Length)
+        {
+            return;
+        }
+
+        for (var i = 0; i < tangents.Length; i++)
+        {
+            tangents[i] = new Vector4(tangents[i].X, tangents[i].Y, tangents[i].Z, originalWs[i]);
+        }
     }
 
     private static ushort[]? ReadUShort4(ParseContext ctx, int accessor)
@@ -1709,6 +1734,19 @@ public static class GltfReader
                     floats[offset + 1], floats[offset + 5], floats[offset + 9], floats[offset + 13],
                     floats[offset + 2], floats[offset + 6], floats[offset + 10], floats[offset + 14],
                     floats[offset + 3], floats[offset + 7], floats[offset + 11], floats[offset + 15]);
+            }
+
+            return result;
+        }
+
+        public float[] ReadFirstFloatComponents(int accessorIndex)
+        {
+            var accessor = accessors[accessorIndex];
+            var (data, count, _, componentType, normalized, stride) = ResolveAccessor(accessor);
+            var result = new float[count];
+            for (var i = 0; i < count; i++)
+            {
+                result[i] = ReadComponentAsFloat(data, i * stride, componentType, normalized);
             }
 
             return result;

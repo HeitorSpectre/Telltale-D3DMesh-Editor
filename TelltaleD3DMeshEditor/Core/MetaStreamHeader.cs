@@ -22,6 +22,17 @@ public sealed class MetaStreamHeader
             return new MetaStreamHeader { Version = magic == "5VSM" ? "MSV5" : "MSV6", DataOffset = reader.Position };
         }
 
+        // MSV4 (older Telltale tool, e.g. the Tales from the Borderlands source-code leak) has the same
+        // serialized-class table but one fewer u32 in the preamble before the class count.
+        if (magic is "4VSM")
+        {
+            reader.ReadUInt32();
+            reader.ReadUInt32();
+            var classCount = checked((int)reader.ReadUInt32());
+            reader.Skip(classCount * 12);
+            return new MetaStreamHeader { Version = "MSV4", DataOffset = reader.Position };
+        }
+
         if (magic is "ERTM" or "MTRE")
         {
             var count = checked((int)reader.ReadUInt32());
