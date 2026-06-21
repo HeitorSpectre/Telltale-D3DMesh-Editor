@@ -20,6 +20,7 @@ public enum GameId
     TalesFromTheBorderlands2021 = 15,
     MinecraftStoryModeGroup = 16,
     MinecraftStoryModeSeason2 = 17,
+    GameOfThrones = 18,
 }
 
 // Per-game settings, so behaviour specific to one game stays isolated and never affects another. The
@@ -83,6 +84,15 @@ public sealed class GameConfig
     // Telltale GLB keeps the source texture symbols instead of being renamed to the replaced
     // character's template symbols. TWD S2 character swaps currently need this for eyes/shared parts.
     public bool PreferGltfTextureNamesOnReimport { get; init; }
+
+    // Some games treat authored secondary symbols (normal, brushnormal, occlusion, etc.) as part of
+    // the material identity. Preserve those slot names instead of generating namespaced replacements.
+    public bool PreserveSecondaryTextureNamesOnReimport { get; init; }
+
+    // Some v17/v18 games encode bone indices with room for more than 64 entries, but their shipped
+    // character meshes still cap each runtime palette at 64 bones. Keep this profile-scoped so a
+    // foreign-model reimport cannot create oversized palettes only because the byte encoding allows it.
+    public int? MaxSkinnedPaletteBonesOnReimport { get; init; }
 
     // TWD S2 character swaps need the imported image data, but several shaders still expect the
     // replaced character's original texture symbols. This enables a semantic source->template remap
@@ -156,7 +166,7 @@ public sealed class GameConfig
     // facial rig makes the imported face follow the target lipsync, but the donor mouth is usually a
     // different shape and collapses/recedes in-game. Keep exact bone matches, but do not retarget those
     // character-specific face aliases for this profile.
-    public bool DisableCharacterSpecificFacialRetargetOnReimport { get; init; }
+    public bool DisableCharacterSpecificFacialRetargetOnReimport { get; init; } = true;
 
     public static readonly GameConfig Generic = new()
     {
@@ -166,6 +176,7 @@ public sealed class GameConfig
         ClearInheritedBakeOnReimport = false,
         ClearInheritedSecondaryTexturesOnReimport = false,
         PreferGltfTextureNamesOnReimport = false,
+        PreserveSecondaryTextureNamesOnReimport = false,
         PreferSemanticTemplateTextureNamesOnReimport = false,
         RemoveEyeHelperPrimitivesOnReimport = true,
         SplitBodyLineAlphaOnReimport = false,
@@ -177,7 +188,7 @@ public sealed class GameConfig
         PreserveSkeletonDerivedFieldsOnMerge = false,
         PortTranslationScalesOnSkeletonMerge = false,
         PortCompanionVariantPartsOnReimport = false,
-        DisableCharacterSpecificFacialRetargetOnReimport = false,
+        DisableCharacterSpecificFacialRetargetOnReimport = true,
     };
 
     public static readonly GameConfig WolfAmongUs = new()
@@ -199,7 +210,7 @@ public sealed class GameConfig
         PreserveSkeletonDerivedFieldsOnMerge = false,
         PortTranslationScalesOnSkeletonMerge = false,
         PortCompanionVariantPartsOnReimport = false,
-        DisableCharacterSpecificFacialRetargetOnReimport = false,
+        DisableCharacterSpecificFacialRetargetOnReimport = true,
     };
 
     public static readonly GameConfig WalkingDead = new()
@@ -227,7 +238,7 @@ public sealed class GameConfig
         PreserveSkeletonDerivedFieldsOnMerge = false,
         PortTranslationScalesOnSkeletonMerge = false,
         PortCompanionVariantPartsOnReimport = false,
-        DisableCharacterSpecificFacialRetargetOnReimport = false,
+        DisableCharacterSpecificFacialRetargetOnReimport = true,
     };
 
     public static readonly GameConfig MinecraftStoryMode = new()
@@ -250,7 +261,7 @@ public sealed class GameConfig
         PreserveSkeletonDerivedFieldsOnMerge = true,
         PortTranslationScalesOnSkeletonMerge = true,
         PortCompanionVariantPartsOnReimport = true,
-        DisableCharacterSpecificFacialRetargetOnReimport = false,
+        DisableCharacterSpecificFacialRetargetOnReimport = true,
     };
 
     public static readonly GameConfig MinecraftStoryModeGroup = new()
@@ -334,6 +345,31 @@ public sealed class GameConfig
         DisplayName = "Tales from the Borderlands",
     };
 
+    public static readonly GameConfig GameOfThrones = new()
+    {
+        Id = GameId.GameOfThrones,
+        DisplayName = "Game of Thrones - A Telltale Games Series",
+        ModernTextureToolkitGameName = "Game of Thrones (2015)",
+        UsesCompanionAlphaTextures = false,
+        ClearInheritedBakeOnReimport = false,
+        ClearInheritedSecondaryTexturesOnReimport = true,
+        PreferGltfTextureNamesOnReimport = false,
+        PreserveSecondaryTextureNamesOnReimport = true,
+        MaxSkinnedPaletteBonesOnReimport = 64,
+        PreferSemanticTemplateTextureNamesOnReimport = false,
+        RemoveEyeHelperPrimitivesOnReimport = false,
+        SplitBodyLineAlphaOnReimport = false,
+        InvertBodyLineAlphaOnReimport = false,
+        InvertHeadLineAlphaOnReimport = false,
+        InvertHandLineAlphaOnReimport = false,
+        TreatAdvObj000TexturesAsBake = false,
+        PixelatedGltfTextures = false,
+        PreserveSkeletonDerivedFieldsOnMerge = false,
+        PortTranslationScalesOnSkeletonMerge = false,
+        PortCompanionVariantPartsOnReimport = false,
+        DisableCharacterSpecificFacialRetargetOnReimport = true,
+    };
+
     public static readonly GameConfig BackToTheFuture = CreateBackToTheFuture(GameId.BackToTheFuture, "Back to the Future: The Game");
     public static readonly GameConfig BackToTheFutureEpisode1 = CreateBackToTheFuture(GameId.BackToTheFutureEpisode1, "Back to the Future: Episode 1 - It's About Time");
     public static readonly GameConfig BackToTheFutureEpisode2 = CreateBackToTheFuture(GameId.BackToTheFutureEpisode2, "Back to the Future: Episode 2 - Get Tannen!");
@@ -353,6 +389,7 @@ public sealed class GameConfig
         TalesFromTheBorderlands2014,
         TalesFromTheBorderlandsE3,
         TalesFromTheBorderlandsOld,
+        GameOfThrones,
         BackToTheFuture,
         BackToTheFutureEpisode1,
         BackToTheFutureEpisode2,
@@ -383,6 +420,8 @@ public sealed class GameConfig
             ClearInheritedBakeOnReimport = ClearInheritedBakeOnReimport,
             ClearInheritedSecondaryTexturesOnReimport = ClearInheritedSecondaryTexturesOnReimport,
             PreferGltfTextureNamesOnReimport = PreferGltfTextureNamesOnReimport,
+            PreserveSecondaryTextureNamesOnReimport = PreserveSecondaryTextureNamesOnReimport,
+            MaxSkinnedPaletteBonesOnReimport = MaxSkinnedPaletteBonesOnReimport,
             PreferSemanticTemplateTextureNamesOnReimport = PreferSemanticTemplateTextureNamesOnReimport,
             RemoveEyeHelperPrimitivesOnReimport = RemoveEyeHelperPrimitivesOnReimport,
             SplitBodyLineAlphaOnReimport = SplitBodyLineAlphaOnReimport,
@@ -422,6 +461,6 @@ public sealed class GameConfig
             PreserveSkeletonDerivedFieldsOnMerge = false,
             PortTranslationScalesOnSkeletonMerge = false,
             PortCompanionVariantPartsOnReimport = false,
-            DisableCharacterSpecificFacialRetargetOnReimport = false,
+            DisableCharacterSpecificFacialRetargetOnReimport = true,
         };
 }

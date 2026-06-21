@@ -15,6 +15,7 @@ namespace TelltaleD3DMeshEditor.Formats.Skeleton;
 // Season 2), so when the skeleton is unmodified the rebuilt file matches the game's exactly.
 public static class SkeletonRebuilder
 {
+    private const float LegacyTransformEpsilon = 1e-5f;
     private static readonly object Gate = new();
     private static List<Workspace>? _workspaces;
 
@@ -46,9 +47,9 @@ public static class SkeletonRebuilder
 
     public static byte[] RebuildWithEdits(string originalSklPath, SkeletonData edited, GameConfig gameConfig)
     {
-        if (gameConfig.IsOriginalTalesFromTheBorderlandsPc)
+        if (gameConfig.IsOriginalTalesFromTheBorderlandsPc || gameConfig.Id == GameId.GameOfThrones)
         {
-            // TFTB original PC builds use a legacy MSV skeleton layout that the toolkit cannot serialize yet.
+            // Original v17 PC builds use a legacy MSV skeleton layout that the toolkit cannot serialize yet.
             // Rebuild it by applying the imported GLB's local bone transforms onto the target .skl
             // entry table, matching the same partial-skeleton workflow used by the other games.
             return RebuildLegacyMsvSkeletonWithEdits(
@@ -232,37 +233,53 @@ public static class SkeletonRebuilder
         var bytes = File.ReadAllBytes(originalSklPath);
         var records = ReadLegacyMsvBoneRecords(bytes);
         var editedByHash = edited.Bones
-            .Where(bone => bone.Hash != 0)
-            .GroupBy(bone => bone.Hash)
+            .Select((bone, index) => (Bone: bone, Index: index))
+            .Where(item => item.Bone.Hash != 0)
+            .GroupBy(item => item.Bone.Hash)
             .ToDictionary(group => group.Key, group => group.First());
         var editedByName = edited.Bones
-            .Where(bone => !string.IsNullOrWhiteSpace(bone.Name))
-            .GroupBy(bone => bone.Name, StringComparer.OrdinalIgnoreCase)
+            .Select((bone, index) => (Bone: bone, Index: index))
+            .Where(item => !string.IsNullOrWhiteSpace(item.Bone.Name))
+            .GroupBy(item => item.Bone.Name, StringComparer.OrdinalIgnoreCase)
             .ToDictionary(group => group.Key, group => group.First(), StringComparer.OrdinalIgnoreCase);
         var editedByAlias = allowCharacterSpecificAliases
             ? edited.Bones
-                .Select(bone => (Bone: bone, HasAlias: BoneNameAliases.TryGetCharacterSpecificAlias(bone.Name, out var alias), Alias: alias))
+                .Select((bone, index) => (Bone: bone, Index: index, HasAlias: BoneNameAliases.TryGetCharacterSpecificAlias(bone.Name, out var alias), Alias: alias))
                 .Where(item => item.HasAlias)
                 .GroupBy(item => item.Alias, StringComparer.OrdinalIgnoreCase)
-                .ToDictionary(group => group.Key, group => group.First().Bone, StringComparer.OrdinalIgnoreCase)
-            : new Dictionary<string, BoneData>(StringComparer.OrdinalIgnoreCase);
+                .ToDictionary(group => group.Key, group => (group.First().Bone, group.First().Index), StringComparer.OrdinalIgnoreCase)
+            : new Dictionary<string, (BoneData Bone, int Index)>(StringComparer.OrdinalIgnoreCase);
+        var editedWorlds = BuildLegacyWorldMatrices(edited);
+        var outputWorlds = new List<Matrix4x4>(records.Count);
 
         var matchedBones = 0;
         foreach (var record in records)
         {
-            if (!TryFindEditedBone(record, editedByHash, editedByName, editedByAlias, allowCharacterSpecificAliases, out var bone))
+            var position = record.LocalPosition;
+            var rotation = record.LocalRotation;
+            if (TryFindEditedBone(record, editedByHash, editedByName, editedByAlias, allowCharacterSpecificAliases, out var match))
             {
-                continue;
+                matchedBones++;
+                var targetWorld = editedWorlds[match.Index];
+                if (!TryGetLegacyLocalTransform(targetWorld, record.ParentIndex, outputWorlds, out position, out rotation))
+                {
+                    position = new Vector3(match.Bone.X, match.Bone.Y, match.Bone.Z);
+                    rotation = NormalizeLegacyRotation(new Quaternion(match.Bone.Qx, match.Bone.Qy, match.Bone.Qz, match.Bone.Qw));
+                }
+
+                if (!LegacyTransformMatches(record, position, rotation))
+                {
+                    WriteLegacyF32(bytes, record.PositionOffset, position.X);
+                    WriteLegacyF32(bytes, record.PositionOffset + 4, position.Y);
+                    WriteLegacyF32(bytes, record.PositionOffset + 8, position.Z);
+                    WriteLegacyF32(bytes, record.RotationOffset, rotation.X);
+                    WriteLegacyF32(bytes, record.RotationOffset + 4, rotation.Y);
+                    WriteLegacyF32(bytes, record.RotationOffset + 8, rotation.Z);
+                    WriteLegacyF32(bytes, record.RotationOffset + 12, rotation.W);
+                }
             }
 
-            matchedBones++;
-            WriteLegacyF32(bytes, record.PositionOffset, bone.X);
-            WriteLegacyF32(bytes, record.PositionOffset + 4, bone.Y);
-            WriteLegacyF32(bytes, record.PositionOffset + 8, bone.Z);
-            WriteLegacyF32(bytes, record.RotationOffset, bone.Qx);
-            WriteLegacyF32(bytes, record.RotationOffset + 4, bone.Qy);
-            WriteLegacyF32(bytes, record.RotationOffset + 8, bone.Qz);
-            WriteLegacyF32(bytes, record.RotationOffset + 12, bone.Qw);
+            outputWorlds.Add(BuildLegacyEntryWorld(position, rotation, record.ParentIndex, outputWorlds));
         }
 
         if (matchedBones == 0 && edited.Bones.Count > 0)
@@ -300,11 +317,15 @@ public static class SkeletonRebuilder
         {
             var hash = ReadLegacySymbolHash(reader);
             ReadLegacySymbolHash(reader);
-            reader.ReadInt32();
+            var parentIndex = reader.ReadInt32();
             var positionOffset = reader.Position;
-            reader.Skip(3 * 4);
+            var position = new Vector3(reader.ReadFloat(), reader.ReadFloat(), reader.ReadFloat());
             var rotationOffset = reader.Position;
-            reader.Skip(4 * 4);
+            var rotation = NormalizeLegacyRotation(new Quaternion(
+                reader.ReadFloat(),
+                reader.ReadFloat(),
+                reader.ReadFloat(),
+                reader.ReadFloat()));
 
             reader.ReadUInt32();
             reader.Skip(3 * 4);
@@ -331,6 +352,9 @@ public static class SkeletonRebuilder
             records.Add(new LegacyMsvBoneRecord(
                 hash,
                 BoneHashDatabase.Resolve(hash) ?? $"bone_{hash:X16}",
+                parentIndex,
+                position,
+                rotation,
                 positionOffset,
                 rotationOffset));
         }
@@ -340,11 +364,11 @@ public static class SkeletonRebuilder
 
     private static bool TryFindEditedBone(
         LegacyMsvBoneRecord record,
-        IReadOnlyDictionary<ulong, BoneData> editedByHash,
-        IReadOnlyDictionary<string, BoneData> editedByName,
-        IReadOnlyDictionary<string, BoneData> editedByAlias,
+        IReadOnlyDictionary<ulong, (BoneData Bone, int Index)> editedByHash,
+        IReadOnlyDictionary<string, (BoneData Bone, int Index)> editedByName,
+        IReadOnlyDictionary<string, (BoneData Bone, int Index)> editedByAlias,
         bool allowCharacterSpecificAliases,
-        out BoneData bone)
+        out (BoneData Bone, int Index) bone)
     {
         if (record.Hash != 0 && editedByHash.TryGetValue(record.Hash, out bone!))
         {
@@ -363,8 +387,120 @@ public static class SkeletonRebuilder
             return true;
         }
 
-        bone = null!;
+        bone = default;
         return false;
+    }
+
+    private static bool LegacyTransformMatches(LegacyMsvBoneRecord record, Vector3 position, Quaternion rotation)
+        => Math.Abs(record.LocalPosition.X - position.X) <= LegacyTransformEpsilon &&
+           Math.Abs(record.LocalPosition.Y - position.Y) <= LegacyTransformEpsilon &&
+           Math.Abs(record.LocalPosition.Z - position.Z) <= LegacyTransformEpsilon &&
+           LegacyRotationDelta(record.LocalRotation, rotation) <= LegacyTransformEpsilon;
+
+    private static float LegacyRotationDelta(Quaternion a, Quaternion b)
+    {
+        a = NormalizeLegacyRotation(a);
+        b = NormalizeLegacyRotation(b);
+        var direct =
+            Math.Abs(a.X - b.X) +
+            Math.Abs(a.Y - b.Y) +
+            Math.Abs(a.Z - b.Z) +
+            Math.Abs(a.W - b.W);
+        var negated =
+            Math.Abs(a.X + b.X) +
+            Math.Abs(a.Y + b.Y) +
+            Math.Abs(a.Z + b.Z) +
+            Math.Abs(a.W + b.W);
+        return Math.Min(direct, negated);
+    }
+
+    private static Matrix4x4[] BuildLegacyWorldMatrices(SkeletonData skeleton)
+    {
+        var worlds = new Matrix4x4[skeleton.Bones.Count];
+        var states = new byte[skeleton.Bones.Count];
+        for (var i = 0; i < skeleton.Bones.Count; i++)
+        {
+            BuildLegacyWorldMatrix(i, skeleton, worlds, states);
+        }
+
+        return worlds;
+    }
+
+    private static Matrix4x4 BuildLegacyWorldMatrix(int index, SkeletonData skeleton, Matrix4x4[] worlds, byte[] states)
+    {
+        if (states[index] == 2)
+        {
+            return worlds[index];
+        }
+
+        if (states[index] == 1)
+        {
+            return Matrix4x4.Identity;
+        }
+
+        states[index] = 1;
+        var bone = skeleton.Bones[index];
+        var local = BuildLegacyLocalMatrix(
+            new Vector3(bone.X, bone.Y, bone.Z),
+            new Quaternion(bone.Qx, bone.Qy, bone.Qz, bone.Qw));
+        var parent = bone.ParentIndex;
+        worlds[index] = parent >= 0 && parent < skeleton.Bones.Count
+            ? local * BuildLegacyWorldMatrix(parent, skeleton, worlds, states)
+            : local;
+        states[index] = 2;
+        return worlds[index];
+    }
+
+    private static Matrix4x4 BuildLegacyEntryWorld(
+        Vector3 position,
+        Quaternion rotation,
+        int parentIndex,
+        IReadOnlyList<Matrix4x4> outputWorlds)
+    {
+        var local = BuildLegacyLocalMatrix(position, rotation);
+        return parentIndex >= 0 && parentIndex < outputWorlds.Count
+            ? local * outputWorlds[parentIndex]
+            : local;
+    }
+
+    private static Matrix4x4 BuildLegacyLocalMatrix(Vector3 position, Quaternion rotation)
+        => Matrix4x4.CreateFromQuaternion(NormalizeLegacyRotation(rotation)) *
+           Matrix4x4.CreateTranslation(position);
+
+    private static bool TryGetLegacyLocalTransform(
+        Matrix4x4 targetWorld,
+        int parentIndex,
+        IReadOnlyList<Matrix4x4> outputWorlds,
+        out Vector3 position,
+        out Quaternion rotation)
+    {
+        var local = targetWorld;
+        if (parentIndex >= 0 &&
+            parentIndex < outputWorlds.Count &&
+            Matrix4x4.Invert(outputWorlds[parentIndex], out var inverseParent))
+        {
+            local = targetWorld * inverseParent;
+        }
+
+        if (!Matrix4x4.Decompose(local, out _, out rotation, out position))
+        {
+            position = Vector3.Zero;
+            rotation = Quaternion.Identity;
+            return false;
+        }
+
+        rotation = NormalizeLegacyRotation(rotation);
+        return true;
+    }
+
+    private static Quaternion NormalizeLegacyRotation(Quaternion rotation)
+    {
+        if (rotation.LengthSquared() < 0.000001f)
+        {
+            return Quaternion.Identity;
+        }
+
+        return Quaternion.Normalize(rotation);
     }
 
     private static ulong ReadLegacySymbolHash(DataReader reader)
@@ -444,5 +580,8 @@ public sealed record SkeletonEntryDiagnostics(
 internal sealed record LegacyMsvBoneRecord(
     ulong Hash,
     string Name,
+    int ParentIndex,
+    System.Numerics.Vector3 LocalPosition,
+    System.Numerics.Quaternion LocalRotation,
     int PositionOffset,
     int RotationOffset);

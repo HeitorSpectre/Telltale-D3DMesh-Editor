@@ -269,6 +269,14 @@ internal static class AssetGltfBuilder
                         };
                     }
                 }
+                if (TryGetSlotTexture(submesh.TextureNames, textureIndexByName, "occlusion", out _, out var occlusionTexIndex))
+                {
+                    materialDict["occlusionTexture"] = new Dictionary<string, object>
+                    {
+                        ["index"] = occlusionTexIndex,
+                        ["texCoord"] = TexCoordForSlot("occlusion"),
+                    };
+                }
                 var telltaleTextures = BuildTelltaleTextureExtras(submesh.TextureNames, textureIndexByName);
                 if (telltaleTextures.Count > 0)
                 {

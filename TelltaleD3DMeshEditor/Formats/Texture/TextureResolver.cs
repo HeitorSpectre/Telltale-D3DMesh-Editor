@@ -31,6 +31,9 @@ public static class TextureResolver
         var shadowFiles = textureFiles
             .Where(candidate => candidate.Role == TextureRole.Shadow)
             .ToList();
+        var occlusionFiles = textureFiles
+            .Where(candidate => candidate.Role == TextureRole.Occlusion)
+            .ToList();
         var diffuseReferences = BuildDiffuseReferenceStems(mesh);
         var result = new Dictionary<int, MaterialTextureSet>();
         if (textureFiles.Count == 0)
@@ -50,6 +53,7 @@ public static class TextureResolver
                 Normal = LoadMatched(FindBestTexture(textureFiles, normalFiles, mesh.Submeshes[i], TextureRole.Normal), loaded),
                 Bake = LoadMatched(FindBestTexture(textureFiles, bakeFiles, mesh.Submeshes[i], TextureRole.Bake), loaded),
                 Shadow = LoadMatched(FindBestTexture(textureFiles, shadowFiles, mesh.Submeshes[i], TextureRole.Shadow), loaded),
+                Occlusion = LoadMatched(FindBestTexture(textureFiles, occlusionFiles, mesh.Submeshes[i], TextureRole.Occlusion), loaded),
             };
 
             ApplyCompanionAlpha(set, diffuse, textureFiles, loaded, diffuseReferences);
@@ -670,6 +674,7 @@ public static class TextureResolver
             TextureRole.Normal => ["bump", "detail_bump"],
             TextureRole.Bake => ["bake"],
             TextureRole.Shadow => ["shadow"],
+            TextureRole.Occlusion => ["occlusion"],
             _ => []
         };
     }
@@ -729,6 +734,7 @@ public static class TextureResolver
         Normal,
         Bake,
         Shadow,
+        Occlusion,
         Other
     }
 
@@ -777,10 +783,14 @@ public static class TextureResolver
                 return TextureRole.Detail;
             }
 
+            if (lower.EndsWith("_ao"))
+            {
+                return TextureRole.Occlusion;
+            }
+
             if (lower.EndsWith("_spec") ||
                 lower.EndsWith("_mask") ||
                 lower.EndsWith("_masks") ||
-                lower.EndsWith("_ao") ||
                 lower.EndsWith("_rough") ||
                 lower.EndsWith("_metal") ||
                 lower.EndsWith("_bump"))
