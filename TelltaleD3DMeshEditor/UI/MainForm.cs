@@ -955,6 +955,7 @@ public sealed class MainForm : Form
             GameId.TalesFromTheBorderlandsE3 => "TFTBE3",
             GameId.TalesFromTheBorderlandsOld => "TFTBOLD",
             GameId.TalesFromTheBorderlands2021 => "TFTB2021",
+            GameId.GameOfThrones => "GOT",
             GameId.BackToTheFuture => "BTTF",
             GameId.BackToTheFutureEpisode1 => "BTTF101",
             GameId.BackToTheFutureEpisode2 => "BTTF102",
@@ -1255,6 +1256,11 @@ public sealed class MainForm : Form
             return GameConfig.MinecraftStoryMode;
         }
 
+        if (IsGameOfThronesHint(text))
+        {
+            return GameConfig.GameOfThrones;
+        }
+
         if (IsTalesFromTheBorderlandsOldHint(text))
         {
             return GameConfig.TalesFromTheBorderlandsOld;
@@ -1292,6 +1298,13 @@ public sealed class MainForm : Form
                text.Contains("Tales from the Borderlands", StringComparison.OrdinalIgnoreCase) ||
                text.Contains("Borderlands", StringComparison.OrdinalIgnoreCase);
     }
+
+    private static bool IsGameOfThronesHint(string text)
+        => text.Contains("Game of Thrones", StringComparison.OrdinalIgnoreCase) ||
+           text.Contains("GameOfThrones", StringComparison.OrdinalIgnoreCase) ||
+           text.Contains("Telltale Games Series", StringComparison.OrdinalIgnoreCase) ||
+           text.Contains("GOT _", StringComparison.OrdinalIgnoreCase) ||
+           text.Contains("GOT_", StringComparison.OrdinalIgnoreCase);
 
     private static bool IsTalesFromTheBorderlandsOldHint(string text)
         => !text.Contains("2021", StringComparison.OrdinalIgnoreCase) &&
@@ -2945,7 +2958,7 @@ public sealed class MainForm : Form
             }
 
             var scaleDonor = LoadDonorSkeletonForScales(model, inputRoot, gameConfig);
-            var skeletonBytes = gameConfig.IsOriginalTalesFromTheBorderlandsPc
+            var skeletonBytes = gameConfig.IsOriginalTalesFromTheBorderlandsPc || gameConfig.Id == GameId.GameOfThrones
                 ? RebuildSkeletonBytesForGame(group.SkeletonPath, model.Skeleton, gameConfig)
                 : SkeletonRebuilder.RebuildWithEdits(group.SkeletonPath, model.Skeleton, scaleDonor);
             File.WriteAllBytes(outputPath, skeletonBytes);

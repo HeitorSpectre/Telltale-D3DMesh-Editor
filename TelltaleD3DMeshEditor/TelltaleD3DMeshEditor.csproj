@@ -100,6 +100,9 @@
     <EmbeddedResource Include="Resources\Images\TFTB2021.png">
       <LogicalName>TelltaleD3DMeshEditor.Resources.Images.TFTB2021.png</LogicalName>
     </EmbeddedResource>
+    <EmbeddedResource Include="Resources\Images\GOT.png">
+      <LogicalName>TelltaleD3DMeshEditor.Resources.Images.GOT.png</LogicalName>
+    </EmbeddedResource>
     <EmbeddedResource Include="Resources\Images\TWAU.png">
       <LogicalName>TelltaleD3DMeshEditor.Resources.Images.TWAU.png</LogicalName>
     </EmbeddedResource>

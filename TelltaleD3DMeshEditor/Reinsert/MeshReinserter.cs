@@ -277,7 +277,7 @@ public static class MeshReinserter
             if (!HasUsableSkin(primitive) || layout.BonePalettes.Count == 0 || !HasResolvableSkeleton(model, referenceSkeleton))
             {
                 var paletteIndex = layout.BonePalettes.Count > 0
-                    ? (staticImportPaletteIndex ??= ResolveStaticImportPaletteIndex(layout, referenceSkeleton))
+                    ? (staticImportPaletteIndex ??= ResolveStaticImportPaletteIndex(layout, referenceSkeleton, gameConfig))
                     : primitive.BonePaletteIndex;
                 result.Add(new PreparedPrimitive(primitive, textureSlots, paletteIndex));
                 continue;
@@ -294,7 +294,7 @@ public static class MeshReinserter
 
             if (usage.AllHashes.Count == 0)
             {
-                var paletteIndex = staticImportPaletteIndex ??= ResolveStaticImportPaletteIndex(layout, referenceSkeleton);
+                var paletteIndex = staticImportPaletteIndex ??= ResolveStaticImportPaletteIndex(layout, referenceSkeleton, gameConfig);
                 result.Add(new PreparedPrimitive(primitive, textureSlots, paletteIndex));
                 continue;
             }
@@ -321,7 +321,7 @@ public static class MeshReinserter
                 continue;
             }
 
-            var maxPaletteBones = MaxPaletteBonesForLayout(layout);
+            var maxPaletteBones = MaxPaletteBonesForLayout(layout, gameConfig);
             if (usage.AllHashes.Count <= maxPaletteBones)
             {
                 var customPalette = AddCustomBonePalette(layout, usage.AllHashes, maxPaletteBones);
@@ -329,7 +329,7 @@ public static class MeshReinserter
                 continue;
             }
 
-            var slices = SplitPrimitiveByBonePalette(layout, primitive, usage, textureSlots, preferredPalette);
+            var slices = SplitPrimitiveByBonePalette(layout, primitive, usage, textureSlots, preferredPalette, maxPaletteBones);
             result.AddRange(slices);
         }
 
@@ -514,7 +514,7 @@ public static class MeshReinserter
         return layout.BonePalettes.Count - 1;
     }
 
-    private static int MaxPaletteBonesForLayout(D3DMeshLayout layout)
+    private static int MaxPaletteBonesForLayout(D3DMeshLayout layout, GameConfig? gameConfig)
     {
         var maxIndex = MaxPaletteBonesForByteEncoding - 1;
         foreach (var vertexBuffer in layout.VertexBuffers)
@@ -533,10 +533,13 @@ public static class MeshReinserter
             });
         }
 
-        return maxIndex + 1;
+        var encodingLimit = maxIndex + 1;
+        return gameConfig?.MaxSkinnedPaletteBonesOnReimport is { } profileLimit && profileLimit > 0
+            ? Math.Min(encodingLimit, profileLimit)
+            : encodingLimit;
     }
 
-    private static int? ResolveStaticImportPaletteIndex(D3DMeshLayout layout, SkeletonData? referenceSkeleton)
+    private static int? ResolveStaticImportPaletteIndex(D3DMeshLayout layout, SkeletonData? referenceSkeleton, GameConfig? gameConfig)
     {
         if (layout.BonePalettes.Count == 0)
         {
@@ -554,7 +557,7 @@ public static class MeshReinserter
                 }
             }
 
-            return AddCustomBonePalette(layout, [rootHash], MaxPaletteBonesForLayout(layout));
+            return AddCustomBonePalette(layout, [rootHash], MaxPaletteBonesForLayout(layout, gameConfig));
         }
 
         for (var i = 0; i < layout.BonePalettes.Count; i++)
@@ -586,7 +589,8 @@ public static class MeshReinserter
         GltfPrimitive primitive,
         PrimitiveJointUsage usage,
         IReadOnlyDictionary<string, string>? textureSlots,
-        int preferredPalette)
+        int preferredPalette,
+        int maxPaletteBones)
     {
         var trianglesByPalette = new Dictionary<int, List<int>>();
         var failedTriangles = 0;
@@ -607,8 +611,13 @@ public static class MeshReinserter
 
             if (FindCoveringPalette(layout, triangleHashes, preferredPalette) is not { } paletteIndex)
             {
-                failedTriangles++;
-                continue;
+                if (triangleHashes.Count > maxPaletteBones)
+                {
+                    failedTriangles++;
+                    continue;
+                }
+
+                paletteIndex = AddCustomBonePalette(layout, triangleHashes, maxPaletteBones);
             }
 
             if (!trianglesByPalette.TryGetValue(paletteIndex, out var indices))
@@ -867,7 +876,8 @@ public static class MeshReinserter
         GameConfig? gameConfig,
         out ulong hash)
     {
-        if (gameConfig?.IsOriginalTalesFromTheBorderlandsPc == true &&
+        if ((gameConfig?.IsOriginalTalesFromTheBorderlandsPc == true ||
+             gameConfig?.Id == GameId.GameOfThrones) &&
             referenceSkeleton is not null)
         {
             if (TryResolveTftbJointHash(gltfJoint, model, referenceSkeleton, gameConfig, out hash))
@@ -1245,6 +1255,9 @@ public static class MeshReinserter
                      "gradient",
                      "tex10",
                      "shadow",
+                     "emissive",
+                     "alternate_bump",
+                     "occlusion",
                  })
         {
             if (!PrimitiveProvidesSlot(textureSlotsByPrimitive, primitiveIndex, slot))

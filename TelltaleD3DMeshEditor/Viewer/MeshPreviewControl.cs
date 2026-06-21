@@ -777,6 +777,7 @@ public sealed class MeshPreviewControl : Control
                     var bakeU = a.BakeU * w0 + b.BakeU * w1 + c.BakeU * w2;
                     var bakeV = a.BakeV * w0 + b.BakeV * w1 + c.BakeV * w2;
                     color = ApplyBake(color, textures.Bake, bakeU, bakeV);
+                    color = ApplyOcclusion(color, textures.Occlusion, u, v);
                     var shadowU = a.ShadowU * w0 + b.ShadowU * w1 + c.ShadowU * w2;
                     var shadowV = a.ShadowV * w0 + b.ShadowV * w1 + c.ShadowV * w2;
                     color = ApplyShadow(color, textures.Shadow, shadowU, shadowV);
@@ -2049,6 +2050,25 @@ public sealed class MeshPreviewControl : Control
         var shadowArgb = shadow.SampleClamped(u, v);
         var alpha = ((shadowArgb >> 24) & 0xFF) / 255f;
         var factor = 0.78f + alpha * 0.22f;
+        var a = (baseArgb >> 24) & 0xFF;
+        var r = (baseArgb >> 16) & 0xFF;
+        var g = (baseArgb >> 8) & 0xFF;
+        var b = baseArgb & 0xFF;
+        return Color.FromArgb(a, (int)(r * factor), (int)(g * factor), (int)(b * factor)).ToArgb();
+    }
+
+    private static int ApplyOcclusion(int baseArgb, TextureImage? occlusion, float u, float v)
+    {
+        if (occlusion is null)
+        {
+            return baseArgb;
+        }
+
+        var aoArgb = occlusion.Sample(u, v);
+        var ao = (((aoArgb >> 16) & 0xFF) * 0.30f +
+                  ((aoArgb >> 8) & 0xFF) * 0.59f +
+                  (aoArgb & 0xFF) * 0.11f) / 255f;
+        var factor = 0.55f + ao * 0.45f;
         var a = (baseArgb >> 24) & 0xFF;
         var r = (baseArgb >> 16) & 0xFF;
         var g = (baseArgb >> 8) & 0xFF;

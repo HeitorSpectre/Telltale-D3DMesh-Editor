@@ -10,10 +10,11 @@ namespace TelltaleD3DMeshEditor.Reinsert;
 public static class ReinsertTextureService
 {
     private const int MaxGeneratedTextureNameLength = 96;
-    private static readonly HashSet<string> TextureSlotsV13 = new(StringComparer.OrdinalIgnoreCase)
+    private static readonly HashSet<string> TextureSlots = new(StringComparer.OrdinalIgnoreCase)
     {
         "diffuse", "bake", "bump", "environment", "detail_diffuse", "detail_bump",
-        "specular", "tex8", "gradient", "tex10", "shadow"
+        "specular", "tex8", "gradient", "tex10", "shadow", "emissive",
+        "alternate_bump", "occlusion"
     };
     private static readonly HashSet<string> SharedOriginalReplacementTextureNames = new(StringComparer.OrdinalIgnoreCase)
     {
@@ -57,7 +58,8 @@ public static class ReinsertTextureService
         var originalTextureNamePool = useOriginalNameTickets
             ? BuildOriginalTextureNamePool(templateMeshPath)
             : OriginalTextureNamePool.Empty;
-        var semanticTemplateNames = nameMode == ResolvedTextureNameMode.SemanticTemplateNames
+        var semanticTemplateNames = nameMode == ResolvedTextureNameMode.SemanticTemplateNames ||
+                                    (gameConfig ?? GameConfig.Current).Id == GameId.GameOfThrones
             ? BuildSemanticTemplateNames(templateMeshPath, gameConfig)
             : new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
         var bumpResolver = StrippedLineTextureRecovery.BuildBumpResolver(templateMeshPath);
@@ -86,7 +88,12 @@ public static class ReinsertTextureService
                 var imageKey = ImageKey(image);
                 if (!writtenByImage.TryGetValue(imageKey, out var textureName))
                 {
-                    if (TryResolveGameProvidedTextureName(templateMeshPath, image.Name, out var gameProvidedName))
+                    var gotSharedTemplateName = ResolveGameOfThronesSharedTemplateName(
+                        image.Name,
+                        normalizedReference,
+                        semanticTemplateNames,
+                        gameConfig);
+                    if (TryResolveGameProvidedTextureName(templateMeshPath, gotSharedTemplateName ?? image.Name, out var gameProvidedName))
                     {
                         if (ShouldMapWithoutEmittingGameProvidedTexture(gameProvidedName) ||
                             CopyGameProvidedTextureIfAvailable(templateMeshPath, outputFolder, gameProvidedName, writtenNames))
@@ -123,7 +130,9 @@ public static class ReinsertTextureService
                         semanticTemplateName,
                         nameMode,
                         useOriginalNameTickets,
-                        preserveTemplateName: preserveDiffuseName || sourceImageMatches);
+                        preserveTemplateName: preserveDiffuseName ||
+                                              sourceImageMatches ||
+                                              gameConfig?.PreserveSecondaryTextureNamesOnReimport == true);
                     if (FindSourceTextureTemplate(templateMeshPath, textureName) is { } chosenSourceTexturePath)
                     {
                         sourceTexturePath = chosenSourceTexturePath;
@@ -176,8 +185,20 @@ public static class ReinsertTextureService
                     continue;
                 }
 
+                if (IsNativeGameOfThronesSharedTextureName(image.Name, gameConfig) &&
+                    writtenByImage.TryGetValue(slotImageKey, out var nativeGotSharedTextureName))
+                {
+                    slots[normalizedSlot] = nativeGotSharedTextureName;
+                    continue;
+                }
+
                 var semanticSlotName = ResolveSemanticTemplateName(primitive, image.Name, normalizedSlot, semanticTemplateNames, gameConfig);
-                if (TryResolveGameProvidedTextureName(templateMeshPath, semanticSlotName ?? image.Name, out var slotGameProvidedName))
+                var gotSharedTemplateName = ResolveGameOfThronesSharedTemplateName(
+                    image.Name,
+                    normalizedSlot,
+                    semanticTemplateNames,
+                    gameConfig);
+                if (TryResolveGameProvidedTextureName(templateMeshPath, gotSharedTemplateName ?? semanticSlotName ?? image.Name, out var slotGameProvidedName))
                 {
                     if (ShouldMapWithoutEmittingGameProvidedTexture(slotGameProvidedName) ||
                         CopyGameProvidedTextureIfAvailable(templateMeshPath, outputFolder, slotGameProvidedName, writtenNames))
@@ -739,7 +760,7 @@ public static class ReinsertTextureService
     private static string NormalizeTextureSlotName(string slot)
         => slot.Equals("normal", StringComparison.OrdinalIgnoreCase) ? "bump" : slot;
 
-    private static bool IsSupportedTextureSlot(string slot) => TextureSlotsV13.Contains(slot);
+    private static bool IsSupportedTextureSlot(string slot) => TextureSlots.Contains(slot);
 
     private static bool ShouldUseOriginalNameTickets(
         GltfModel model,
@@ -1273,6 +1294,20 @@ public static class ReinsertTextureService
 
         if (nameMode == ResolvedTextureNameMode.PreferTemplateNames)
         {
+            if (preserveTemplateName &&
+                sourceTexturePath is not null &&
+                TexturePathStemEquals(sourceTexturePath, rawName) &&
+                TryReservePreservedName(Path.GetFileName(sourceTexturePath), reservedNames) is { } exactSourceName)
+            {
+                return exactSourceName;
+            }
+
+            if (semanticTemplateName is not null &&
+                TryReservePreservedName(semanticTemplateName, reservedNames) is { } semanticName)
+            {
+                return semanticName;
+            }
+
             if (useOriginalNameTickets)
             {
                 foreach (var preferred in preferredOriginalNames)
@@ -1333,6 +1368,10 @@ public static class ReinsertTextureService
             ? TryReservePreservedName(name, reservedNames)
             : null;
     }
+
+    private static bool TexturePathStemEquals(string path, string name)
+        => StripKnownTextureExtension(Path.GetFileName(path))
+            .Equals(StripKnownTextureExtension(Path.GetFileName(name)), StringComparison.OrdinalIgnoreCase);
 
     private static string? FindSourceTextureTemplateForMode(
         string templateMeshPath,
@@ -1436,11 +1475,79 @@ public static class ReinsertTextureService
         return null;
     }
 
+    private static string? ResolveGameOfThronesSharedTemplateName(
+        string imageName,
+        string slot,
+        IReadOnlyDictionary<string, string> semanticTemplateNames,
+        GameConfig? gameConfig)
+    {
+        if ((gameConfig ?? GameConfig.Current).Id != GameId.GameOfThrones ||
+            semanticTemplateNames.Count == 0 ||
+            !IsGameOfThronesSharedSourceName(imageName))
+        {
+            return null;
+        }
+
+        var semantic = ClassifySourceTextureSemantic(imageName, gameConfig);
+        if (semantic is null)
+        {
+            return null;
+        }
+
+        var normalizedSlot = NormalizeTextureSlotName(slot);
+        if (semanticTemplateNames.TryGetValue(SemanticKey(semantic, normalizedSlot), out var templateName))
+        {
+            return templateName;
+        }
+
+        foreach (var fallbackSemantic in FallbackSemantics(semantic))
+        {
+            if (semanticTemplateNames.TryGetValue(SemanticKey(fallbackSemantic, normalizedSlot), out templateName))
+            {
+                return templateName;
+            }
+        }
+
+        return null;
+    }
+
+    private static bool IsGameOfThronesSharedSourceName(string name)
+    {
+        var stem = StripKnownTextureExtension(Path.GetFileName(name)).ToLowerInvariant();
+        return stem is "map_1px_alpha" or "color_000" ||
+               stem.StartsWith("sk_sharedparts", StringComparison.Ordinal) ||
+               stem.StartsWith("bmap_sk_sharedparts", StringComparison.Ordinal);
+    }
+
+    private static bool IsNativeGameOfThronesSharedTextureName(string name, GameConfig? gameConfig)
+    {
+        if ((gameConfig ?? GameConfig.Current).Id != GameId.GameOfThrones)
+        {
+            return false;
+        }
+
+        var stem = StripKnownTextureExtension(Path.GetFileName(name)).ToLowerInvariant();
+        return stem.StartsWith("sk_gotsharedparts", StringComparison.Ordinal) ||
+               stem.StartsWith("bmap_sk_gotsharedparts", StringComparison.Ordinal);
+    }
+
     private static IEnumerable<string> FallbackSemantics(string semantic)
     {
+        if (semantic.Equals("eyelens", StringComparison.OrdinalIgnoreCase) ||
+            semantic.Equals("eyespupil", StringComparison.OrdinalIgnoreCase))
+        {
+            yield return "eye";
+        }
+
         if (semantic.Equals("teeth", StringComparison.OrdinalIgnoreCase))
         {
             yield return "mouth";
+        }
+
+        if (semantic.Equals("bodyupper", StringComparison.OrdinalIgnoreCase) ||
+            semantic.Equals("bodylower", StringComparison.OrdinalIgnoreCase))
+        {
+            yield return "body";
         }
     }
 
@@ -1469,6 +1576,34 @@ public static class ReinsertTextureService
     private static string? ClassifySemantic(string text, bool template, GameConfig? gameConfig)
     {
         var lower = text.ToLowerInvariant();
+        if (gameConfig?.Id == GameId.GameOfThrones)
+        {
+            if (lower.Contains("bodyupper") || lower.Contains("body_upper") || lower.Contains("upperbody") || lower.Contains("upper_body"))
+            {
+                return "bodyupper";
+            }
+
+            if (lower.Contains("bodylower") || lower.Contains("body_lower") || lower.Contains("lowerbody") || lower.Contains("lower_body"))
+            {
+                return "bodylower";
+            }
+
+            if (lower.Contains("hands") || lower.Contains("_hand") || lower.Contains("hand_"))
+            {
+                return "hands";
+            }
+
+            if (lower.Contains("eyespupil") || lower.Contains("eye_pupil") || lower.Contains("pupil") || lower.Contains("color_000"))
+            {
+                return "eyespupil";
+            }
+
+            if (lower.Contains("eyelens") || lower.Contains("eye_lens") || lower.Contains("map_1px_alpha"))
+            {
+                return "eyelens";
+            }
+        }
+
         if (lower.Contains("eyelash") || lower.Contains("eyelashes"))
         {
             return "eyelashes";
@@ -1584,7 +1719,7 @@ public static class ReinsertTextureService
 
         var allNames = new List<string>();
         var bySlot = new Dictionary<string, IReadOnlyList<string>>(StringComparer.OrdinalIgnoreCase);
-        foreach (var slot in TextureSlotsV13)
+        foreach (var slot in TextureSlots)
         {
             var slotNames = new List<string>();
             foreach (var submesh in templateMesh.Submeshes)
@@ -1667,6 +1802,8 @@ public static class ReinsertTextureService
         return !SharedOriginalReplacementTextureNames.Contains(stem) &&
                !stem.StartsWith("map_1px", StringComparison.OrdinalIgnoreCase) &&
                !stem.StartsWith("sk_sharedparts_", StringComparison.OrdinalIgnoreCase) &&
+               !stem.StartsWith("sk_gotsharedparts_", StringComparison.OrdinalIgnoreCase) &&
+               !stem.StartsWith("bmap_sk_gotsharedparts_", StringComparison.OrdinalIgnoreCase) &&
                !stem.StartsWith("map_gradient", StringComparison.OrdinalIgnoreCase);
     }
 
@@ -1686,7 +1823,9 @@ public static class ReinsertTextureService
         return stem.StartsWith("color_", StringComparison.Ordinal) ||
                stem.StartsWith("map_", StringComparison.Ordinal) ||
                stem.StartsWith("sk_sharedparts", StringComparison.Ordinal) ||
-               stem.StartsWith("bmap_sk_sharedparts", StringComparison.Ordinal);
+               stem.StartsWith("bmap_sk_sharedparts", StringComparison.Ordinal) ||
+               stem.StartsWith("sk_gotsharedparts", StringComparison.Ordinal) ||
+               stem.StartsWith("bmap_sk_gotsharedparts", StringComparison.Ordinal);
     }
 
     private static bool ShouldMapWithoutEmittingGameProvidedTexture(string? name)

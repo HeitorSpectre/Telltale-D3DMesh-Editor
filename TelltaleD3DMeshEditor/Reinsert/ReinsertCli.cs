@@ -2004,6 +2004,11 @@ public static class ReinsertCli
             return GameConfig.MinecraftStoryMode;
         }
 
+        if (IsGameOfThronesPath(text))
+        {
+            return GameConfig.GameOfThrones;
+        }
+
         if (IsTalesFromTheBorderlandsOldPath(text))
         {
             return GameConfig.TalesFromTheBorderlandsOld;
@@ -2041,6 +2046,13 @@ public static class ReinsertCli
                text.Contains("Tales from the Borderlands", StringComparison.OrdinalIgnoreCase) ||
                text.Contains("Borderlands", StringComparison.OrdinalIgnoreCase);
     }
+
+    private static bool IsGameOfThronesPath(string text)
+        => text.Contains("Game of Thrones", StringComparison.OrdinalIgnoreCase) ||
+           text.Contains("GameOfThrones", StringComparison.OrdinalIgnoreCase) ||
+           text.Contains("Telltale Games Series", StringComparison.OrdinalIgnoreCase) ||
+           text.Contains("GOT _", StringComparison.OrdinalIgnoreCase) ||
+           text.Contains("GOT_", StringComparison.OrdinalIgnoreCase);
 
     private static bool IsTalesFromTheBorderlandsOldPath(string text)
         => !text.Contains("2021", StringComparison.OrdinalIgnoreCase) &&
