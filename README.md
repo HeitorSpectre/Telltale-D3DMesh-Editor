@@ -33,7 +33,8 @@ https://github.com/HeitorSpectre/Telltale-D3DMesh-Editor/wiki
 | PC | Minecraft: Story Mode | ✅ Working |
 | PC | Back to the Future: The Game | 🚧 In Progress |
 | PC | Tales from the Borderlands | ✅ Working |
-| PC | Game of Thrones - A Telltale Games Series | 🚧 In Progress |
+| PC | Game of Thrones - A Telltale Games Series | ✅ Working |
+| PC | The Walking Dead: Michonne | 🚧 In Progress |
 
 ## Help with testing
 
