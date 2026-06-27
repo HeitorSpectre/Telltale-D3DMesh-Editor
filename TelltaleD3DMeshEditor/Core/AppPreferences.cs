@@ -26,6 +26,15 @@ public sealed record AppPreferences
     // compatible face rigs follow target lipsync, but remains off by default because mismatched rigs can
     // deform the mouth.
     public bool NormalizeFacialBonesOnReimport { get; init; }
+    public bool DiscordRichPresence { get; init; }
+    public bool DiscordInviteAccepted { get; init; }
+    public DateTime? DiscordInviteLastDismissedUtc { get; init; }
+
+    // UI language code (e.g. "en", "pt-BR", "es"). Null means the user has not chosen one yet, in which
+    // case the tool auto-detects the closest language to the Windows UI culture on first run. The picker
+    // in Settings is populated from the Languages/ folder next to the executable, so the community can add
+    // a new language by dropping a <code>.json file there.
+    public string? Language { get; init; }
 
     private static readonly JsonSerializerOptions JsonOptions = new()
     {
@@ -76,7 +85,8 @@ public sealed record AppPreferences
         bool matchOriginalModelSize,
         bool normalizeFacialBonesOnReimport,
         bool viewerAntiAliasing,
-        bool viewerFlightCamera)
+        bool viewerFlightCamera,
+        bool discordRichPresence)
     {
         var current = Load();
         Save(current with
@@ -88,7 +98,30 @@ public sealed record AppPreferences
             NormalizeFacialBonesOnReimport = normalizeFacialBonesOnReimport,
             ViewerAntiAliasing = viewerAntiAliasing,
             ViewerFlightCamera = viewerFlightCamera,
+            DiscordRichPresence = discordRichPresence,
         });
+    }
+
+    public static void SaveLanguage(string languageCode)
+    {
+        var current = Load();
+        Save(current with { Language = languageCode });
+    }
+
+    public static void SaveDiscordInviteAccepted()
+    {
+        var current = Load();
+        Save(current with
+        {
+            DiscordInviteAccepted = true,
+            DiscordInviteLastDismissedUtc = DateTime.UtcNow,
+        });
+    }
+
+    public static void SaveDiscordInviteDismissed()
+    {
+        var current = Load();
+        Save(current with { DiscordInviteLastDismissedUtc = DateTime.UtcNow });
     }
 
     private static void Save(AppPreferences prefs)

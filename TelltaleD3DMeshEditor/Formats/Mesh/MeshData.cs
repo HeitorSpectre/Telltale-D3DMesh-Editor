@@ -8,6 +8,7 @@ public sealed class MeshData
     public int Version { get; init; }
     public List<SubmeshData> Submeshes { get; } = [];
     public List<ulong[]> BonePalettes { get; } = [];
+    public List<List<BonePaletteEntryData>> BonePaletteEntries { get; } = [];
     public int VertexCount => Submeshes.Sum(s => s.Vertices.Count);
     public int FaceCount => Submeshes.Sum(s => s.Faces.Count);
 
@@ -27,6 +28,27 @@ public sealed class MeshData
             vertices.Max(v => v.Y),
             vertices.Max(v => v.Z));
     }
+}
+
+public readonly record struct BonePaletteEntryData(
+    ulong Hash,
+    float MinX,
+    float MinY,
+    float MinZ,
+    float MaxX,
+    float MaxY,
+    float MaxZ,
+    float CenterX,
+    float CenterY,
+    float CenterZ,
+    float Radius)
+{
+    public bool HasBounds => Radius > 0.000001f ||
+                             Math.Abs(MaxX - MinX) > 0.000001f ||
+                             Math.Abs(MaxY - MinY) > 0.000001f ||
+                             Math.Abs(MaxZ - MinZ) > 0.000001f;
+
+    public System.Numerics.Vector3 Center => new(CenterX, CenterY, CenterZ);
 }
 
 public sealed class SubmeshData
@@ -93,4 +115,8 @@ public readonly record struct VertexData(
     float TangentX = 0f,
     float TangentY = 0f,
     float TangentZ = 0f,
-    float TangentW = 0f);
+    float TangentW = 0f,
+    float U5 = 0f,
+    float V5 = 0f,
+    float U6 = 0f,
+    float V6 = 0f);

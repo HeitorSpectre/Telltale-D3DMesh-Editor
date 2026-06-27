@@ -75,7 +75,14 @@ public static class TextureHashDatabase
     {
         var names = _names ??= HashNameDb.LoadBinary("TexNames.HashDB");
         var combined = ((ulong)high << 32) | low;
-        if (names.TryGetValue(combined, out var name))
+        // Prefer the actual .d3dtx file next to the mesh: it carries the real, original-case name
+        // (e.g. obj_chairApartmentCoveA), whereas the embedded hash DB only knows the lowercase form the
+        // CRC64 is computed from. Texture names are case-sensitive when written back, so the file wins.
+        if (TryResolveFolderTextureHash(combined, out var name))
+        {
+            return name;
+        }
+        if (names.TryGetValue(combined, out name))
         {
             return StripD3dtxExtension(name);
         }
@@ -83,21 +90,17 @@ public static class TextureHashDatabase
         {
             return name;
         }
-        if (TryResolveFolderTextureHash(combined, out name))
+
+        var swapped = ((ulong)low << 32) | high;
+        if (TryResolveFolderTextureHash(swapped, out name))
         {
             return name;
         }
-
-        var swapped = ((ulong)low << 32) | high;
         if (names.TryGetValue(swapped, out name))
         {
             return StripD3dtxExtension(name);
         }
         if (TryResolveTftbE3TextureHash(swapped, out name))
-        {
-            return name;
-        }
-        if (TryResolveFolderTextureHash(swapped, out name))
         {
             return name;
         }

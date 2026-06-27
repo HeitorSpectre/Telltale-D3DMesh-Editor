@@ -62,6 +62,22 @@ public static class SkeletonResolver
                 candidates = skeletonsByStem[bestKey];
             }
         }
+        if (candidates is null && !GameConfig.Current.IsBackToTheFuture)
+        {
+            // The .skl may EXTEND the mesh name with a numeric variant suffix instead of being a prefix
+            // of it (sk54_zombieAverage -> sk54_zombieAverage200.skl). Prefer the shortest key that is the
+            // mesh stem followed by a digit (the base variant), so "...Mini"/"...Low" siblings don't win.
+            var extending = skeletonsByStem.Keys
+                .Where(key => key.Length > stem.Length && key.StartsWith(stem, StringComparison.OrdinalIgnoreCase))
+                .OrderBy(key => key.Length)
+                .ToList();
+            var extKey = extending.FirstOrDefault(key => char.IsDigit(key[stem.Length]))
+                         ?? extending.FirstOrDefault();
+            if (extKey is not null)
+            {
+                candidates = skeletonsByStem[extKey];
+            }
+        }
 
         if (candidates is null || candidates.Count == 0)
         {

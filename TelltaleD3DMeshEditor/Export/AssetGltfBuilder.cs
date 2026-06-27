@@ -24,6 +24,7 @@ internal static class AssetGltfBuilder
 {
     private const float LineOverlayNormalOffset = 0.0015f;
     private const float SourceAlphaLineOverlayStrength = 1.0f;
+    private static readonly string[] LightmapSlots = ["bake", "lightmap", "light_map", "lighting", "lighting_map"];
 
     public static BuiltAsset Build(
         MeshData mesh,
@@ -98,6 +99,8 @@ internal static class AssetGltfBuilder
             var uv2s = new List<byte>();
             var uv3s = new List<byte>();
             var uv4s = new List<byte>();
+            var uv5s = new List<byte>();
+            var uv6s = new List<byte>();
             var colors = new List<byte>();
             var tangents = BuildTangents(submesh, out var originalTangentWs);
             var hasStoredBinormals = submesh.Vertices.Any(HasStoredBinormal);
@@ -111,6 +114,9 @@ internal static class AssetGltfBuilder
             var lineYs = new List<float>();
             var lineZs = new List<float>();
             var hasVertexColors = false;
+            var exportVertexColors = GameConfig.Current.Id != GameId.WalkingDeadMichonne;
+            var exportMichonneVertexAlpha = GameConfig.Current.Id == GameId.WalkingDeadMichonne &&
+                                            submesh.Vertices.Any(vertex => vertex.ColorA < 0.98f);
 
             var palette = submesh.BonePaletteIndex >= 0 && submesh.BonePaletteIndex < mesh.BonePalettes.Count
                 ? mesh.BonePalettes[submesh.BonePaletteIndex]
@@ -145,12 +151,23 @@ internal static class AssetGltfBuilder
                 GltfCommon.AddFloat(uv2s, v.U2); GltfCommon.AddFloat(uv2s, 1f - v.V2);
                 GltfCommon.AddFloat(uv3s, v.U3); GltfCommon.AddFloat(uv3s, 1f - v.V3);
                 GltfCommon.AddFloat(uv4s, v.U4); GltfCommon.AddFloat(uv4s, 1f - v.V4);
-                GltfCommon.AddFloat(colors, vertexColor.R); GltfCommon.AddFloat(colors, vertexColor.G);
-                GltfCommon.AddFloat(colors, vertexColor.B); GltfCommon.AddFloat(colors, vertexColor.A);
-                hasVertexColors |= Math.Abs(vertexColor.R - 1f) > 0.001f ||
-                                   Math.Abs(vertexColor.G - 1f) > 0.001f ||
-                                   Math.Abs(vertexColor.B - 1f) > 0.001f ||
-                                   Math.Abs(vertexColor.A - 1f) > 0.001f;
+                GltfCommon.AddFloat(uv5s, v.U5); GltfCommon.AddFloat(uv5s, 1f - v.V5);
+                GltfCommon.AddFloat(uv6s, v.U6); GltfCommon.AddFloat(uv6s, 1f - v.V6);
+                if (exportVertexColors)
+                {
+                    GltfCommon.AddFloat(colors, vertexColor.R); GltfCommon.AddFloat(colors, vertexColor.G);
+                    GltfCommon.AddFloat(colors, vertexColor.B); GltfCommon.AddFloat(colors, vertexColor.A);
+                    hasVertexColors |= Math.Abs(vertexColor.R - 1f) > 0.001f ||
+                                       Math.Abs(vertexColor.G - 1f) > 0.001f ||
+                                       Math.Abs(vertexColor.B - 1f) > 0.001f ||
+                                       Math.Abs(vertexColor.A - 1f) > 0.001f;
+                }
+                else if (exportMichonneVertexAlpha)
+                {
+                    GltfCommon.AddFloat(colors, 1f); GltfCommon.AddFloat(colors, 1f);
+                    GltfCommon.AddFloat(colors, 1f); GltfCommon.AddFloat(colors, vertexColor.A);
+                    hasVertexColors |= Math.Abs(vertexColor.A - 1f) > 0.001f;
+                }
                 if (exportSkinning)
                 {
                     AddWeightedJoint(joints, v.Weight0, GltfCommon.RemapJoint(v.Bone0, mesh.Version, palette, boneIndexByHash));
@@ -181,6 +198,8 @@ internal static class AssetGltfBuilder
             var uv2Accessor = GltfCommon.AddAccessor(bin, bufferViews, accessors, uv2s.ToArray(), 34962, 5126, vertexCount, "VEC2", null, null);
             var uv3Accessor = GltfCommon.AddAccessor(bin, bufferViews, accessors, uv3s.ToArray(), 34962, 5126, vertexCount, "VEC2", null, null);
             var uv4Accessor = GltfCommon.AddAccessor(bin, bufferViews, accessors, uv4s.ToArray(), 34962, 5126, vertexCount, "VEC2", null, null);
+            var uv5Accessor = GltfCommon.AddAccessor(bin, bufferViews, accessors, uv5s.ToArray(), 34962, 5126, vertexCount, "VEC2", null, null);
+            var uv6Accessor = GltfCommon.AddAccessor(bin, bufferViews, accessors, uv6s.ToArray(), 34962, 5126, vertexCount, "VEC2", null, null);
             var colorAccessor = hasVertexColors
                 ? GltfCommon.AddAccessor(bin, bufferViews, accessors, colors.ToArray(), 34962, 5126, vertexCount, "VEC4", null, null)
                 : (int?)null;
@@ -204,6 +223,10 @@ internal static class AssetGltfBuilder
 
             var materialName = submesh.MaterialName ?? submesh.Name;
             var materialKey = BuildMaterialKey(submesh, materialName);
+            if (exportMichonneVertexAlpha)
+            {
+                materialKey += "|__twdm_vertex_alpha";
+            }
             if (!materialMap.TryGetValue(materialKey, out var materialIndex))
             {
                 materialIndex = materials.Count;
@@ -250,6 +273,11 @@ internal static class AssetGltfBuilder
                         materialDict["doubleSided"] = true;
                     }
                 }
+                if (exportMichonneVertexAlpha)
+                {
+                    materialDict["alphaMode"] = "BLEND";
+                    materialDict["doubleSided"] = true;
+                }
                 if (TryGetSlotTexture(submesh.TextureNames, textureIndexByName, "bump", out var normalTextureName, out var normalTexIndex))
                 {
                     if (!ShouldSkipGltfNormalTexture(normalTextureName, materialName))
@@ -277,6 +305,17 @@ internal static class AssetGltfBuilder
                         ["texCoord"] = TexCoordForSlot("occlusion"),
                     };
                 }
+                else if (TryGetLightmapSlotTexture(submesh.TextureNames, textureIndexByName, out _, out var bakeTexIndex))
+                {
+                    // glTF has no official Telltale-style baked lightmap slot. Bind the bake as the
+                    // closest standard material texture so GLB viewers/editors carry it visibly, while
+                    // extras.telltaleTextures below still preserves the original "bake" slot for reimport.
+                    materialDict["occlusionTexture"] = new Dictionary<string, object>
+                    {
+                        ["index"] = bakeTexIndex,
+                        ["texCoord"] = TexCoordForSlot("bake"),
+                    };
+                }
                 var telltaleTextures = BuildTelltaleTextureExtras(submesh.TextureNames, textureIndexByName);
                 if (telltaleTextures.Count > 0)
                 {
@@ -297,6 +336,8 @@ internal static class AssetGltfBuilder
                 ["TEXCOORD_1"] = uv2Accessor,
                 ["TEXCOORD_2"] = uv3Accessor,
                 ["TEXCOORD_3"] = uv4Accessor,
+                ["TEXCOORD_4"] = uv5Accessor,
+                ["TEXCOORD_5"] = uv6Accessor,
             };
             if (jointAccessor is not null && weightAccessor is not null)
             {
@@ -862,6 +903,27 @@ internal static class AssetGltfBuilder
                textureIndexByName.TryGetValue(textureName, out textureIndex);
     }
 
+    // Toolkit and imported assets occasionally call the same Telltale bake channel "lightmap"
+    // or "lighting_map". Export it through the normal glTF carrier regardless of that alias.
+    private static bool TryGetLightmapSlotTexture(
+        IReadOnlyDictionary<string, string> textureNames,
+        IReadOnlyDictionary<string, int> textureIndexByName,
+        out string textureName,
+        out int textureIndex)
+    {
+        foreach (var slot in LightmapSlots)
+        {
+            if (TryGetSlotTexture(textureNames, textureIndexByName, slot, out textureName, out textureIndex))
+            {
+                return true;
+            }
+        }
+
+        textureName = "";
+        textureIndex = -1;
+        return false;
+    }
+
     private static bool TryGetDetailOverlayTexture(
         IReadOnlyDictionary<string, string> textureNames,
         IReadOnlyDictionary<string, int> textureIndexByName,
@@ -1213,7 +1275,8 @@ internal static class AssetGltfBuilder
     {
         return slot.ToLowerInvariant() switch
         {
-            "bake" => 1,
+            "bake" or "lightmap" or "light_map" or "lighting" or "lighting_map"
+                => GameConfig.Current.Id == GameId.WalkingDeadMichonne ? 5 : 1,
             "detail_diffuse" => 2,
             "detail_bump" => 2,
             "shadow" => 3,

@@ -34,6 +34,7 @@ public static class TextureResolver
         var occlusionFiles = textureFiles
             .Where(candidate => candidate.Role == TextureRole.Occlusion)
             .ToList();
+        var meshBake = FindMeshBakeTexture(bakeFiles, meshPath);
         var diffuseReferences = BuildDiffuseReferenceStems(mesh);
         var result = new Dictionary<int, MaterialTextureSet>();
         if (textureFiles.Count == 0)
@@ -51,7 +52,7 @@ public static class TextureResolver
                 Diffuse = LoadMatched(diffuse, loaded),
                 Detail = LoadMatched(FindBestTexture(textureFiles, detailFiles, mesh.Submeshes[i], TextureRole.Detail), loaded),
                 Normal = LoadMatched(FindBestTexture(textureFiles, normalFiles, mesh.Submeshes[i], TextureRole.Normal), loaded),
-                Bake = LoadMatched(FindBestTexture(textureFiles, bakeFiles, mesh.Submeshes[i], TextureRole.Bake), loaded),
+                Bake = LoadMatched(FindBestTexture(textureFiles, bakeFiles, mesh.Submeshes[i], TextureRole.Bake) ?? meshBake, loaded),
                 Shadow = LoadMatched(FindBestTexture(textureFiles, shadowFiles, mesh.Submeshes[i], TextureRole.Shadow), loaded),
                 Occlusion = LoadMatched(FindBestTexture(textureFiles, occlusionFiles, mesh.Submeshes[i], TextureRole.Occlusion), loaded),
             };
@@ -59,6 +60,7 @@ public static class TextureResolver
             ApplyCompanionAlpha(set, diffuse, textureFiles, loaded, diffuseReferences);
             ApplyBackToTheFutureDiffuseAlpha(set, diffuse, mesh.Submeshes[i]);
             ApplyBackToTheFutureGlassAlpha(set, mesh.Submeshes[i]);
+            AddAuxiliaryTextures(set, mesh.Submeshes[i], textureFiles, loaded);
 
             if (set.Count > 0)
             {
@@ -67,6 +69,64 @@ public static class TextureResolver
         }
 
         return result;
+    }
+
+    private static void AddAuxiliaryTextures(
+        MaterialTextureSet set,
+        SubmeshData submesh,
+        IReadOnlyList<TextureCandidate> textureFiles,
+        Dictionary<string, TextureImage> loaded)
+    {
+        var primary = new HashSet<TextureImage>();
+        AddPrimaryTexture(primary, set.Diffuse);
+        AddPrimaryTexture(primary, set.Detail);
+        AddPrimaryTexture(primary, set.Normal);
+        AddPrimaryTexture(primary, set.Bake);
+        AddPrimaryTexture(primary, set.Shadow);
+        AddPrimaryTexture(primary, set.Occlusion);
+
+        foreach (var (slot, textureName) in submesh.TextureNames)
+        {
+            if (IsPrimaryTextureSlot(slot) ||
+                string.IsNullOrWhiteSpace(textureName) ||
+                !TryFindExactTexture(textureName, textureFiles, out var candidate))
+            {
+                continue;
+            }
+
+            var texture = LoadMatched(candidate, loaded);
+            if (texture is null || primary.Contains(texture) || set.Auxiliary.Values.Any(existing => ReferenceEquals(existing, texture)))
+            {
+                continue;
+            }
+
+            set.Auxiliary[slot] = texture;
+        }
+    }
+
+    private static void AddPrimaryTexture(HashSet<TextureImage> primary, TextureImage? texture)
+    {
+        if (texture is not null)
+        {
+            primary.Add(texture);
+        }
+    }
+
+    private static bool IsPrimaryTextureSlot(string slot)
+    {
+        return slot.Equals("diffuse", StringComparison.OrdinalIgnoreCase) ||
+               slot.Equals("bump", StringComparison.OrdinalIgnoreCase) ||
+               slot.Equals("detail_bump", StringComparison.OrdinalIgnoreCase) ||
+               slot.Equals("detail_diffuse", StringComparison.OrdinalIgnoreCase) ||
+               slot.Equals("tex7", StringComparison.OrdinalIgnoreCase) ||
+               slot.Equals("tex8", StringComparison.OrdinalIgnoreCase) ||
+               slot.Equals("bake", StringComparison.OrdinalIgnoreCase) ||
+               slot.Equals("lightmap", StringComparison.OrdinalIgnoreCase) ||
+               slot.Equals("light_map", StringComparison.OrdinalIgnoreCase) ||
+               slot.Equals("lighting", StringComparison.OrdinalIgnoreCase) ||
+               slot.Equals("lighting_map", StringComparison.OrdinalIgnoreCase) ||
+               slot.Equals("shadow", StringComparison.OrdinalIgnoreCase) ||
+               slot.Equals("occlusion", StringComparison.OrdinalIgnoreCase);
     }
 
     // For games that keep opacity in a separate companion texture (e.g. The Walking Dead: Season 2 hair
@@ -481,6 +541,30 @@ public static class TextureResolver
         return null;
     }
 
+    private static TextureCandidate? FindMeshBakeTexture(
+        IReadOnlyList<TextureCandidate> bakeFiles,
+        string meshPath)
+    {
+        if (!GameConfig.Current.TreatAdvObj000TexturesAsBake)
+        {
+            return null;
+        }
+
+        var meshStem = NormalizeStem(Path.GetFileNameWithoutExtension(meshPath));
+        if (string.IsNullOrWhiteSpace(meshStem))
+        {
+            return null;
+        }
+
+        var expected = meshStem + "_000";
+        var match = bakeFiles.FirstOrDefault(file =>
+            NormalizeStem(Path.GetFileNameWithoutExtension(file.Path))
+                .Equals(expected, StringComparison.OrdinalIgnoreCase));
+        // FirstOrDefault returns a default struct when the mesh has no matching *_000 bake.
+        // Do not pass that empty candidate to the loader: its null path becomes a Dictionary key.
+        return string.IsNullOrWhiteSpace(match.Path) ? null : match;
+    }
+
     private static bool TryFindDiffuseSiblingForNormal(
         TextureCandidate normal,
         IReadOnlyList<TextureCandidate> files,
@@ -672,7 +756,7 @@ public static class TextureResolver
             TextureRole.Diffuse => ["diffuse"],
             TextureRole.Detail => ["detail_diffuse", "tex7", "tex8"],
             TextureRole.Normal => ["bump", "detail_bump"],
-            TextureRole.Bake => ["bake"],
+            TextureRole.Bake => ["bake", "lightmap", "light_map", "lighting", "lighting_map"],
             TextureRole.Shadow => ["shadow"],
             TextureRole.Occlusion => ["occlusion"],
             _ => []
@@ -752,6 +836,14 @@ public static class TextureResolver
             if (lower.Contains("_shadow"))
             {
                 return TextureRole.Shadow;
+            }
+
+            if (lower.Contains("lightmap") ||
+                lower.Contains("light_map") ||
+                lower.Contains("lighting_map") ||
+                lower.EndsWith("_lighting"))
+            {
+                return TextureRole.Bake;
             }
 
             if (GameConfig.Current.TreatAdvObj000TexturesAsBake &&

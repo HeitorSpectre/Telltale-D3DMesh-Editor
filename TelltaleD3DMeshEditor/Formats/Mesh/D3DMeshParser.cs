@@ -70,7 +70,7 @@ public static class D3DMeshParser
             return ParseErtmV5(reader, name, version);
         }
 
-        return ParseMsvMesh(reader, name, version);
+        return ParseMsvMesh(reader, name, version, data);
     }
 
     public static MeshData ParseFile(string path)
@@ -79,7 +79,7 @@ public static class D3DMeshParser
         return Parse(File.ReadAllBytes(path));
     }
 
-    private static MeshData ParseMsvMesh(DataReader reader, string name, int version)
+    private static MeshData ParseMsvMesh(DataReader reader, string name, int version, byte[] data)
     {
         if (version is 13 or 14)
         {
@@ -96,6 +96,10 @@ public static class D3DMeshParser
         if (version is 17 or 18)
         {
             return ParseV18(reader, name, version);
+        }
+        if (version == 25)
+        {
+            return ParseV25(reader, name, version);
         }
 
         reader.Skip(version == 1 ? 1 : version >= 13 ? 4 : 5);
@@ -185,7 +189,8 @@ public static class D3DMeshParser
 
         SkipSizedBlock(reader);
 
-        var bonePalettes = ReadBonePalettes(reader, 12);
+        var bonePaletteData = ReadBonePalettes(reader, 12);
+        var bonePalettes = bonePaletteData.Palettes;
 
         SkipSizedBlock(reader);
         SkipSizedBlock(reader);
@@ -253,6 +258,7 @@ public static class D3DMeshParser
 
         var mesh = new MeshData { Name = name, Version = version };
         mesh.BonePalettes.AddRange(bonePalettes);
+        mesh.BonePaletteEntries.AddRange(bonePaletteData.Entries);
         foreach (var info in infos)
         {
             var submesh = new SubmeshData
@@ -381,7 +387,8 @@ public static class D3DMeshParser
 
         SkipSizedBlock(reader);
 
-        var bonePalettes = ReadBonePalettes(reader, 56);
+        var bonePaletteData = ReadBonePalettes(reader, 56);
+        var bonePalettes = bonePaletteData.Palettes;
 
         SkipSizedBlock(reader);
         SkipSizedBlock(reader);
@@ -426,6 +433,7 @@ public static class D3DMeshParser
             {
                 var emptyMesh = new MeshData { Name = name, Version = version };
                 emptyMesh.BonePalettes.AddRange(bonePalettes);
+                emptyMesh.BonePaletteEntries.AddRange(bonePaletteData.Entries);
                 return emptyMesh;
             }
 
@@ -435,6 +443,7 @@ public static class D3DMeshParser
         var multiStream = false;
         var mesh = new MeshData { Name = name, Version = version };
         mesh.BonePalettes.AddRange(bonePalettes);
+        mesh.BonePaletteEntries.AddRange(bonePaletteData.Entries);
         foreach (var info in infos)
         {
             var materialName = info.TextureNames.TryGetValue("diffuse", out var diffuse) ? diffuse : $"material_{info.Index + 1}";
@@ -451,6 +460,294 @@ public static class D3DMeshParser
 
             AppendSubmeshGeometry(submesh, info, vertices, rawFaces, multiStream);
 
+            if (submesh.Vertices.Count > 0 && submesh.Faces.Count > 0)
+            {
+                mesh.Submeshes.Add(submesh);
+            }
+        }
+
+        if (mesh.Submeshes.Count == 0)
+        {
+            if (IsIntentionallyEmptyMesh(facePointCount, infos))
+            {
+                return mesh;
+            }
+
+            throw new InvalidDataException("No submesh with valid triangles was found.");
+        }
+
+        return mesh;
+    }
+
+    private static MeshData ParseV25(DataReader reader, string name, int version)
+    {
+        reader.Skip(1);
+        var materialCount = checked((int)reader.ReadUInt32());
+        if (materialCount == 0)
+        {
+            return new MeshData { Name = name, Version = version };
+        }
+
+        var materialsByHash = new Dictionary<ulong, IReadOnlyDictionary<string, string>>();
+        for (var i = 0; i < materialCount; i++)
+        {
+            var matLow = reader.ReadUInt32();
+            var matHigh = reader.ReadUInt32();
+            reader.Skip(8);
+            var materialEnd = reader.Position + checked((int)reader.ReadUInt32());
+            reader.Skip(12);
+            var materialHashCount = checked((int)reader.ReadUInt32());
+            reader.Skip(materialHashCount * 8);
+            var parameterCount = checked((int)reader.ReadUInt32());
+            var materialTextures = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+            for (var p = 0; p < parameterCount && reader.Position < materialEnd; p++)
+            {
+                var sectionLow = reader.ReadUInt32();
+                var sectionHigh = reader.ReadUInt32();
+                var sectionCount = checked((int)reader.ReadUInt32());
+                if (sectionHigh == 0x52A09151 && sectionLow == 0xF1C3F2C7)
+                {
+                    for (var t = 0; t < sectionCount; t++)
+                    {
+                        var typeLow = reader.ReadUInt32();
+                        var typeHigh = reader.ReadUInt32();
+                        var texLow = reader.ReadUInt32();
+                        var texHigh = reader.ReadUInt32();
+                        var slot = GetV25TextureSlot(typeHigh, typeLow);
+                        if (slot is not null)
+                        {
+                            materialTextures[slot] = TextureHashDatabase.Resolve(texLow, texHigh);
+                        }
+                    }
+                }
+                else
+                {
+                    SkipV25MaterialParameter(reader, sectionHigh, sectionLow, sectionCount, materialEnd);
+                }
+            }
+
+            materialsByHash[((ulong)matHigh << 32) | matLow] = materialTextures;
+            reader.Seek(materialEnd);
+        }
+
+        // The geometry block (T3MeshData mesh data) is an inclusive sized block whose index/face buffer
+        // begins exactly at its end. RTB's Michonne importer derives the face-data offset the same way:
+        // the size is measured from the size field itself, so blockEnd = sizeFieldOffset + size. After
+        // reading the leading u32 and the size u32, reader.Position is sizeFieldOffset + 4, hence
+        // faceDataStart = reader.Position + size - 4.
+        reader.ReadUInt32();
+        var geometryBlockSize = checked((int)reader.ReadUInt32());
+        var faceDataStart = reader.Position + geometryBlockSize - 4;
+
+        var lodBlockEnd = reader.Position + checked((int)reader.ReadUInt32());
+        var lodCount = checked((int)reader.ReadUInt32());
+        var infos = new List<SubmeshInfo>();
+        for (var lod = 1; lod <= lodCount; lod++)
+        {
+            var lodEntryEnd = reader.Position + checked((int)reader.ReadUInt32() - 4);
+            var submeshCount = checked((int)reader.ReadUInt32());
+            for (var i = 0; i < submeshCount; i++)
+            {
+                reader.ReadVec3();
+                reader.ReadVec3();
+                reader.ReadUInt32();
+                reader.Skip(16);
+                reader.ReadUInt32();
+                var vertexMin = checked((int)reader.ReadUInt32() + 1);
+                var vertexMax = checked((int)reader.ReadUInt32() + 1);
+                var facePointStart = checked((int)reader.ReadUInt32());
+                var polygonCount = checked((int)reader.ReadUInt32());
+                var headerLength2 = reader.ReadUInt32();
+                if (headerLength2 == 0x10)
+                {
+                    reader.Skip(8);
+                }
+
+                reader.ReadUInt32();
+                var materialIndex = ReadOptionalIndexPlusOne(reader);
+                var boneSet = ReadOptionalIndexPlusOne(reader);
+                reader.ReadUInt32();
+
+                if (lod == 1)
+                {
+                    infos.Add(new SubmeshInfo(
+                        Index: infos.Count,
+                        BoneSetIndex: boneSet,
+                        VertexMin: vertexMin,
+                        VertexMax: vertexMax,
+                        PolygonStart: facePointStart / 3 + 1,
+                        PolygonCount: polygonCount,
+                        MaterialIndex: materialIndex,
+                        MaterialTint: MaterialTint.White,
+                        TextureNames: new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase)));
+                }
+            }
+
+            reader.ReadUInt32();
+            reader.ReadUInt32();
+            reader.ReadVec3();
+            reader.ReadVec3();
+            reader.ReadUInt32();
+            reader.Skip(16);
+            reader.Skip(8);
+            if (reader.Position < lodEntryEnd)
+            {
+                reader.Seek(lodEntryEnd);
+            }
+        }
+        if (reader.Position < lodBlockEnd)
+        {
+            reader.Seek(lodBlockEnd);
+        }
+
+        SkipV25SizedBlock(reader, static (r, count) => r.Skip(count * 76));
+
+        var materialGroupEnd = reader.Position + checked((int)reader.ReadUInt32() - 4);
+        var materialGroupCount = checked((int)reader.ReadUInt32());
+        var materialTexturesByGroup = new List<IReadOnlyDictionary<string, string>>(materialGroupCount);
+        for (var i = 0; i < materialGroupCount; i++)
+        {
+            reader.ReadUInt32();
+            var matLow = reader.ReadUInt32();
+            var matHigh = reader.ReadUInt32();
+            reader.Skip(8);
+            reader.Skip(24);
+            reader.ReadUInt32();
+            reader.Skip(16);
+            reader.ReadUInt32();
+            var key = ((ulong)matHigh << 32) | matLow;
+            materialTexturesByGroup.Add(materialsByHash.TryGetValue(key, out var materialTextures)
+                ? materialTextures
+                : new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase));
+        }
+        if (reader.Position < materialGroupEnd)
+        {
+            reader.Seek(materialGroupEnd);
+        }
+
+        SkipV25SizedBlock(reader, static (r, count) => r.Skip(count * 16));
+
+        var bonePaletteBlockStart = reader.Position;
+        reader.ReadUInt32();
+        var bonePaletteCount = checked((int)reader.ReadUInt32());
+        var bonePalettes = new List<ulong[]>(bonePaletteCount);
+        var bonePaletteEntries = new List<List<BonePaletteEntryData>>(bonePaletteCount);
+        for (var palette = 0; palette < bonePaletteCount; palette++)
+        {
+            var boneCount = checked((int)reader.ReadUInt32());
+            var hashes = new ulong[boneCount];
+            var entries = new List<BonePaletteEntryData>(boneCount);
+            for (var bone = 0; bone < boneCount; bone++)
+            {
+                var low = reader.ReadUInt32();
+                var high = reader.ReadUInt32();
+                var hash = ((ulong)high << 32) | low;
+                hashes[bone] = hash;
+                var minX = reader.ReadFloat();
+                var minY = reader.ReadFloat();
+                var minZ = reader.ReadFloat();
+                var maxX = reader.ReadFloat();
+                var maxY = reader.ReadFloat();
+                var maxZ = reader.ReadFloat();
+                reader.ReadUInt32();
+                var centerX = reader.ReadFloat();
+                var centerY = reader.ReadFloat();
+                var centerZ = reader.ReadFloat();
+                var radius = reader.ReadFloat();
+                reader.ReadUInt32();
+                entries.Add(new BonePaletteEntryData(hash, minX, minY, minZ, maxX, maxY, maxZ, centerX, centerY, centerZ, radius));
+            }
+
+            bonePalettes.Add(hashes);
+            bonePaletteEntries.Add(entries);
+        }
+
+        SkipSizedBlock(reader);
+        SkipSizedBlock(reader);
+        reader.ReadUInt32();
+        reader.ReadUInt32();
+        reader.ReadVec3();
+        reader.ReadVec3();
+        reader.ReadUInt32();
+        reader.Skip(16);
+        reader.ReadUInt32();
+        reader.ReadUInt32();
+        reader.ReadUInt32();
+
+        var vertexCount = checked((int)reader.ReadUInt32());
+        reader.ReadUInt32();
+        var uvLayerCount = checked((int)reader.ReadUInt32());
+        var uvScales = new V25UvScale[6];
+        for (var i = 0; i < uvScales.Length; i++)
+        {
+            uvScales[i] = new V25UvScale(1f, 1f, 0f, 0f);
+        }
+
+        for (var i = 0; i < uvLayerCount; i++)
+        {
+            var layer = checked((int)reader.ReadUInt32());
+            var scale = new V25UvScale(reader.ReadFloat(), reader.ReadFloat(), reader.ReadFloat(), reader.ReadFloat());
+            if (layer >= 0 && layer < uvScales.Length)
+            {
+                uvScales[layer] = scale;
+            }
+        }
+
+        var descriptors = ReadV25VertexDescriptor(reader);
+        reader.ReadByte();
+
+        reader.Skip(12);
+        var facePointCount = checked((int)reader.ReadUInt32());
+        reader.ReadUInt32();
+        reader.Skip(12);
+        var v25VertexCount = checked((int)reader.ReadUInt32());
+        reader.ReadUInt32();
+        reader.Skip(12);
+        var normalCount = checked((int)reader.ReadUInt32());
+        reader.ReadUInt32();
+        reader.Skip(12);
+        var uvCount = checked((int)reader.ReadUInt32());
+        reader.ReadUInt32();
+        var totalVertices = Math.Max(vertexCount, v25VertexCount);
+        reader.Seek(faceDataStart);
+        var rawFaces = new List<(int A, int B, int C)>();
+        for (var i = 0; i < facePointCount / 3; i++)
+        {
+            rawFaces.Add((reader.ReadUInt16() + 1, reader.ReadUInt16() + 1, reader.ReadUInt16() + 1));
+        }
+
+        var vertices = ReadV25Vertices(reader, totalVertices, normalCount, uvCount, descriptors, uvScales);
+        var mesh = new MeshData { Name = name, Version = version };
+        mesh.BonePalettes.AddRange(bonePalettes);
+        mesh.BonePaletteEntries.AddRange(bonePaletteEntries);
+
+        foreach (var info in infos)
+        {
+            var materialTextures = info.MaterialIndex > 0 && info.MaterialIndex <= materialTexturesByGroup.Count
+                ? materialTexturesByGroup[info.MaterialIndex - 1]
+                : new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+            var materialName = materialTextures.TryGetValue("diffuse", out var diffuseName) &&
+                               !string.IsNullOrWhiteSpace(diffuseName) &&
+                               !diffuseName.Equals("undefined", StringComparison.OrdinalIgnoreCase)
+                ? diffuseName
+                : $"material_{info.Index + 1}";
+            var submesh = new SubmeshData
+            {
+                Name = materialName,
+                MaterialName = materialName,
+                BonePaletteIndex = NormalizePaletteIndex(info.BoneSetIndex, bonePalettes.Count),
+                SourceSubmeshIndex = info.Index,
+            };
+            foreach (var (slot, textureName) in materialTextures)
+            {
+                if (!string.IsNullOrWhiteSpace(textureName) &&
+                    !textureName.Equals("undefined", StringComparison.OrdinalIgnoreCase))
+                {
+                    submesh.TextureNames[slot] = textureName;
+                }
+            }
+
+            AppendSubmeshGeometry(submesh, info, vertices, rawFaces, multiStream: true);
             if (submesh.Vertices.Count > 0 && submesh.Faces.Count > 0)
             {
                 mesh.Submeshes.Add(submesh);
@@ -538,7 +835,8 @@ public static class D3DMeshParser
 
         SkipSizedBlock(reader);
 
-        var bonePalettes = ReadBonePalettes(reader, 56);
+        var bonePaletteData = ReadBonePalettes(reader, 56);
+        var bonePalettes = bonePaletteData.Palettes;
 
         SkipSizedBlock(reader);
         SkipSizedBlock(reader);
@@ -585,6 +883,7 @@ public static class D3DMeshParser
 
         var mesh = new MeshData { Name = name, Version = version };
         mesh.BonePalettes.AddRange(bonePalettes);
+        mesh.BonePaletteEntries.AddRange(bonePaletteData.Entries);
         foreach (var info in infos)
         {
             var materialName = info.TextureNames.TryGetValue("diffuse", out var diffuse) ? diffuse : $"material_{info.Index + 1}";
@@ -943,6 +1242,250 @@ public static class D3DMeshParser
             }
         }
     }
+
+    // V25 (Michonne) material textures are identified by hashes rather than a fixed texture table.
+    // These labels come from the same V25 material map documented by the RTB importer.
+    private static string? GetV25TextureSlot(uint typeHigh, uint typeLow)
+        => (typeHigh, typeLow) switch
+        {
+            (0x8648FA82, 0xD1DBEE1A) or
+            (0xDC6E83A0, 0x253F163A) or
+            (0x94A590DE, 0x74B1F5C1) => "diffuse",
+            (0x4930B970, 0xA7FD511F) or
+            (0xDF7E4122, 0x56E87E74) => "detail_diffuse",
+            (0x1E3F6B9F, 0x2550389D) or
+            (0xB8B04DDF, 0x1796F446) => "bump",
+            (0xCAAAE643, 0x2AF348C0) or
+            (0x62C49575, 0x78189F07) => "occlusion",
+            (0x257C2A45, 0x683F7D2F) or
+            (0x13EEE658, 0x65DFC90F) => "environment",
+            (0xB3022EA7, 0xFD418B40) or
+            (0xBDB4C92A, 0x546FB889) => "emissive",
+            (0xFF787A61, 0xEAC8A5B5) => "ink",
+            _ => null,
+        };
+
+    private static void SkipV25MaterialParameter(DataReader reader, uint high, uint low, int count, int materialEnd)
+    {
+        var bytesPerEntry = (high, low) switch
+        {
+            (0x00000000, 0x00000000) => 0,
+            (0xA98F0652, 0x295DE685) => 0,
+            (0xFA21E4C8, 0x8AE64D31) => 0,
+            (0x254EDC51, 0x7B59BB47) => 0,
+            (0x7CACEEBC, 0xD26D075C) => 0,
+            (0xDED5E193, 0x7B1689EF) => 0,
+            (0x181AFB3E, 0x0BB8F90AE) => 0,
+            (0x8C44858F, 0x42CD32D5) => 0,
+            (0xB76E07D6, 0xBB899BFE) => 24,
+            (0x004F0234, 0x63D89FB0) => 16,
+            (0xBAE4CBD7, 0x7F139A91) => 12,
+            (0x9004C558, 0x7575D6C0) => 9,
+            (0x394C43AF, 0x4FF52C94) => 20,
+            (0x7BBCA244, 0xE61F1A07) => 16,
+            (0xC16762F7, 0x763D62AB) => 24,
+            (0xE2BA743E, 0x952F9338) => 24,
+            _ => -1,
+        };
+
+        if (bytesPerEntry < 0)
+        {
+            reader.Seek(materialEnd);
+            return;
+        }
+
+        reader.Skip(checked(count * bytesPerEntry));
+    }
+
+    private static void SkipV25SizedBlock(DataReader reader, Action<DataReader, int> readEntries)
+    {
+        var end = reader.Position + checked((int)reader.ReadUInt32() - 4);
+        var count = checked((int)reader.ReadUInt32());
+        readEntries(reader, count);
+        if (reader.Position < end)
+        {
+            reader.Seek(end);
+        }
+    }
+
+    private static Dictionary<string, V25VertexElement> ReadV25VertexDescriptor(DataReader reader)
+    {
+        reader.Skip(12);
+        var count = checked((int)reader.ReadUInt32());
+        var result = new Dictionary<string, V25VertexElement>(StringComparer.OrdinalIgnoreCase);
+        for (var i = 0; i < count; i++)
+        {
+            var type = checked((int)reader.ReadUInt32() + 1);
+            var format = checked((int)reader.ReadUInt32() + 1);
+            var layer = checked((int)reader.ReadUInt32() + 1);
+            var buffer = checked((int)reader.ReadUInt32() + 1);
+            var offset = checked((int)reader.ReadUInt32() + 1);
+            var key = type switch
+            {
+                1 => "position",
+                2 when layer == 1 => "normals",
+                2 when layer == 2 => "binormals",
+                3 => "tangents",
+                4 => "weights",
+                5 => "bones",
+                6 when layer == 1 => "colors",
+                6 when layer == 2 => "colors2",
+                7 => $"uv{layer}",
+                _ => "",
+            };
+            if (!string.IsNullOrEmpty(key))
+            {
+                result[key] = new V25VertexElement(buffer, format, offset);
+            }
+        }
+
+        return result;
+    }
+
+    private static List<VertexData> ReadV25Vertices(
+        DataReader reader,
+        int vertexCount,
+        int normalCount,
+        int uvCount,
+        IReadOnlyDictionary<string, V25VertexElement> elements,
+        IReadOnlyList<V25UvScale> uvScales)
+    {
+        var positions = new (float X, float Y, float Z)[vertexCount];
+        var bones = Enumerable.Repeat((0, 0, 0, 0), vertexCount).ToArray();
+        var weights = Enumerable.Repeat((1f, 0f, 0f, 0f), vertexCount).ToArray();
+        for (var i = 0; i < vertexCount; i++)
+        {
+            if (IsV25Element(elements, "position", 1, 3))
+            {
+                positions[i] = (reader.ReadFloat(), reader.ReadFloat(), reader.ReadFloat());
+            }
+            if (IsV25Element(elements, "weights", 1, 21))
+            {
+                weights[i] = NormalizeWeights(
+                    reader.ReadInt16() / 32767f,
+                    reader.ReadInt16() / 32767f,
+                    reader.ReadInt16() / 32767f,
+                    reader.ReadInt16() / 32767f);
+            }
+            if (IsV25Element(elements, "bones", 1, 24))
+            {
+                bones[i] = (reader.ReadByte() / 3, reader.ReadByte() / 3, reader.ReadByte() / 3, reader.ReadByte() / 3);
+            }
+        }
+
+        var normals = Enumerable.Repeat((0f, 1f, 0f), vertexCount).ToArray();
+        for (var i = 0; i < normalCount; i++)
+        {
+            if (IsV25Element(elements, "normals", 2, 21))
+            {
+                var normal = (reader.ReadInt16() / 32767f, reader.ReadInt16() / 32767f, reader.ReadInt16() / 32767f);
+                reader.ReadInt16();
+                if (i < normals.Length)
+                {
+                    normals[i] = normal;
+                }
+            }
+            if (IsV25Element(elements, "binormals", 2, 21))
+            {
+                reader.Skip(8);
+            }
+        }
+
+        var colors = Enumerable.Repeat((1f, 1f, 1f, 1f), vertexCount).ToArray();
+        var uv1 = new (float U, float V)[vertexCount];
+        var uv2 = new (float U, float V)[vertexCount];
+        var uv3 = new (float U, float V)[vertexCount];
+        var uv4 = new (float U, float V)[vertexCount];
+        var uv5 = new (float U, float V)[vertexCount];
+        var uv6 = new (float U, float V)[vertexCount];
+        for (var i = 0; i < uvCount; i++)
+        {
+            if (IsV25Element(elements, "tangents", 3, 21))
+            {
+                reader.Skip(8);
+            }
+
+            // RTB's Michonne importer reads the third buffer in this exact order:
+            // tangents, UV6, UV5, color, color2, UV1, UV2, UV3, UV4.
+            // Reading UV1-4 before the color slots shifts the stream and corrupts texture UVs.
+            ReadV25UvIfPresent(reader, elements, uvScales, 6, i, vertexCount, uv6);
+            ReadV25UvIfPresent(reader, elements, uvScales, 5, i, vertexCount, uv5);
+
+            if (IsV25Element(elements, "colors", 3, 26))
+            {
+                var color = (reader.ReadByte() / 255f, reader.ReadByte() / 255f, reader.ReadByte() / 255f, reader.ReadByte() / 255f);
+                if (i < vertexCount)
+                {
+                    colors[i] = color;
+                }
+            }
+            if (IsV25Element(elements, "colors2", 3, 26))
+            {
+                reader.Skip(4);
+            }
+
+            ReadV25UvIfPresent(reader, elements, uvScales, 1, i, vertexCount, uv1);
+            ReadV25UvIfPresent(reader, elements, uvScales, 2, i, vertexCount, uv2);
+            ReadV25UvIfPresent(reader, elements, uvScales, 3, i, vertexCount, uv3);
+            ReadV25UvIfPresent(reader, elements, uvScales, 4, i, vertexCount, uv4);
+        }
+
+        static void ReadV25UvIfPresent(
+            DataReader reader,
+            IReadOnlyDictionary<string, V25VertexElement> elements,
+            IReadOnlyList<V25UvScale> uvScales,
+            int layer,
+            int index,
+            int vertexCount,
+            (float U, float V)[] target)
+        {
+            if (!elements.TryGetValue($"uv{layer}", out var element) || element.Buffer != 3)
+            {
+                return;
+            }
+
+            var uv = ReadV25Uv(reader, element.Format, uvScales[Math.Clamp(layer - 1, 0, uvScales.Count - 1)]);
+            if (index < vertexCount)
+            {
+                target[index] = uv;
+            }
+        }
+
+        var vertices = new List<VertexData>(vertexCount);
+        for (var i = 0; i < vertexCount; i++)
+        {
+            if (uv2[i] == default) uv2[i] = uv1[i];
+            if (uv3[i] == default) uv3[i] = uv2[i];
+            if (uv4[i] == default) uv4[i] = uv3[i];
+            vertices.Add(new VertexData(
+                positions[i].X, positions[i].Y, positions[i].Z,
+                normals[i].Item1, normals[i].Item2, normals[i].Item3,
+                uv1[i].U, uv1[i].V,
+                uv2[i].U, uv2[i].V,
+                uv3[i].U, uv3[i].V,
+                uv4[i].U, uv4[i].V,
+                bones[i].Item1, bones[i].Item2, bones[i].Item3, bones[i].Item4,
+                weights[i].Item1, weights[i].Item2, weights[i].Item3, weights[i].Item4,
+                colors[i].Item1, colors[i].Item2, colors[i].Item3, colors[i].Item4,
+                U5: uv5[i].U, V5: uv5[i].V,
+                U6: uv6[i].U, V6: uv6[i].V));
+        }
+
+        return vertices;
+    }
+
+    private static bool IsV25Element(IReadOnlyDictionary<string, V25VertexElement> elements, string key, int buffer, int format)
+        => elements.TryGetValue(key, out var element) && element.Buffer == buffer && element.Format == format;
+
+    private static (float U, float V) ReadV25Uv(DataReader reader, int format, V25UvScale scale)
+        => format switch
+        {
+            2 => (reader.ReadFloat(), 1f - reader.ReadFloat()),
+            19 => (
+                reader.ReadInt16() / 32767f * scale.XMult + scale.XStart,
+                1f - (reader.ReadInt16() / 32767f * scale.YMult + scale.YStart)),
+            _ => throw new InvalidDataException($"Unknown V25 UV format: {format}"),
+        };
 
     private static List<VertexData> ReadVerticesV13(
         DataReader reader,
@@ -2120,20 +2663,42 @@ public static class D3DMeshParser
         return raw == uint.MaxValue ? 0 : checked((int)raw + 1);
     }
 
-    private static List<ulong[]> ReadBonePalettes(DataReader reader, int entrySize)
+    private static BonePaletteReadResult ReadBonePalettes(DataReader reader, int entrySize)
     {
         reader.ReadUInt32();
         var paletteCount = checked((int)reader.ReadUInt32());
         var palettes = new List<ulong[]>(paletteCount);
+        var entries = new List<List<BonePaletteEntryData>>(paletteCount);
         for (var i = 0; i < paletteCount; i++)
         {
             var boneCount = checked((int)reader.ReadUInt32());
             var hashes = new ulong[boneCount];
+            var paletteEntries = new List<BonePaletteEntryData>(boneCount);
             for (var bone = 0; bone < boneCount; bone++)
             {
                 var low = reader.ReadUInt32();
                 var high = reader.ReadUInt32();
-                hashes[bone] = ((ulong)high << 32) | low;
+                var hash = ((ulong)high << 32) | low;
+                hashes[bone] = hash;
+                var entryStart = reader.Position - 8;
+                var entry = new BonePaletteEntryData(hash, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0);
+                if (entrySize >= 56)
+                {
+                    entry = new BonePaletteEntryData(
+                        hash,
+                        reader.PeekFloat(entryStart + 8),
+                        reader.PeekFloat(entryStart + 12),
+                        reader.PeekFloat(entryStart + 16),
+                        reader.PeekFloat(entryStart + 20),
+                        reader.PeekFloat(entryStart + 24),
+                        reader.PeekFloat(entryStart + 28),
+                        reader.PeekFloat(entryStart + 36),
+                        reader.PeekFloat(entryStart + 40),
+                        reader.PeekFloat(entryStart + 44),
+                        reader.PeekFloat(entryStart + 48));
+                }
+
+                paletteEntries.Add(entry);
                 var remaining = entrySize - 8;
                 if (remaining > 0)
                 {
@@ -2142,9 +2707,10 @@ public static class D3DMeshParser
             }
 
             palettes.Add(hashes);
+            entries.Add(paletteEntries);
         }
 
-        return palettes;
+        return new BonePaletteReadResult(palettes, entries);
     }
 
     private static int NormalizePaletteIndex(int rawIndex, int paletteCount)
@@ -2345,6 +2911,10 @@ public static class D3DMeshParser
         MaterialTint MaterialTint,
         Dictionary<string, string> TextureNames);
 
+    private sealed record BonePaletteReadResult(
+        List<ulong[]> Palettes,
+        List<List<BonePaletteEntryData>> Entries);
+
     private readonly record struct MaterialTint(float R, float G, float B, float A)
     {
         public static readonly MaterialTint White = new(1f, 1f, 1f, 1f);
@@ -2373,4 +2943,6 @@ public static class D3DMeshParser
         float Uv4Y);
 
     private readonly record struct AttrDescriptor(uint Offset = 0, uint Count = 0, uint Format = 0);
+    private readonly record struct V25UvScale(float XMult, float YMult, float XStart, float YStart);
+    private readonly record struct V25VertexElement(int Buffer, int Format, int Offset);
 }

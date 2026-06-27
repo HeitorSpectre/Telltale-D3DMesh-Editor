@@ -107,11 +107,13 @@ public sealed class MaterialTextureSet
     public TextureImage? Bake { get; set; }
     public TextureImage? Shadow { get; set; }
     public TextureImage? Occlusion { get; set; }
+    public Dictionary<string, TextureImage> Auxiliary { get; } = new(StringComparer.OrdinalIgnoreCase);
     public int Count =>
         (Diffuse is null ? 0 : 1) +
         (Detail is null ? 0 : 1) +
         (Normal is null ? 0 : 1) +
         (Bake is null ? 0 : 1) +
         (Shadow is null ? 0 : 1) +
-        (Occlusion is null ? 0 : 1);
+        (Occlusion is null ? 0 : 1) +
+        Auxiliary.Count;
 }

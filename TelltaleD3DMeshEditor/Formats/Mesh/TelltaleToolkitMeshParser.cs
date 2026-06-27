@@ -45,7 +45,21 @@ internal static class TelltaleToolkitMeshParser
         return Convert(ttkMesh, fallbackName);
     }
 
-    private static D3DMesh? TryDeserialize(byte[] data, bool requireGeometry, out Exception? lastError, out string lastStatus)
+    public static MeshData ParseModernMesh(byte[] data, string fallbackName, string? preferredGameName)
+    {
+        EnsureToolkitInitialized();
+        var ttkMesh = TryDeserialize(data, requireGeometry: true, out var lastError, out var lastStatus, preferredGameName)
+            ?? throw new InvalidDataException($"Telltale Toolkit could not read the mesh. {lastStatus}", lastError);
+
+        return Convert(ttkMesh, fallbackName);
+    }
+
+    private static D3DMesh? TryDeserialize(
+        byte[] data,
+        bool requireGeometry,
+        out Exception? lastError,
+        out string lastStatus,
+        string? preferredGameName = null)
     {
         lastError = null;
         lastStatus = "No profile produced geometry.";
@@ -69,9 +83,11 @@ internal static class TelltaleToolkitMeshParser
             }
         }
 
-        foreach (var profileName in Toolkit.Instance.GameProfiles.Keys
-                     .OrderByDescending(profile => profile.Contains("future", StringComparison.OrdinalIgnoreCase) ||
-                                                   profile.Contains("bttf", StringComparison.OrdinalIgnoreCase)))
+        var profileNames = Toolkit.Instance.GameProfiles.Keys
+            .OrderByDescending(profile => IsPreferredProfile(profile, preferredGameName))
+            .ThenByDescending(profile => profile.Contains("future", StringComparison.OrdinalIgnoreCase) ||
+                                         profile.Contains("bttf", StringComparison.OrdinalIgnoreCase));
+        foreach (var profileName in profileNames)
         {
             Workspace workspace;
             try
@@ -108,6 +124,18 @@ internal static class TelltaleToolkitMeshParser
         }
 
         return null;
+    }
+
+    private static bool IsPreferredProfile(string profileName, string? preferredGameName)
+    {
+        if (string.IsNullOrWhiteSpace(preferredGameName))
+        {
+            return false;
+        }
+
+        return profileName.Equals(preferredGameName, StringComparison.OrdinalIgnoreCase) ||
+               profileName.Contains(preferredGameName, StringComparison.OrdinalIgnoreCase) ||
+               preferredGameName.Contains(profileName, StringComparison.OrdinalIgnoreCase);
     }
 
     private static bool HasGeometry(D3DMesh mesh)

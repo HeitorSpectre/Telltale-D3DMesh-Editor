@@ -243,6 +243,7 @@ public static class TextureLoader
     {
         var modernInfo =
             TryInspectModernD3dtx(path, GameConfig.Current.ModernTextureToolkitGameName) ??
+            TryInspectModernD3dtx(path, GameConfig.WalkingDeadMichonne.ModernTextureToolkitGameName) ??
             TryInspectModernD3dtx(path, GameConfig.GameOfThrones.ModernTextureToolkitGameName) ??
             TryInspectModernD3dtx(path, GameConfig.TalesFromTheBorderlands2014.ModernTextureToolkitGameName) ??
             TryInspectModernD3dtx(path, GameConfig.MinecraftStoryMode.ModernTextureToolkitGameName);

@@ -21,6 +21,7 @@ public enum GameId
     MinecraftStoryModeGroup = 16,
     MinecraftStoryModeSeason2 = 17,
     GameOfThrones = 18,
+    WalkingDeadMichonne = 19,
 }
 
 // Per-game settings, so behaviour specific to one game stays isolated and never affects another. The
@@ -42,7 +43,8 @@ public sealed class GameConfig
 
     public bool IsWalkingDead => Id is
         GameId.WalkingDead or
-        GameId.WalkingDeadSeason2;
+        GameId.WalkingDeadSeason2 or
+        GameId.WalkingDeadMichonne;
 
     public bool IsTalesFromTheBorderlands => Id is
         GameId.TalesFromTheBorderlands or
@@ -241,6 +243,31 @@ public sealed class GameConfig
         DisableCharacterSpecificFacialRetargetOnReimport = true,
     };
 
+    public static readonly GameConfig WalkingDeadMichonne = new()
+    {
+        Id = GameId.WalkingDeadMichonne,
+        DisplayName = "The Walking Dead: Michonne",
+        ModernTextureToolkitGameName = "The Walking Dead: Michonne",
+        UsesCompanionAlphaTextures = false,
+        ClearInheritedBakeOnReimport = false,
+        ClearInheritedSecondaryTexturesOnReimport = true,
+        PreferGltfTextureNamesOnReimport = false,
+        PreserveSecondaryTextureNamesOnReimport = true,
+        MaxSkinnedPaletteBonesOnReimport = 64,
+        PreferSemanticTemplateTextureNamesOnReimport = false,
+        RemoveEyeHelperPrimitivesOnReimport = false,
+        SplitBodyLineAlphaOnReimport = false,
+        InvertBodyLineAlphaOnReimport = false,
+        InvertHeadLineAlphaOnReimport = false,
+        InvertHandLineAlphaOnReimport = false,
+        TreatAdvObj000TexturesAsBake = true,
+        PixelatedGltfTextures = false,
+        PreserveSkeletonDerivedFieldsOnMerge = false,
+        PortTranslationScalesOnSkeletonMerge = false,
+        PortCompanionVariantPartsOnReimport = false,
+        DisableCharacterSpecificFacialRetargetOnReimport = true,
+    };
+
     public static readonly GameConfig MinecraftStoryMode = new()
     {
         Id = GameId.MinecraftStoryMode,
@@ -383,6 +410,7 @@ public sealed class GameConfig
         WolfAmongUs,
         WalkingDead,
         WalkingDeadSeason2,
+        WalkingDeadMichonne,
         MinecraftStoryModeGroup,
         MinecraftStoryMode,
         TalesFromTheBorderlands,
