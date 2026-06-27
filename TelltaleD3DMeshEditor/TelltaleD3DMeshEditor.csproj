@@ -16,10 +16,10 @@
     <Company>HeitorSpectre</Company>
     <Authors>HeitorSpectre</Authors>
     <Copyright>Tool by HeitorSpectre - 2026</Copyright>
-    <Version>1.10.0</Version>
-    <AssemblyVersion>1.10.0.0</AssemblyVersion>
-    <FileVersion>1.10.0.0</FileVersion>
-    <InformationalVersion>1.10</InformationalVersion>
+    <Version>1.11.0</Version>
+    <AssemblyVersion>1.11.0.0</AssemblyVersion>
+    <FileVersion>1.11.0.0</FileVersion>
+    <InformationalVersion>1.11</InformationalVersion>
   </PropertyGroup>
 
   <PropertyGroup Condition="'$(Configuration)' == 'Release'">
@@ -41,6 +41,7 @@
        extract .ttarch / .ttarch2 game containers so users don't have to unpack them manually.
        Referenced from source so it stays linked to the upstream repo via the submodule. -->
   <ItemGroup>
+    <PackageReference Include="DiscordRichPresence" Version="1.6.1.70" />
     <PackageReference Include="SharpCompress" Version="0.49.1" />
     <ProjectReference Include="..\external\TelltaleToolKit\src\TelltaleToolKit\TelltaleToolKit.csproj" />
   </ItemGroup>
@@ -55,6 +56,15 @@
     <None Include="Resources\HashDBs\TexNames.HashDB" Link="HashDBs\TexNames.HashDB">
       <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
     </None>
+    <!-- UI translations: shipped as loose files in a Languages\ folder next to the .exe so the community
+         can edit them or drop in a new <code>.json without rebuilding. en.json is also embedded below as
+         the canonical baseline / fallback used when the folder is missing. -->
+    <None Include="Resources\Languages\**\*.*" Link="Languages\%(RecursiveDir)%(Filename)%(Extension)">
+      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+    </None>
+    <EmbeddedResource Include="Resources\Languages\en.json">
+      <LogicalName>TelltaleD3DMeshEditor.Resources.Languages.en.json</LogicalName>
+    </EmbeddedResource>
     <EmbeddedResource Include="Resources\Icons\d3dmesh.ico">
       <LogicalName>TelltaleD3DMeshEditor.Resources.Icons.D3DMesh.ico</LogicalName>
     </EmbeddedResource>
@@ -69,6 +79,9 @@
     </EmbeddedResource>
     <EmbeddedResource Include="Resources\Images\Logo Background.png">
       <LogicalName>TelltaleD3DMeshEditor.Resources.Images.LogoBackground.png</LogicalName>
+    </EmbeddedResource>
+    <EmbeddedResource Include="Resources\Images\Telltale Modding Group.png">
+      <LogicalName>TelltaleD3DMeshEditor.Resources.Images.TelltaleModdingGroup.png</LogicalName>
     </EmbeddedResource>
     <EmbeddedResource Include="Resources\Images\Auto-Generic.png">
       <LogicalName>TelltaleD3DMeshEditor.Resources.Images.Auto-Generic.png</LogicalName>
@@ -111,6 +124,9 @@
     </EmbeddedResource>
     <EmbeddedResource Include="Resources\Images\TWDS2.png">
       <LogicalName>TelltaleD3DMeshEditor.Resources.Images.TWDS2.png</LogicalName>
+    </EmbeddedResource>
+    <EmbeddedResource Include="Resources\Images\TWDM.png">
+      <LogicalName>TelltaleD3DMeshEditor.Resources.Images.TWDM.png</LogicalName>
     </EmbeddedResource>
     <EmbeddedResource Include="Resources\Images\BTTF101.png">
       <LogicalName>TelltaleD3DMeshEditor.Resources.Images.BTTF101.png</LogicalName>

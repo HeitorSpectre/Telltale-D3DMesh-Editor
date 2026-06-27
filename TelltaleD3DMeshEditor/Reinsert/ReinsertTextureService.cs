@@ -30,6 +30,12 @@ public static class ReinsertTextureService
         ReinsertTextureOptions? options = null)
     {
         options ??= ReinsertTextureOptions.Default;
+        if ((gameConfig ?? GameConfig.Current).Id == GameId.WalkingDeadMichonne)
+        {
+            return ToReinsertedTextures(
+                WriteV25ReferencedTextures(model, templateMeshPath, outputMeshPath, options.ForceUncompressed));
+        }
+
         var nameMode = ResolveNameMode(gameConfig, options.NameMode);
         var templateTexturePath = FindTemplateTexture(templateMeshPath);
         if (templateTexturePath is null)
@@ -758,7 +764,21 @@ public static class ReinsertTextureService
     }
 
     private static string NormalizeTextureSlotName(string slot)
-        => slot.Equals("normal", StringComparison.OrdinalIgnoreCase) ? "bump" : slot;
+    {
+        if (slot.Equals("normal", StringComparison.OrdinalIgnoreCase))
+        {
+            return "bump";
+        }
+
+        // D3DMesh stores the baked lighting channel as "bake". Accept the common GLB/Toolkit
+        // aliases so an imported material writes the user's lightmap into that actual slot.
+        return slot.Equals("lightmap", StringComparison.OrdinalIgnoreCase) ||
+               slot.Equals("light_map", StringComparison.OrdinalIgnoreCase) ||
+               slot.Equals("lighting", StringComparison.OrdinalIgnoreCase) ||
+               slot.Equals("lighting_map", StringComparison.OrdinalIgnoreCase)
+            ? "bake"
+            : slot;
+    }
 
     private static bool IsSupportedTextureSlot(string slot) => TextureSlots.Contains(slot);
 
@@ -2088,6 +2108,19 @@ public static class ReinsertTextureService
         return name;
     }
 
+    public static V25TextureReinserter.Result WriteV25ReferencedTextures(
+        GltfModel model,
+        string templateMeshPath,
+        string outputMeshPath,
+        bool forceUncompressed)
+        => V25TextureReinserter.WriteReferencedTextures(model, templateMeshPath, outputMeshPath, forceUncompressed);
+
+    public static int DistinctV25TextureCount(GltfModel model)
+        => V25MaterialAssignment.DistinctTextureCount(model);
+
+    private static ReinsertedTextures ToReinsertedTextures(V25TextureReinserter.Result result)
+        => new(result.PrimitiveSlots, result.Written);
+
     private static string SanitizeName(string name)
     {
         var invalid = Path.GetInvalidFileNameChars();
@@ -2148,4 +2181,354 @@ internal enum ResolvedTextureNameMode
     PreferTemplateNames,
     PreferGltfNames,
     GeneratedNames,
+}
+
+// ---- V25 material assignment moved from V25MaterialAssignment.cs ----
+
+// Decides which template material slot each GLB part should use when reinserting a V25 mesh.
+//
+// The assignment is texture-aware, not positional: parts that share the same diffuse texture map to the
+// same slot, and each distinct texture gets its own slot, capped at the number of slots the template
+// provides (one per template submesh/material). This keeps each part's geometry bound to its own texture
+// even when the part order or count differs from the template — a purely positional mapping would, for
+// example, send a console's second "body" part to the "screen" material.
+//
+// Both the mesh reinserter (which writes each batch's material index) and the texture reinserter (which
+// writes each part's image under the slot's bound texture name) call this so they stay in lockstep.
+public static class V25MaterialAssignment
+{
+    // Returns, per GLB primitive, the template slot index in [0, slotCount). slotCount must be >= 1.
+    public static int[] PrimitiveToSlot(GltfModel model, int slotCount)
+    {
+        var cap = Math.Max(0, slotCount - 1);
+        var distinct = new List<string>();
+        var result = new int[model.Primitives.Count];
+        for (var k = 0; k < model.Primitives.Count; k++)
+        {
+            var name = DiffuseName(model.Primitives[k]) ?? $"__part{k}";
+            var idx = distinct.FindIndex(n => string.Equals(n, name, StringComparison.OrdinalIgnoreCase));
+            if (idx < 0)
+            {
+                idx = distinct.Count;
+                distinct.Add(name);
+            }
+
+            result[k] = Math.Min(idx, cap);
+        }
+
+        return result;
+    }
+
+    // Number of distinct diffuse textures referenced across the GLB parts.
+    public static int DistinctTextureCount(GltfModel model)
+    {
+        var distinct = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        foreach (var prim in model.Primitives)
+        {
+            distinct.Add(DiffuseName(prim) ?? Guid.NewGuid().ToString());
+        }
+
+        return distinct.Count;
+    }
+
+    public static string? DiffuseName(GltfPrimitive primitive)
+    {
+        if (primitive.ReferencedTextures.TryGetValue("diffuse", out var image) && image is not null)
+        {
+            return StripExtension(image.Name);
+        }
+
+        return null;
+    }
+
+    private static string StripExtension(string name)
+        => name.EndsWith(".d3dtx", StringComparison.OrdinalIgnoreCase) ? name[..^6] : name;
+}
+
+// ---- V25 texture reinsertion moved from V25TextureReinserter.cs ----
+
+
+// Texture reinsertion for The Walking Dead: Michonne (V25), following the same naming logic as the
+// other games: every texture is written under the RECEIVER/template's own original slot name (diffuse,
+// detail_diffuse, normal, ...), so an unmodified extract->reinsert reproduces the original names and the
+// mesh's material bindings (left untouched) keep resolving. A brand-new name is only invented when the
+// model brings more textures than the template's slots provide. The bake/lightmap is the one exception:
+// the engine resolves it by the <meshname>_000 convention, so it is written under <output>_000.
+//
+// Each image is written into a copy of a real .d3dtx template. When the texture's OWN original file is
+// found next to the mesh its exact format is preserved (so an A8 mask like eyelashes stays A8); only a
+// fallback template (a brand-new texture) is steered away from A8 to avoid an all-black colour map.
+public static class V25TextureReinserter
+{
+    public sealed class Result
+    {
+        public List<string> Written { get; } = [];
+        public List<string> TemplateNotFound { get; } = [];
+        public List<IReadOnlyDictionary<string, string>> PrimitiveSlots { get; } = [];
+    }
+
+    public static Result WriteReferencedTextures(
+        GltfModel model,
+        string templateMeshPath,
+        string outputMeshPath,
+        bool forceUncompressed)
+    {
+        var result = new Result();
+        var outputFolder = Path.GetDirectoryName(Path.GetFullPath(outputMeshPath)) ?? ".";
+        Directory.CreateDirectory(outputFolder);
+        var meshFolder = Path.GetDirectoryName(Path.GetFullPath(templateMeshPath));
+        var fallbackTemplate = FindFallbackTemplate(meshFolder);
+        var templateStem = Path.GetFileNameWithoutExtension(templateMeshPath);
+        var outputStem = Path.GetFileNameWithoutExtension(outputMeshPath);
+        var writtenTargets = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+
+        var lightmapImages = CollectLightmapImages(model);
+
+        var templateLightmap = FindTemplateByName(meshFolder, templateStem + "_000");
+        var glbLightmap = FindLightmapImage(model);
+        var lightmapTemplate = templateLightmap ?? fallbackTemplate;
+        if (lightmapTemplate is not null && glbLightmap is not null)
+        {
+            var lightmapTarget = outputStem + "_000";
+            var lightmapOutput = Path.Combine(outputFolder, lightmapTarget + ".d3dtx");
+            D3dtxWriter.WriteFromImageBytes(File.ReadAllBytes(lightmapTemplate), glbLightmap, lightmapOutput, forceUncompressed);
+            writtenTargets.Add(lightmapTarget);
+            result.Written.Add(lightmapTarget);
+            if (!string.IsNullOrWhiteSpace(glbLightmap.Name))
+            {
+                lightmapImages.Add(glbLightmap.Name);
+            }
+        }
+        else if (templateLightmap is not null)
+        {
+            var lightmapTarget = outputStem + "_000";
+            var lightmapOutput = Path.Combine(outputFolder, lightmapTarget + ".d3dtx");
+            D3dtxWriter.WriteRenamedCopy(File.ReadAllBytes(templateLightmap), lightmapOutput);
+            writtenTargets.Add(lightmapTarget);
+            result.Written.Add(lightmapTarget);
+        }
+
+        // Diffuse naming follows the other games: the receiver part's own distinct diffuse names form a
+        // pool, and each distinct GLB diffuse texture takes the next pool name. So a same-model reinsert
+        // reproduces the originals, a foreign model with as many textures maps onto the receiver's slots
+        // (e.g. console->couch uses the couch's names), and a foreign model with MORE textures than the
+        // part has (e.g. Lee's head: stubble+eye+mouth onto Michonne's single head slot) keeps the extra
+        // textures distinct under their own names instead of collapsing them all onto one slot. Other
+        // slots (detail/normal) keep their own names.
+        var templateSubs = SafeParseSubmeshes(templateMeshPath, meshFolder);
+        var templatePool = new List<string>();
+        foreach (var sub in templateSubs)
+        {
+            if (sub.TextureNames.TryGetValue("diffuse", out var dn) && !string.IsNullOrWhiteSpace(dn))
+            {
+                var stripped = StripTextureExtension(dn);
+                if (!templatePool.Contains(stripped, StringComparer.OrdinalIgnoreCase))
+                {
+                    templatePool.Add(stripped);
+                }
+            }
+        }
+
+        var glbDistinct = new List<string>();
+        foreach (var primitive in model.Primitives)
+        {
+            var name = V25MaterialAssignment.DiffuseName(primitive);
+            if (!string.IsNullOrWhiteSpace(name) && !glbDistinct.Contains(name, StringComparer.OrdinalIgnoreCase))
+            {
+                glbDistinct.Add(name);
+            }
+        }
+
+        // A GLB texture whose name already matches a template slot keeps that name (same-model / shared
+        // texture, by IDENTITY not position — robust to primitive reordering). A foreign texture takes the
+        // next template slot no GLB texture matches; once those run out it keeps its own name.
+        var glbSet = new HashSet<string>(glbDistinct, StringComparer.OrdinalIgnoreCase);
+        var freePool = templatePool.Where(p => !glbSet.Contains(p)).ToList();
+        var freeIdx = 0;
+        var diffuseTargetByImage = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+        foreach (var name in glbDistinct)
+        {
+            if (templatePool.Contains(name, StringComparer.OrdinalIgnoreCase))
+            {
+                diffuseTargetByImage[name] = name;
+            }
+            else
+            {
+                diffuseTargetByImage[name] = freeIdx < freePool.Count ? freePool[freeIdx++] : name;
+            }
+        }
+
+        for (var k = 0; k < model.Primitives.Count; k++)
+        {
+            var primitive = model.Primitives[k];
+            var slots = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+
+            foreach (var (slot, image) in EnumerateTextureSlots(primitive))
+            {
+                if (image is null || string.IsNullOrWhiteSpace(image.Name) ||
+                    IsGeneratedHelper(image.Name) || IsLightmapSlot(slot) ||
+                    lightmapImages.Contains(image.Name) || slots.ContainsKey(slot))
+                {
+                    continue;
+                }
+
+                // The diffuse takes its pooled target (receiver slot name or, beyond the pool, its own);
+                // all other slots keep the GLB's own original name.
+                var ownName = StripTextureExtension(image.Name);
+                var target = slot.Equals("diffuse", StringComparison.OrdinalIgnoreCase) &&
+                             diffuseTargetByImage.TryGetValue(ownName, out var mapped)
+                    ? mapped
+                    : ownName;
+
+                slots[slot] = target;
+                if (!writtenTargets.Add(target))
+                {
+                    continue;
+                }
+
+                // The texture's own original file gives the exact format (A8 masks stay A8); a fallback
+                // template is steered away from A8 so a brand-new colour map never lands all black.
+                var ownTemplate = FindTemplateByName(meshFolder, target);
+                var template = ownTemplate ?? fallbackTemplate;
+                if (template is null)
+                {
+                    result.TemplateNotFound.Add(target);
+                    continue;
+                }
+
+                var outputPath = Path.Combine(outputFolder, target + ".d3dtx");
+                D3dtxWriter.WriteFromImageBytes(
+                    File.ReadAllBytes(template),
+                    image,
+                    outputPath,
+                    forceUncompressed,
+                    allowA8TemplateFormat: ownTemplate is not null);
+                result.Written.Add(target);
+            }
+
+            result.PrimitiveSlots.Add(slots);
+        }
+
+        return result;
+    }
+
+    // The mesh's texture slots come through either map depending on the exporter path; union them so
+    // diffuse, detail_diffuse, normal etc. are all written, preferring the resolved ReferencedTextures.
+    private static IEnumerable<(string Slot, GltfImage? Image)> EnumerateTextureSlots(GltfPrimitive primitive)
+    {
+        foreach (var pair in primitive.ReferencedTextures)
+        {
+            yield return (pair.Key, pair.Value);
+        }
+
+        foreach (var pair in primitive.TextureSlots)
+        {
+            if (!primitive.ReferencedTextures.ContainsKey(pair.Key))
+            {
+                yield return (pair.Key, pair.Value);
+            }
+        }
+    }
+
+    private static IReadOnlyList<SubmeshData> SafeParseSubmeshes(string templateMeshPath, string? meshFolder)
+    {
+        try
+        {
+            // Resolve texture hashes against the actual .d3dtx files so the names keep their original
+            // case (the embedded hash DB only knows the lowercase form the CRC64 is computed from).
+            using (Core.TextureHashDatabase.UseTextureFolder(meshFolder))
+            {
+                return D3DMeshParser.Parse(File.ReadAllBytes(templateMeshPath)).Submeshes;
+            }
+        }
+        catch
+        {
+            return [];
+        }
+    }
+
+    private static string? FindTemplateByName(string? meshFolder, string stem)
+    {
+        if (meshFolder is null || !Directory.Exists(meshFolder))
+        {
+            return null;
+        }
+
+        return Directory.EnumerateFiles(meshFolder, "*.d3dtx", SearchOption.TopDirectoryOnly)
+            .FirstOrDefault(path => string.Equals(
+                Path.GetFileNameWithoutExtension(path), stem, StringComparison.OrdinalIgnoreCase));
+    }
+
+    // Any .d3dtx next to the mesh works as a format/container template when the texture's own file is
+    // absent (e.g. a brand-new texture from a replacement model). Prefer a larger one (a real diffuse,
+    // not a tiny bake) so mip layout is representative.
+    private static string? FindFallbackTemplate(string? meshFolder)
+    {
+        if (meshFolder is null || !Directory.Exists(meshFolder))
+        {
+            return null;
+        }
+
+        var files = Directory.EnumerateFiles(meshFolder, "*.d3dtx", SearchOption.TopDirectoryOnly).ToList();
+        return files
+            .Where(p => !Path.GetFileNameWithoutExtension(p).EndsWith("_000", StringComparison.OrdinalIgnoreCase))
+            .OrderByDescending(p => new FileInfo(p).Length)
+            .FirstOrDefault()
+            ?? files.OrderByDescending(p => new FileInfo(p).Length).FirstOrDefault();
+    }
+
+    private static HashSet<string> CollectLightmapImages(GltfModel model)
+    {
+        var result = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        foreach (var primitive in model.Primitives)
+        {
+            foreach (var (slot, image) in primitive.ReferencedTextures)
+            {
+                if (image is not null && IsLightmapSlot(slot) && !string.IsNullOrWhiteSpace(image.Name))
+                {
+                    result.Add(image.Name);
+                    result.Add(StripTextureExtension(image.Name));
+                }
+            }
+
+            foreach (var (slot, image) in primitive.TextureSlots)
+            {
+                if (image is not null && IsLightmapSlot(slot) && !string.IsNullOrWhiteSpace(image.Name))
+                {
+                    result.Add(image.Name);
+                    result.Add(StripTextureExtension(image.Name));
+                }
+            }
+        }
+
+        return result;
+    }
+
+    private static GltfImage? FindLightmapImage(GltfModel model)
+    {
+        foreach (var primitive in model.Primitives)
+        {
+            foreach (var slot in new[] { "bake", "lightmap", "light_map", "lighting", "lighting_map", "occlusion" })
+            {
+                if (primitive.TextureSlots.TryGetValue(slot, out var texture) ||
+                    primitive.ReferencedTextures.TryGetValue(slot, out texture))
+                {
+                    return texture;
+                }
+            }
+        }
+
+        return null;
+    }
+
+    private static string StripTextureExtension(string name)
+        => name.EndsWith(".d3dtx", StringComparison.OrdinalIgnoreCase) ? name[..^6] : name;
+
+    private static bool IsLightmapSlot(string slot)
+        => slot is "bake" or "lightmap" or "light_map" or "lighting" or "lighting_map";
+
+    private static bool IsGeneratedHelper(string name)
+        => name.Contains("_atlas", StringComparison.OrdinalIgnoreCase) ||
+           name.StartsWith("gltf_", StringComparison.OrdinalIgnoreCase) ||
+           name.Contains("__tt_lines", StringComparison.OrdinalIgnoreCase);
 }

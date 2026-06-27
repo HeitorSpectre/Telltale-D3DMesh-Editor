@@ -35,6 +35,39 @@ public static class MeshReinserter
         return ReinsertGeometry(layout, model, textureSlotsByPrimitive, referenceSkeleton, gameConfig);
     }
 
+    public static byte[] ReinsertV25Geometry(
+        V25MeshLayout layout,
+        GltfModel model,
+        ReinsertedTextures textures)
+        => V25MeshReinserter.Reinsert(layout, model, textures.PrimitiveSlots);
+
+    public static byte[] ReinsertV25Geometry(
+        V25MeshLayout layout,
+        GltfModel model,
+        IReadOnlyList<IReadOnlyDictionary<string, string>> textureSlotsByPrimitive)
+        => V25MeshReinserter.Reinsert(layout, model, textureSlotsByPrimitive);
+
+    public static byte[] ReinsertV25Geometry(
+        V25MeshLayout layout,
+        GltfModel model,
+        IReadOnlyList<IReadOnlyDictionary<string, string>> textureSlotsByPrimitive,
+        V25MeshLayout? sourceMaterialLayout)
+        => V25MeshReinserter.Reinsert(layout, model, textureSlotsByPrimitive, sourceMaterialLayout);
+
+    public static byte[] ReinsertV25Geometry(
+        V25MeshLayout layout,
+        GltfModel model)
+        => V25MeshReinserter.Reinsert(layout, model);
+
+    public static bool CanAddV25Materials(V25MeshLayout layout)
+        => V25MeshReinserter.CanAddMaterials(layout);
+
+    public static V25MeshLayout? TryFindV25SourceMaterialLayout(
+        GltfModel model,
+        string templateMeshPath,
+        string? modelPath = null)
+        => V25MeshReinserter.TryFindSourceMaterialLayout(model, templateMeshPath, modelPath);
+
     public static byte[] ReinsertGeometry(
         D3DMeshLayout layout,
         GltfModel model,
@@ -1592,7 +1625,7 @@ public static class MeshReinserter
         return result;
     }
 
-    private static void WriteBoneBoxIntoEntry(byte[] entry, BoneBox box)
+    private static void WriteBoneBoxIntoEntry(byte[] entry, BoneBox box, bool rewriteCenterAndRadius)
     {
         // Entry layout after the 8-byte hash: min vec3, max vec3, int (kept), center vec3,
         // radius (half diagonal), int (kept).
@@ -1603,6 +1636,11 @@ public static class MeshReinserter
         BinaryPrimitives.WriteSingleLittleEndian(span[20..], box.MaxX);
         BinaryPrimitives.WriteSingleLittleEndian(span[24..], box.MaxY);
         BinaryPrimitives.WriteSingleLittleEndian(span[28..], box.MaxZ);
+        if (!rewriteCenterAndRadius)
+        {
+            return;
+        }
+
         BinaryPrimitives.WriteSingleLittleEndian(span[36..], (box.MinX + box.MaxX) * 0.5f);
         BinaryPrimitives.WriteSingleLittleEndian(span[40..], (box.MinY + box.MaxY) * 0.5f);
         BinaryPrimitives.WriteSingleLittleEndian(span[44..], (box.MinZ + box.MaxZ) * 0.5f);
@@ -1631,7 +1669,7 @@ public static class MeshReinserter
                 if (paletteBoneBounds.TryGetValue((paletteIndex, bone), out var box))
                 {
                     var entry = originalBlock.AsSpan(pos, layout.BonePaletteEntrySize).ToArray();
-                    WriteBoneBoxIntoEntry(entry, box);
+                    WriteBoneBoxIntoEntry(entry, box, rewriteCenterAndRadius: false);
                     entry.CopyTo(originalBlock, pos);
                 }
 
@@ -1654,7 +1692,7 @@ public static class MeshReinserter
                 BinaryPrimitives.WriteUInt32LittleEndian(entry.AsSpan(4, 4), unchecked((uint)(palette[bone] >> 32)));
                 if (paletteBoneBounds.TryGetValue((paletteIndex, bone), out var box))
                 {
-                    WriteBoneBoxIntoEntry(entry, box);
+                    WriteBoneBoxIntoEntry(entry, box, rewriteCenterAndRadius: true);
                 }
 
                 ms.Write(entry, 0, entry.Length);
@@ -2047,5 +2085,1239 @@ public static class MeshReinserter
         }
 
         return (x, y, z, w);
+    }
+}
+
+// ---- V25 mesh reinsertion moved from V25MeshReinserter.cs ----
+
+
+// Static-mesh reinserter for The Walking Dead: Michonne (.d3dmesh V25), written for the V25 engine
+// layout from scratch (it shares nothing with the V13/17/18 path or the Back to the Future code).
+//
+// Strategy: template-patch. The original .d3dmesh is kept byte-for-byte except for the geometry-
+// dependent fields and the async buffer payloads. The new geometry comes from a GLB whose primitives
+// map 1:1 onto the template's LOD0 batches (so the property-set materials, LOD/material/bone tables
+// and every header stay intact and correctly sized). The encoder is driven entirely by the vertex
+// state's attribute table (mAttribute/mFormat/mBufferIndex/mBufferOffset): each stream is written at
+// the exact buffer/offset/format the file declares, so any attribute layout is handled faithfully.
+//
+// Only pure static meshes are accepted; skinned meshes are refused by V25MeshLayout with a clear
+// reason (skinned support is a deliberately separate later phase).
+public static class V25MeshReinserter
+{
+    public static byte[] Reinsert(V25MeshLayout layout, GltfModel model)
+        => Reinsert(layout, model, textureSlotsByPrimitive: null, sourceMaterialLayout: null);
+
+    public static byte[] Reinsert(
+        V25MeshLayout layout,
+        GltfModel model,
+        IReadOnlyList<IReadOnlyDictionary<string, string>>? textureSlotsByPrimitive,
+        V25MeshLayout? sourceMaterialLayout = null)
+    {
+        // Static meshes and skinned (character) meshes are both reinsertable now. Only the genuine
+        // can't-build cases (no materials / no LOD0 batches) keep a reject reason without skinning data.
+        if (layout.RejectReason is not null && !layout.IsSkinned)
+        {
+            throw new InvalidOperationException(layout.RejectReason);
+        }
+
+        if (model.Primitives.Count == 0)
+        {
+            throw new InvalidOperationException("GLB has no mesh primitives to reinsert.");
+        }
+
+        if (layout.Batches.Count == 0)
+        {
+            throw new InvalidOperationException("The template mesh has no batch table to build from.");
+        }
+
+        if (layout.LodCount != 1 && model.Primitives.Count != layout.Batches.Count)
+        {
+            // Resizing the batch table is only wired for the single-LOD layout every shipped V25 mesh
+            // uses. A multi-LOD template with a different part count would need each LOD rebuilt.
+            throw new InvalidOperationException(
+                "This V25 mesh has multiple LODs; changing the number of parts is not supported for it. " +
+                "Reimport a model with the same number of parts as the original.");
+        }
+
+        // Build one global vertex/face stream by concatenating ALL the GLB primitives. Each part becomes
+        // one batch that owns a contiguous vertex range and a contiguous index range, exactly what the
+        // engine's mMinVertIndex/mMaxVertIndex + mStartIndex/mNumPrimitives expect. The part count may
+        // differ from the template's: the batch table is rebuilt below to match.
+        var partCount = model.Primitives.Count;
+        var verts = new List<V25Vertex>();
+        var faces = new List<int>();
+        var batchRanges = new (int VMin, int VMax, int FaceStart, int PolyCount)[partCount];
+
+        // Skinning: normally the template's bone palettes are reused as-is (the rebuilt .skl shares their
+        // bones). But a foreign character carries its own rig, and the template palette is only a SUBSET of
+        // the skeleton tailored to the original geometry — the imported vertices reference bones it doesn't
+        // contain, which would collapse them to the root (hands moving with the legs). When that happens,
+        // rebuild a single palette from the bones the model actually uses so every blend index resolves.
+        var skinned = layout.IsSkinned && layout.BonePalettes.Count > 0;
+        var usedHashes = skinned ? CollectUsedBoneHashes(model) : [];
+        // Covered = every used bone exists in the UNION of the template's palettes (multi-palette meshes
+        // split their bones across palettes, so a single-palette test would wrongly trigger a rebuild on a
+        // same-model reinsert). Only rebuild for a foreign rig, and only when the template is single-palette
+        // (collapsing several palettes into one would break per-submesh palette assignment).
+        var templateBoneUnion = skinned
+            ? layout.BonePalettes.SelectMany(p => p.BoneHashes).ToHashSet()
+            : [];
+        var templateCovers = skinned && usedHashes.Count > 0 && usedHashes.All(templateBoneUnion.Contains);
+        var rebuildPalette = skinned && layout.BonePalettes.Count == 1 &&
+                             usedHashes.Count is > 0 and <= MaxPaletteBones && !templateCovers;
+        var newPaletteBones = rebuildPalette ? usedHashes.ToArray() : [];
+        var paletteMaps = skinned
+            ? (rebuildPalette
+                ? [BuildHashIndexMap(newPaletteBones)]
+                : layout.BonePalettes.Select(BuildPaletteHashIndex).ToArray())
+            : [];
+        var unresolvedJoints = 0;
+
+        for (var k = 0; k < partCount; k++)
+        {
+            var prim = model.Primitives[k];
+            var vertexStart = verts.Count;
+            var faceStartTri = faces.Count / 3;
+            var paletteForPrim = skinned ? (rebuildPalette ? 0 : PaletteForPrimitive(layout, k, partCount)) : -1;
+
+            var normals = HasChannel(prim.Normals, prim.VertexCount) ? prim.Normals! : ComputeNormals(prim);
+            var tangents = HasChannel(prim.Tangents, prim.VertexCount) ? prim.Tangents! : ComputeTangents(prim, normals);
+            var binormals = HasChannel(prim.Binormals, prim.VertexCount)
+                ? prim.Binormals!
+                : ComputeBinormals(normals, tangents);
+
+            for (var i = 0; i < prim.VertexCount; i++)
+            {
+                var vertex = new V25Vertex
+                {
+                    Position = prim.Positions[i],
+                    Normal = normals[i],
+                    Tangent = tangents[i],
+                    Binormal = binormals[i],
+                    Color = HasChannel(prim.Color0, prim.VertexCount) ? prim.Color0![i] : new Vector4(1, 1, 1, 1),
+                    Uv =
+                    [
+                        Uv(prim.Uv0, i),
+                        Uv(prim.Uv1, i),
+                        Uv(prim.Uv2, i),
+                        Uv(prim.Uv3, i),
+                        Uv(prim.Uv4, i),
+                        Uv(prim.Uv5, i),
+                    ],
+                };
+
+                if (paletteForPrim >= 0 && prim.Joints0 is not null && prim.Weights0 is not null)
+                {
+                    AssignSkinning(vertex, model, prim, i, paletteMaps[paletteForPrim], ref unresolvedJoints);
+                }
+
+                verts.Add(vertex);
+            }
+
+            for (var i = 0; i + 2 < prim.Indices.Length; i += 3)
+            {
+                int a = prim.Indices[i], b = prim.Indices[i + 1], c = prim.Indices[i + 2];
+                if (a == b || b == c || a == c ||
+                    (uint)a >= (uint)prim.VertexCount || (uint)b >= (uint)prim.VertexCount || (uint)c >= (uint)prim.VertexCount)
+                {
+                    continue;
+                }
+
+                faces.Add(vertexStart + a);
+                faces.Add(vertexStart + b);
+                faces.Add(vertexStart + c);
+            }
+
+            var polyCount = faces.Count / 3 - faceStartTri;
+            batchRanges[k] = (vertexStart, verts.Count - 1, faceStartTri, polyCount);
+        }
+
+        if (verts.Count == 0 || faces.Count == 0)
+        {
+            throw new InvalidOperationException("The model produced no usable geometry (no vertices/triangles).");
+        }
+
+        if (verts.Count > 65535)
+        {
+            throw new InvalidOperationException(
+                $"The model has {verts.Count} vertices but V25 uses 16-bit indices (max 65535). Reduce the mesh density or split it.");
+        }
+
+        // UV scales: only the layers that own an mTexCoordTransform entry get a recomputed scale (those
+        // are patched and encoded consistently). Quantized layers without an entry are decoded by the
+        // game with identity, so they must be encoded with identity too.
+        var uvScaleByLayer = new Dictionary<int, V25UvScaleValue>();
+        foreach (var slot in layout.UvScaleSlots)
+        {
+            uvScaleByLayer[slot.Layer] = ComputeUvScale(verts, slot.Layer);
+        }
+
+        var patches = new List<RegionPatch>();
+
+        // Bounds: mesh-level + every LOD box + every batch box.
+        if (layout.MeshBoundsOffset > 0)
+        {
+            patches.Add(new RegionPatch(layout.MeshBoundsOffset, 24, BoundsBytes(verts, 0, verts.Count)));
+        }
+        foreach (var lodBoundsOffset in layout.LodBoundsOffsets)
+        {
+            patches.Add(new RegionPatch(lodBoundsOffset, 24, BoundsBytes(verts, 0, verts.Count)));
+        }
+
+        patches.Add(new RegionPatch(layout.VertexCountFieldOffset, 4, U32(verts.Count)));
+
+        // Material plan: bind each part to a material that resolves its own texture. When the model has
+        // more distinct textures than the template has materials, new materials (property sets) and
+        // material-group entries are added so every texture is shown — matching the other games.
+        var materialPlan = BuildMaterialPlan(layout, model, textureSlotsByPrimitive, sourceMaterialLayout);
+        patches.AddRange(materialPlan.Patches);
+
+        var batchGeometryDelta = 0;
+        if (partCount == layout.Batches.Count)
+        {
+            // Same number of parts: patch each existing batch in place.
+            for (var k = 0; k < layout.Batches.Count; k++)
+            {
+                var batch = layout.Batches[k];
+                var range = batchRanges[k];
+                patches.Add(new RegionPatch(batch.BoundsOffset, 24, BoundsBytes(verts, range.VMin, range.VMax + 1)));
+                patches.Add(new RegionPatch(batch.VertexMinOffset, 4, U32(range.VMin)));
+                patches.Add(new RegionPatch(batch.VertexMaxOffset, 4, U32(range.VMax)));
+                patches.Add(new RegionPatch(batch.FaceStartOffset, 4, U32(range.FaceStart * 3)));
+                patches.Add(new RegionPatch(batch.PolygonCountOffset, 4, U32(range.PolyCount)));
+                patches.Add(new RegionPatch(batch.MaterialIndexOffset, 4, RawMaterialIndex(materialPlan.BatchMaterialIndex1Based[k])));
+            }
+        }
+        else
+        {
+            // Different number of parts: rebuild the whole LOD0 batch table from a copy of the first
+            // template entry. Each new batch keeps the texture-aware material index from the plan.
+            batchGeometryDelta = RebuildBatchTable(layout, verts, batchRanges, materialPlan.BatchMaterialIndex1Based, patches);
+        }
+
+        // Foreign rig: replace the template's bone-palette block with one rebuilt from the bones the
+        // imported model actually uses, so its vertices resolve correctly. All batches already point at
+        // palette 0 (single-palette character parts), so only the block contents change.
+        var paletteDelta = 0;
+        if (rebuildPalette)
+        {
+            var newBlock = BuildV25PaletteBlock(newPaletteBones, verts);
+            var oldLen = layout.BonePaletteBlockEnd - layout.BonePaletteBlockStart;
+            patches.Add(new RegionPatch(layout.BonePaletteBlockStart, oldLen, newBlock));
+            paletteDelta = newBlock.Length - oldLen;
+        }
+
+        // The geometry block grows by the batch-table change, any added material-group entries, and any
+        // bone-palette resize; patch its size once with the combined delta.
+        var geometryDelta = batchGeometryDelta + materialPlan.GeometryDelta + paletteDelta;
+        if (geometryDelta != 0)
+        {
+            patches.Add(new RegionPatch(layout.GeometryBlockSizeFieldOffset, 4,
+                U32(ReadU32(layout.Original, layout.GeometryBlockSizeFieldOffset) + geometryDelta)));
+        }
+
+        foreach (var slot in layout.UvScaleSlots)
+        {
+            patches.Add(new RegionPatch(slot.ValuesOffset, 16, UvScaleBytes(uvScaleByLayer[slot.Layer])));
+        }
+
+        // Index (face) buffer: count is the number of indices; payload is global 0-based uint16 indices.
+        var faceBytes = FaceBytes(faces);
+        patches.Add(new RegionPatch(layout.FaceBuffer.CountFieldOffset, 4, U32(faces.Count)));
+        patches.Add(new RegionPatch(layout.FaceBuffer.PayloadOffset, layout.FaceBuffer.PayloadLength, faceBytes));
+
+        // Vertex buffers: count = vertex count; payload encoded per the attribute table.
+        // When the GLB carries no vertex colours, the mesh's colour attributes (e.g. Michonne's per-vertex
+        // hair transparency in the second colour stream) are preserved verbatim from the template instead
+        // of being overwritten with white — losing them leaves the hair with black blend artifacts.
+        var glbHasVertexColor = model.Primitives.Any(p => HasChannel(p.Color0, p.VertexCount));
+        var vertexBufferBytes = new List<byte[]>(layout.VertexBuffers.Count);
+        for (var b = 0; b < layout.VertexBuffers.Count; b++)
+        {
+            var vb = layout.VertexBuffers[b];
+            var bytes = BuildVertexBufferBytes(layout, b, vb.Stride, verts, uvScaleByLayer, glbHasVertexColor);
+            vertexBufferBytes.Add(bytes);
+            patches.Add(new RegionPatch(vb.CountFieldOffset, 4, U32(verts.Count)));
+            patches.Add(new RegionPatch(vb.PayloadOffset, vb.PayloadLength, bytes));
+        }
+
+        var result = D3DMeshWriter.Apply(layout.Original, patches);
+
+        // MSV5 container fixup. The async section is exactly the buffer payloads at the end of the file,
+        // so its size is the summed payload bytes regardless of whether the batch table was resized; the
+        // sync ("Default") section is everything before it.
+        var asyncSize = faceBytes.Length + vertexBufferBytes.Sum(b => b.Length);
+        var newFaceDataStart = result.Length - asyncSize;
+        BinaryPrimitives.WriteUInt32LittleEndian(result.AsSpan(4, 4), (uint)(newFaceDataStart - layout.DataOffset));
+        BinaryPrimitives.WriteUInt32LittleEndian(result.AsSpan(12, 4), (uint)asyncSize);
+        return result;
+    }
+
+    // Rebuilds the LOD0 batch table to hold one entry per GLB part, copying the first template entry as
+    // a base and patching its bbox / vertex range / index range / material index. The enclosing block
+    // sizes (LOD entry, LOD block, geometry block) are grown/shrunk by the byte delta.
+    // Returns the byte delta the rebuilt batch table adds to the enclosing geometry block.
+    private static int RebuildBatchTable(
+        V25MeshLayout layout,
+        List<V25Vertex> verts,
+        (int VMin, int VMax, int FaceStart, int PolyCount)[] batchRanges,
+        int[] batchMaterialIndex1Based,
+        List<RegionPatch> patches)
+    {
+        var template = layout.Batches[0];
+        var entrySize = template.EndOffset - template.BoundsOffset;
+        var boundsRel = 0;
+        var vMinRel = template.VertexMinOffset - template.BoundsOffset;
+        var vMaxRel = template.VertexMaxOffset - template.BoundsOffset;
+        var faceStartRel = template.FaceStartOffset - template.BoundsOffset;
+        var polyRel = template.PolygonCountOffset - template.BoundsOffset;
+        var materialRel = template.MaterialIndexOffset - template.BoundsOffset;
+        var templateEntryBytes = layout.Original.AsSpan(template.BoundsOffset, entrySize).ToArray();
+
+        var newTable = new byte[batchRanges.Length * entrySize];
+        for (var k = 0; k < batchRanges.Length; k++)
+        {
+            var range = batchRanges[k];
+            var entry = (byte[])templateEntryBytes.Clone();
+
+            BoundsBytes(verts, range.VMin, range.VMax + 1).CopyTo(entry.AsSpan(boundsRel, 24));
+            WriteU32Into(entry, vMinRel, range.VMin);
+            WriteU32Into(entry, vMaxRel, range.VMax);
+            WriteU32Into(entry, faceStartRel, range.FaceStart * 3);
+            WriteU32Into(entry, polyRel, range.PolyCount);
+
+            // Material index comes from the texture-aware material plan.
+            RawMaterialIndex(batchMaterialIndex1Based[k]).CopyTo(entry.AsSpan(materialRel, 4));
+
+            entry.CopyTo(newTable.AsSpan(k * entrySize, entrySize));
+        }
+
+        var oldTableStart = template.BoundsOffset;
+        var oldTableEnd = layout.Batches[^1].EndOffset;
+        var oldTableLength = oldTableEnd - oldTableStart;
+        var delta = newTable.Length - oldTableLength;
+
+        patches.Add(new RegionPatch(oldTableStart, oldTableLength, newTable));
+        patches.Add(new RegionPatch(layout.BatchCountFieldOffset, 4, U32(batchRanges.Length)));
+        patches.Add(new RegionPatch(layout.LodEntrySizeFieldOffset, 4, U32(ReadU32(layout.Original, layout.LodEntrySizeFieldOffset) + delta)));
+        patches.Add(new RegionPatch(layout.LodBlockSizeFieldOffset, 4, U32(ReadU32(layout.Original, layout.LodBlockSizeFieldOffset) + delta)));
+        // The enclosing geometry-block size is patched once by the caller, combining this delta with any
+        // delta from added material-group entries.
+        return delta;
+    }
+
+    private sealed record MaterialPlan(List<RegionPatch> Patches, int[] BatchMaterialIndex1Based, int GeometryDelta);
+
+    // Builds the material/texture binding plan: rebinds each material's diffuse to its part's texture and,
+    // when the model has more distinct textures than the template has materials, clones extra property
+    // sets and material-group entries so every texture gets its own material. Returns the patches, the
+    // 1-based material index each part's batch should reference, and the byte delta added to the geometry
+    // block by new material-group entries (the property-set bytes go before the geometry block).
+    private static MaterialPlan BuildMaterialPlan(
+        V25MeshLayout layout,
+        GltfModel model,
+        IReadOnlyList<IReadOnlyDictionary<string, string>>? textureSlotsByPrimitive,
+        V25MeshLayout? sourceMaterialLayout)
+    {
+        var patches = new List<RegionPatch>();
+        var partCount = model.Primitives.Count;
+        var batchIndex = new int[partCount];
+
+        // Distinct diffuse textures across parts, in first-appearance order. A part with no diffuse at all
+        // reuses the first material rather than getting its own (which would bind to a texture that was
+        // never written and render black).
+        var distinct = new List<string>();
+        var primTexIndex = new int[partCount];
+        for (var k = 0; k < partCount; k++)
+        {
+            var texName = ResolveDiffuseName(model.Primitives[k], textureSlotsByPrimitive, k);
+            if (string.IsNullOrWhiteSpace(texName))
+            {
+                primTexIndex[k] = 0;
+                continue;
+            }
+
+            var idx = distinct.FindIndex(n => string.Equals(n, texName, StringComparison.OrdinalIgnoreCase));
+            if (idx < 0)
+            {
+                idx = distinct.Count;
+                distinct.Add(texName);
+            }
+
+            primTexIndex[k] = idx;
+        }
+
+        // Same part count: keep the template's batch->group->material wiring intact and only rebind the
+        // diffuse of the material a part actually uses, and only when the GLB changed that part's texture.
+        // Groups link to materials by SYMBOL, and that order is independent of the material list order
+        // (e.g. Michonne hair: groups -> materials [0,2,1]); recomputing batch indices or rebinding
+        // materials positionally would swap a mesh's textures. Resolving each batch's material by symbol
+        // handles any wiring, so a pure extract->reinsert is a no-op. Runs before CanRebindMaterials so the
+        // non-1:1 case (which that guard rejects) is still handled correctly.
+        if (partCount == layout.Batches.Count)
+        {
+            var data = layout.Original;
+            ulong Sym(int off) => BinaryPrimitives.ReadUInt64LittleEndian(data.AsSpan(off, 8));
+            var materialBySymbol = new Dictionary<ulong, int>();
+            for (var i = 0; i < layout.Materials.Count; i++)
+            {
+                materialBySymbol.TryAdd(Sym(layout.Materials[i].SymbolOffset), i);
+            }
+
+            var rebound = new HashSet<int>();
+            for (var k = 0; k < partCount; k++)
+            {
+                batchIndex[k] = layout.Batches[k].MaterialIndex; // keep the template's 1-based group index
+                var groupIndex = layout.Batches[k].MaterialIndex - 1;
+                var name = ResolveDiffuseName(model.Primitives[k], textureSlotsByPrimitive, k);
+                if (name is null || name.StartsWith("__part", StringComparison.Ordinal) ||
+                    groupIndex < 0 || groupIndex >= layout.MaterialGroupEntries.Count)
+                {
+                    continue;
+                }
+
+                if (materialBySymbol.TryGetValue(Sym(layout.MaterialGroupEntries[groupIndex].SymbolOffset), out var matIdx) &&
+                    rebound.Add(matIdx) && layout.Materials[matIdx].DiffuseHashOffset >= 0)
+                {
+                    patches.Add(new RegionPatch(layout.Materials[matIdx].DiffuseHashOffset, 8, Hash8(name)));
+                }
+            }
+
+            return new MaterialPlan(patches, batchIndex, 0);
+        }
+
+        var m = layout.Materials.Count;
+        // When no part carries a real diffuse texture (e.g. a companion/viseme port that reuses the
+        // target's own textures and only swaps geometry/UVs), keep the template's material bindings —
+        // rebinding to synthetic "__partN" names would point the materials at textures that don't exist.
+        var allSynthetic = distinct.All(n => n.StartsWith("__part", StringComparison.Ordinal));
+        if (!CanRebindMaterials(layout) || allSynthetic)
+        {
+            // Can't safely rebind/clone materials: keep the template's, assigning each part to a material
+            // by texture (capped at the template's count). Some textures may repeat — the caller warns.
+            var batchCount = Math.Max(1, layout.Batches.Count);
+            var slots = V25MaterialAssignment.PrimitiveToSlot(model, batchCount);
+            for (var k = 0; k < partCount; k++)
+            {
+                batchIndex[k] = layout.Batches[Math.Min(slots[k], layout.Batches.Count - 1)].MaterialIndex;
+            }
+
+            return new MaterialPlan(patches, batchIndex, 0);
+        }
+
+        var d = distinct.Count;
+        var original = layout.Original;
+        var donorLayout = sourceMaterialLayout is not null &&
+                          sourceMaterialLayout.Materials.Count >= d &&
+                          sourceMaterialLayout.MaterialGroupEntries.Count >= d
+            ? sourceMaterialLayout
+            : null;
+        var material0 = layout.Materials[0];
+        var entry0 = layout.MaterialGroupEntries[0];
+        var material0Bytes = original.AsSpan(material0.Start, material0.End - material0.Start).ToArray();
+        var entry0Bytes = original.AsSpan(entry0.Start, entry0.Length).ToArray();
+        var material0SymbolRel = material0.SymbolOffset - material0.Start;
+        var material0DiffuseRel = material0.DiffuseHashOffset - material0.Start;
+        var entry0SymbolRel = entry0.SymbolOffset - entry0.Start;
+
+        // Rebind the existing materials to the parts' textures (no-op when the names already match, e.g.
+        // re-importing the same model unchanged).
+        for (var i = 0; i < Math.Min(d, m); i++)
+        {
+            var target = layout.Materials[i];
+            if (TryBuildDonorMaterialBytes(donorLayout, i, original, target, distinct[i], out var donorBytes))
+            {
+                patches.Add(new RegionPatch(target.Start, target.End - target.Start, donorBytes));
+            }
+            else if (target.DiffuseHashOffset >= 0)
+            {
+                patches.Add(new RegionPatch(target.DiffuseHashOffset, 8, Hash8(distinct[i])));
+            }
+        }
+
+        var geometryDelta = 0;
+        if (d > m)
+        {
+            var newMaterials = new List<byte>();
+            var newGroupEntries = new List<byte>();
+            for (var i = m; i < d; i++)
+            {
+                var symbol = Crc64Ecma.Compute($"__v25_added_material_{i}_{distinct[i]}");
+
+                byte[] matBytes;
+                int symbolRel;
+                int diffuseRel;
+                if (donorLayout is not null && i < donorLayout.Materials.Count)
+                {
+                    var donor = donorLayout.Materials[i];
+                    matBytes = donorLayout.Original.AsSpan(donor.Start, donor.End - donor.Start).ToArray();
+                    symbolRel = donor.SymbolOffset - donor.Start;
+                    diffuseRel = donor.DiffuseHashOffset >= 0 ? donor.DiffuseHashOffset - donor.Start : -1;
+                }
+                else
+                {
+                    matBytes = (byte[])material0Bytes.Clone();
+                    symbolRel = material0SymbolRel;
+                    diffuseRel = material0DiffuseRel;
+                }
+
+                BinaryPrimitives.WriteUInt64LittleEndian(matBytes.AsSpan(symbolRel, 8), symbol);
+                if (diffuseRel >= 0)
+                {
+                    BinaryPrimitives.WriteUInt64LittleEndian(matBytes.AsSpan(diffuseRel, 8), TextureSymbolHash(distinct[i]));
+                }
+
+                newMaterials.AddRange(matBytes);
+
+                var entryBytes = (byte[])entry0Bytes.Clone();
+                BinaryPrimitives.WriteUInt64LittleEndian(entryBytes.AsSpan(entry0SymbolRel, 8), symbol);
+                newGroupEntries.AddRange(entryBytes);
+            }
+
+            var added = d - m;
+            geometryDelta = added * entry0.Length;
+
+            // New property sets go right after the last material; new material-group entries at the end of
+            // the pairing block. Both are zero-length inserts.
+            patches.Add(new RegionPatch(layout.MaterialsEndOffset, 0, newMaterials.ToArray()));
+            patches.Add(new RegionPatch(layout.MaterialGroupEntriesEndOffset, 0, newGroupEntries.ToArray()));
+            patches.Add(new RegionPatch(layout.MaterialCountFieldOffset, 4, U32(m + added)));
+            patches.Add(new RegionPatch(layout.MaterialGroupCountFieldOffset, 4, U32(layout.MaterialGroupEntries.Count + added)));
+            patches.Add(new RegionPatch(layout.MaterialGroupSizeFieldOffset, 4,
+                U32(ReadU32(original, layout.MaterialGroupSizeFieldOffset) + geometryDelta)));
+        }
+
+        // group entry i references material i (verified 1:1), so a part using texture i points at the
+        // (i+1)-th material (1-based).
+        for (var k = 0; k < partCount; k++)
+        {
+            batchIndex[k] = primTexIndex[k] + 1;
+        }
+
+        return new MaterialPlan(patches, batchIndex, geometryDelta);
+    }
+
+    private static string? ResolveDiffuseName(
+        GltfPrimitive primitive,
+        IReadOnlyList<IReadOnlyDictionary<string, string>>? textureSlotsByPrimitive,
+        int primitiveIndex)
+    {
+        if (textureSlotsByPrimitive is not null &&
+            primitiveIndex >= 0 &&
+            primitiveIndex < textureSlotsByPrimitive.Count &&
+            textureSlotsByPrimitive[primitiveIndex].TryGetValue("diffuse", out var mappedName) &&
+            !string.IsNullOrWhiteSpace(mappedName))
+        {
+            return StripTextureExtension(mappedName);
+        }
+
+        return V25MaterialAssignment.DiffuseName(primitive);
+    }
+
+    private static bool TryBuildDonorMaterialBytes(
+        V25MeshLayout? donorLayout,
+        int index,
+        byte[] targetData,
+        V25MaterialLayout target,
+        string diffuseName,
+        out byte[] bytes)
+    {
+        bytes = [];
+        if (donorLayout is null || index < 0 || index >= donorLayout.Materials.Count)
+        {
+            return false;
+        }
+
+        var donor = donorLayout.Materials[index];
+        var targetLength = target.End - target.Start;
+        var donorLength = donor.End - donor.Start;
+        if (donorLength != targetLength)
+        {
+            return false;
+        }
+
+        bytes = donorLayout.Original.AsSpan(donor.Start, donorLength).ToArray();
+        BinaryPrimitives.WriteUInt64LittleEndian(
+            bytes.AsSpan(donor.SymbolOffset - donor.Start, 8),
+            BinaryPrimitives.ReadUInt64LittleEndian(targetData.AsSpan(target.SymbolOffset, 8)));
+        if (donor.DiffuseHashOffset >= 0)
+        {
+            BinaryPrimitives.WriteUInt64LittleEndian(
+                bytes.AsSpan(donor.DiffuseHashOffset - donor.Start, 8),
+                TextureSymbolHash(diffuseName));
+        }
+
+        return true;
+    }
+
+    public static V25MeshLayout? TryFindSourceMaterialLayout(
+        GltfModel model,
+        string templateMeshPath,
+        string? modelPath)
+    {
+        var templateFolder = Path.GetDirectoryName(Path.GetFullPath(templateMeshPath));
+        foreach (var candidate in EnumerateSourceMeshCandidates(model, templateFolder, modelPath))
+        {
+            try
+            {
+                if (!File.Exists(candidate) ||
+                    Path.GetFullPath(candidate).Equals(Path.GetFullPath(templateMeshPath), StringComparison.OrdinalIgnoreCase))
+                {
+                    continue;
+                }
+
+                var layout = V25MeshLayout.Build(File.ReadAllBytes(candidate));
+                if (layout.Version == 25 && layout.Materials.Count > 0)
+                {
+                    return layout;
+                }
+            }
+            catch
+            {
+                // Best-effort only; the old target-material cloning path remains valid fallback.
+            }
+        }
+
+        return null;
+    }
+
+    private static IEnumerable<string> EnumerateSourceMeshCandidates(
+        GltfModel model,
+        string? templateFolder,
+        string? modelPath)
+    {
+        var seen = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        foreach (var sourcePath in model.Primitives
+                     .Select(p => p.SourceMeshPath)
+                     .Where(p => !string.IsNullOrWhiteSpace(p)))
+        {
+            foreach (var candidate in ExpandSourceCandidate(sourcePath!, templateFolder))
+            {
+                if (seen.Add(candidate))
+                {
+                    yield return candidate;
+                }
+            }
+        }
+
+        if (!string.IsNullOrWhiteSpace(modelPath) && templateFolder is not null)
+        {
+            var byStem = Path.Combine(templateFolder, Path.GetFileNameWithoutExtension(modelPath) + ".d3dmesh");
+            if (seen.Add(byStem))
+            {
+                yield return byStem;
+            }
+        }
+    }
+
+    private static IEnumerable<string> ExpandSourceCandidate(string sourcePath, string? templateFolder)
+    {
+        if (Path.IsPathRooted(sourcePath))
+        {
+            yield return sourcePath;
+        }
+        else if (templateFolder is not null)
+        {
+            yield return Path.Combine(templateFolder, sourcePath);
+            yield return Path.Combine(templateFolder, Path.GetFileName(sourcePath));
+        }
+    }
+
+    // True when this template's materials can be rebound/cloned to add textures (the common case). When
+    // false, a model with more textures than the template has materials will repeat textures instead.
+    public static bool CanAddMaterials(V25MeshLayout layout) => CanRebindMaterials(layout);
+
+    // The material<->material-group mapping must be 1:1 and in order for rebinding/cloning to be safe.
+    private static bool CanRebindMaterials(V25MeshLayout layout)
+    {
+        if (layout.Materials.Count == 0 ||
+            layout.Materials.Count != layout.MaterialGroupEntries.Count ||
+            layout.Materials[0].DiffuseHashOffset < 0)
+        {
+            return false;
+        }
+
+        for (var i = 0; i < layout.Materials.Count; i++)
+        {
+            var matSym = BitConverter.ToUInt64(layout.Original, layout.Materials[i].SymbolOffset);
+            var groupSym = BitConverter.ToUInt64(layout.Original, layout.MaterialGroupEntries[i].SymbolOffset);
+            if (matSym != groupSym)
+            {
+                return false;
+            }
+        }
+
+        return true;
+    }
+
+    private static byte[] Hash8(string name)
+    {
+        var bytes = new byte[8];
+        BinaryPrimitives.WriteUInt64LittleEndian(bytes, TextureSymbolHash(name));
+        return bytes;
+    }
+
+    // Telltale's texture symbol is the CRC64 of the file name WITH its .d3dtx extension (the mesh stores
+    // e.g. CRC64("obj_chairApartmentCoveA.d3dtx"), not CRC64("obj_chairApartmentCoveA")). Binding a
+    // material to the extension-less hash leaves the engine unable to find the texture (black model).
+    private static ulong TextureSymbolHash(string name)
+    {
+        var stem = name.EndsWith(".d3dtx", StringComparison.OrdinalIgnoreCase) ? name : name + ".d3dtx";
+        return Crc64Ecma.Compute(stem);
+    }
+
+    private static string StripTextureExtension(string name)
+        => name.EndsWith(".d3dtx", StringComparison.OrdinalIgnoreCase) ? name[..^6] : name;
+
+    private static byte[] RawMaterialIndex(int index1Based)
+    {
+        var bytes = new byte[4];
+        BinaryPrimitives.WriteUInt32LittleEndian(bytes, index1Based > 0 ? (uint)(index1Based - 1) : 0xFFFFFFFFu);
+        return bytes;
+    }
+
+    private static int ReadU32(byte[] data, int offset)
+        => (int)BinaryPrimitives.ReadUInt32LittleEndian(data.AsSpan(offset, 4));
+
+    private static void WriteU32Into(byte[] bytes, int at, int value)
+        => BinaryPrimitives.WriteUInt32LittleEndian(bytes.AsSpan(at, 4), (uint)value);
+
+    private sealed class V25Vertex
+    {
+        public Vector3 Position;
+        public Vector3 Normal;
+        public Vector4 Tangent;
+        public Vector4 Binormal;
+        public Vector4 Color;
+        public required Vector2[] Uv; // index 0..5 = uv1..uv6
+        public int[] Bones = [0, 0, 0, 0];      // indices into this part's bone palette
+        public float[] Weights = [1f, 0f, 0f, 0f];
+    }
+
+    private readonly record struct V25UvScaleValue(float XMult, float YMult, float XStart, float YStart);
+
+    private static byte[] BuildVertexBufferBytes(
+        V25MeshLayout layout,
+        int bufferIndexZeroBased,
+        int stride,
+        List<V25Vertex> verts,
+        Dictionary<int, V25UvScaleValue> uvScaleByLayer,
+        bool glbHasVertexColor = true)
+    {
+        var bufferKey = bufferIndexZeroBased + 1; // attribute Buffer field is +1 (1,2,3)
+        var attrs = layout.Attributes.Where(a => a.Key.Length > 0 && a.Buffer == bufferKey).ToList();
+        var bytes = new byte[verts.Count * stride];
+
+        // Colour streams the GLB doesn't carry are filled from the template, not white. The exporter only
+        // round-trips the first colour stream as alpha (and only when the mesh uses it), and never the
+        // second stream — so Michonne's hair transparency lives in "colors2", which a GLB round-trip would
+        // otherwise wipe to white and leave the hair with black blend artifacts. These streams are
+        // constant per mesh in practice, so the template's first vertex value is replicated to every
+        // output vertex (vertex counts diverge across UV/normal seam splits, so an index copy can't work).
+        var original = layout.VertexBuffers[bufferIndexZeroBased];
+        var templateColor = new Dictionary<string, byte[]>(StringComparer.Ordinal);
+        foreach (var attr in attrs)
+        {
+            var preserve = attr.Key == "colors2" || (attr.Key == "colors" && !glbHasVertexColor);
+            if (preserve && original.PayloadOffset > 0 && original.Count > 0 &&
+                original.PayloadOffset + attr.BufferOffset + 4 <= layout.Original.Length)
+            {
+                var rep = new byte[4];
+                Array.Copy(layout.Original, original.PayloadOffset + attr.BufferOffset, rep, 0, 4);
+                templateColor[attr.Key] = rep;
+            }
+        }
+
+        for (var i = 0; i < verts.Count; i++)
+        {
+            var vertexBase = i * stride;
+            var v = verts[i];
+            foreach (var attr in attrs)
+            {
+                var at = vertexBase + attr.BufferOffset;
+                if (templateColor.TryGetValue(attr.Key, out var rep))
+                {
+                    Array.Copy(rep, 0, bytes, at, 4);
+                    continue;
+                }
+                switch (attr.Key)
+                {
+                    case "position":
+                        WriteVec3F32(bytes, at, v.Position);
+                        break;
+                    case "normals":
+                        WriteNormalShort4(bytes, at, v.Normal.X, v.Normal.Y, v.Normal.Z, 0f);
+                        break;
+                    case "binormals":
+                        WriteNormalShort4(bytes, at, v.Binormal.X, v.Binormal.Y, v.Binormal.Z, v.Binormal.W);
+                        break;
+                    case "tangents":
+                        WriteNormalShort4(bytes, at, v.Tangent.X, v.Tangent.Y, v.Tangent.Z, v.Tangent.W);
+                        break;
+                    case "colors":
+                        WriteColorUn8(bytes, at, v.Color);
+                        break;
+                    case "colors2":
+                        WriteColorUn8(bytes, at, v.Color);
+                        break;
+                    case "weights":
+                        WriteWeightsShort4(bytes, at, v.Weights);
+                        break;
+                    case "bones":
+                        WriteBonesByte4(bytes, at, v.Bones);
+                        break;
+                    default:
+                        if (attr.Key.StartsWith("uv", StringComparison.Ordinal) &&
+                            int.TryParse(attr.Key.AsSpan(2), out var layer1Based))
+                        {
+                            WriteUv(bytes, at, attr.Format, v.Uv[Math.Clamp(layer1Based - 1, 0, 5)], layer1Based - 1, uvScaleByLayer);
+                        }
+                        break;
+                }
+            }
+        }
+
+        return bytes;
+    }
+
+    private static void WriteUv(byte[] bytes, int at, int format, Vector2 uv, int layer0Based, Dictionary<int, V25UvScaleValue> uvScaleByLayer)
+    {
+        // The stored ("decoded") UV the file holds equals what the GLB carries: the parser reads
+        // displayV = 1 - decoded, and the exporter writes TEXCOORD V = 1 - displayV = decoded. So the
+        // glTF UV already IS the stored value — write U and V straight through, no extra V flip.
+        var decodedU = uv.X;
+        var decodedV = uv.Y;
+        switch (format)
+        {
+            case 2: // F32x2
+                WriteFloat(bytes, at, decodedU);
+                WriteFloat(bytes, at + 4, decodedV);
+                break;
+            case 19: // SN16x2 with optional per-layer scale (identity when the layer owns no transform)
+                var scale = uvScaleByLayer.TryGetValue(layer0Based, out var s) ? s : new V25UvScaleValue(1, 1, 0, 0);
+                WriteInt16(bytes, at, QuantizeUv(decodedU, scale.XStart, scale.XMult));
+                WriteInt16(bytes, at + 2, QuantizeUv(decodedV, scale.YStart, scale.YMult));
+                break;
+            default:
+                throw new InvalidDataException($"Unsupported V25 UV format {format} for reinsertion.");
+        }
+    }
+
+    private static short QuantizeUv(float decoded, float start, float mult)
+    {
+        var unit = mult != 0f ? (decoded - start) / mult : 0f;
+        return (short)Math.Clamp((int)MathF.Round(unit * 32767f), short.MinValue, short.MaxValue);
+    }
+
+    // Recomputes a tight scale for a quantized UV layer so the int16 range covers the model's UV span.
+    // start = min(decoded), mult = span; encode maps [start, start+mult] onto [0, 32767].
+    private static V25UvScaleValue ComputeUvScale(List<V25Vertex> verts, int layer0Based)
+    {
+        float minU = float.MaxValue, minV = float.MaxValue, maxU = float.MinValue, maxV = float.MinValue;
+        foreach (var v in verts)
+        {
+            var uv = v.Uv[Math.Clamp(layer0Based, 0, 5)];
+            var decodedU = uv.X;
+            var decodedV = uv.Y;
+            minU = MathF.Min(minU, decodedU);
+            maxU = MathF.Max(maxU, decodedU);
+            minV = MathF.Min(minV, decodedV);
+            maxV = MathF.Max(maxV, decodedV);
+        }
+
+        if (minU > maxU)
+        {
+            minU = maxU = minV = maxV = 0f;
+        }
+
+        var multU = maxU - minU;
+        var multV = maxV - minV;
+        return new V25UvScaleValue(multU != 0f ? multU : 1f, multV != 0f ? multV : 1f, minU, minV);
+    }
+
+    private static byte[] FaceBytes(List<int> faces)
+    {
+        var bytes = new byte[faces.Count * 2];
+        for (var i = 0; i < faces.Count; i++)
+        {
+            BinaryPrimitives.WriteUInt16LittleEndian(bytes.AsSpan(i * 2, 2), (ushort)faces[i]);
+        }
+
+        return bytes;
+    }
+
+    private static byte[] BoundsBytes(List<V25Vertex> verts, int start, int endExclusive)
+    {
+        float minX = float.MaxValue, minY = float.MaxValue, minZ = float.MaxValue;
+        float maxX = float.MinValue, maxY = float.MinValue, maxZ = float.MinValue;
+        for (var i = start; i < endExclusive && i < verts.Count; i++)
+        {
+            var p = verts[i].Position;
+            minX = MathF.Min(minX, p.X); minY = MathF.Min(minY, p.Y); minZ = MathF.Min(minZ, p.Z);
+            maxX = MathF.Max(maxX, p.X); maxY = MathF.Max(maxY, p.Y); maxZ = MathF.Max(maxZ, p.Z);
+        }
+
+        if (minX > maxX)
+        {
+            minX = minY = minZ = maxX = maxY = maxZ = 0f;
+        }
+
+        var bytes = new byte[24];
+        WriteFloat(bytes, 0, minX); WriteFloat(bytes, 4, minY); WriteFloat(bytes, 8, minZ);
+        WriteFloat(bytes, 12, maxX); WriteFloat(bytes, 16, maxY); WriteFloat(bytes, 20, maxZ);
+        return bytes;
+    }
+
+    private static byte[] UvScaleBytes(V25UvScaleValue s)
+    {
+        var bytes = new byte[16];
+        WriteFloat(bytes, 0, s.XMult); WriteFloat(bytes, 4, s.YMult);
+        WriteFloat(bytes, 8, s.XStart); WriteFloat(bytes, 12, s.YStart);
+        return bytes;
+    }
+
+    private static void WriteVec3F32(byte[] bytes, int at, Vector3 v)
+    {
+        WriteFloat(bytes, at, v.X);
+        WriteFloat(bytes, at + 4, v.Y);
+        WriteFloat(bytes, at + 8, v.Z);
+    }
+
+    private static void WriteNormalShort4(byte[] bytes, int at, float x, float y, float z, float w)
+    {
+        WriteInt16(bytes, at, ToSNorm16(x));
+        WriteInt16(bytes, at + 2, ToSNorm16(y));
+        WriteInt16(bytes, at + 4, ToSNorm16(z));
+        WriteInt16(bytes, at + 6, ToSNorm16(w));
+    }
+
+    private static void WriteColorUn8(byte[] bytes, int at, Vector4 c)
+    {
+        bytes[at] = ToUNorm8(c.X);
+        bytes[at + 1] = ToUNorm8(c.Y);
+        bytes[at + 2] = ToUNorm8(c.Z);
+        bytes[at + 3] = ToUNorm8(c.W);
+    }
+
+    private static short ToSNorm16(float value)
+        => (short)Math.Clamp((int)MathF.Round(Math.Clamp(value, -1f, 1f) * 32767f), short.MinValue, short.MaxValue);
+
+    private static byte ToUNorm8(float value)
+        => (byte)Math.Clamp((int)MathF.Round(Math.Clamp(value, 0f, 1f) * 255f), 0, 255);
+
+    private static void WriteFloat(byte[] bytes, int at, float value)
+        => BinaryPrimitives.WriteSingleLittleEndian(bytes.AsSpan(at, 4), value);
+
+    private static void WriteInt16(byte[] bytes, int at, short value)
+        => BinaryPrimitives.WriteInt16LittleEndian(bytes.AsSpan(at, 2), value);
+
+    // Blend weights: 4x int16 normalized (value/32767 on read, so value = weight*32767). Renormalized so
+    // the four weights sum to 1 (the engine expects normalized weights; the GLB's may drift slightly).
+    private static void WriteWeightsShort4(byte[] bytes, int at, float[] weights)
+    {
+        var sum = weights[0] + weights[1] + weights[2] + weights[3];
+        var inv = sum > 1e-6f ? 1f / sum : 0f;
+        for (var i = 0; i < 4; i++)
+        {
+            var w = inv > 0f ? weights[i] * inv : (i == 0 ? 1f : 0f);
+            WriteInt16(bytes, at + i * 2, (short)Math.Clamp((int)MathF.Round(w * 32767f), 0, 32767));
+        }
+    }
+
+    // Blend bone indices: 4x byte, each the palette index multiplied by 3 (the parser reads byte/3). A
+    // V25 palette holds at most 85 bones (255/3).
+    private static void WriteBonesByte4(byte[] bytes, int at, int[] bones)
+    {
+        for (var i = 0; i < 4; i++)
+        {
+            bytes[at + i] = (byte)(Math.Clamp(bones[i], 0, 85) * 3);
+        }
+    }
+
+    // Maps each bone hash in a palette to its index, so a GLB joint can be resolved back to the index the
+    // vertex blend bytes must store.
+    private static Dictionary<ulong, int> BuildPaletteHashIndex(V25BonePaletteLayout palette)
+    {
+        var map = new Dictionary<ulong, int>(palette.BoneHashes.Length);
+        for (var i = 0; i < palette.BoneHashes.Length; i++)
+        {
+            map.TryAdd(palette.BoneHashes[i], i);
+        }
+
+        return map;
+    }
+
+    // The 0-based bone palette a part's vertices index into: the palette of the template batch this part
+    // maps to (same-count = batch k; different count = clamped). BoneSetIndex is +1 (0 = none -> palette 0).
+    private static int PaletteForPrimitive(V25MeshLayout layout, int primitiveIndex, int partCount)
+    {
+        if (layout.Batches.Count == 0)
+        {
+            return 0;
+        }
+
+        var batchIndex = partCount == layout.Batches.Count
+            ? primitiveIndex
+            : Math.Min(primitiveIndex, layout.Batches.Count - 1);
+        var boneSet = layout.Batches[batchIndex].BoneSetIndex; // +1 convention
+        var palette = boneSet > 0 ? boneSet - 1 : 0;
+        return Math.Clamp(palette, 0, layout.BonePalettes.Count - 1);
+    }
+
+    // Resolves a GLB vertex's 4 joints/weights to the mesh's palette indices. A joint absent from the
+    // palette (a bone the target skeleton doesn't have in this set) drops to weight 0; weights are
+    // renormalized on write. Returns via the vertex's Bones/Weights arrays.
+    private static void AssignSkinning(
+        V25Vertex vertex,
+        GltfModel model,
+        GltfPrimitive prim,
+        int vertexIndex,
+        Dictionary<ulong, int> paletteHashToIndex,
+        ref int unresolvedJoints)
+    {
+        var joints0 = prim.Joints0!;
+        var weights0 = prim.Weights0!;
+        var baseIndex = vertexIndex * 4;
+        var w = weights0[vertexIndex];
+        var weightByLane = new[] { w.X, w.Y, w.Z, w.W };
+        var bones = new int[4];
+        var weights = new float[4];
+        for (var lane = 0; lane < 4; lane++)
+        {
+            var jointIndex = baseIndex + lane < joints0.Length ? joints0[baseIndex + lane] : 0;
+            var paletteIndex = ResolveJointPaletteIndex(model, jointIndex, paletteHashToIndex);
+            if (paletteIndex >= 0)
+            {
+                bones[lane] = paletteIndex;
+                weights[lane] = weightByLane[lane];
+            }
+            else
+            {
+                bones[lane] = 0;
+                weights[lane] = 0f;
+                if (weightByLane[lane] > 0.0001f)
+                {
+                    unresolvedJoints++;
+                }
+            }
+        }
+
+        if (weights[0] + weights[1] + weights[2] + weights[3] <= 1e-6f)
+        {
+            weights[0] = 1f; // fully unresolved vertex: bind to the first palette bone rather than nothing
+        }
+
+        vertex.Bones = bones;
+        vertex.Weights = weights;
+    }
+
+    private static int ResolveJointPaletteIndex(GltfModel model, int jointIndex, Dictionary<ulong, int> paletteHashToIndex)
+    {
+        if (jointIndex < 0 || jointIndex >= model.Joints.Count)
+        {
+            return -1;
+        }
+
+        var joint = model.Joints[jointIndex];
+        if (joint.Hash is { } hash && paletteHashToIndex.TryGetValue(hash, out var byHash))
+        {
+            return byHash;
+        }
+
+        if (!string.IsNullOrWhiteSpace(joint.Name) &&
+            paletteHashToIndex.TryGetValue(Crc64Ecma.Compute(joint.Name), out var byName))
+        {
+            return byName;
+        }
+
+        return -1;
+    }
+
+    private const int MaxPaletteBones = 85; // vertex bone byte = paletteIndex * 3, max 255 -> index <= 85
+
+    // The distinct bone hashes the imported model's vertices reference (weight > 0), in first-appearance
+    // order. Used to rebuild a palette that covers a foreign rig the template's subset doesn't.
+    private static List<ulong> CollectUsedBoneHashes(GltfModel model)
+    {
+        var seen = new HashSet<ulong>();
+        var ordered = new List<ulong>();
+        foreach (var prim in model.Primitives)
+        {
+            if (prim.Joints0 is null || prim.Weights0 is null)
+            {
+                continue;
+            }
+
+            for (var v = 0; v < prim.VertexCount; v++)
+            {
+                var w = prim.Weights0[v];
+                var lanes = new[] { w.X, w.Y, w.Z, w.W };
+                for (var l = 0; l < 4; l++)
+                {
+                    if (lanes[l] <= 0.0001f)
+                    {
+                        continue;
+                    }
+
+                    var ji = v * 4 + l < prim.Joints0.Length ? prim.Joints0[v * 4 + l] : 0;
+                    var hash = ResolveJointHash(model, ji);
+                    if (hash != 0 && seen.Add(hash))
+                    {
+                        ordered.Add(hash);
+                    }
+                }
+            }
+        }
+
+        return ordered;
+    }
+
+    private static ulong ResolveJointHash(GltfModel model, int jointIndex)
+    {
+        if (jointIndex < 0 || jointIndex >= model.Joints.Count)
+        {
+            return 0;
+        }
+
+        var joint = model.Joints[jointIndex];
+        if (joint.Hash is { } h && h != 0)
+        {
+            return h;
+        }
+
+        return string.IsNullOrWhiteSpace(joint.Name) ? 0 : Crc64Ecma.Compute(joint.Name);
+    }
+
+    private static Dictionary<ulong, int> BuildHashIndexMap(ulong[] bones)
+    {
+        var map = new Dictionary<ulong, int>(bones.Length);
+        for (var i = 0; i < bones.Length; i++)
+        {
+            map.TryAdd(bones[i], i);
+        }
+
+        return map;
+    }
+
+    // Builds an mBonePalettes block with a single palette of the given bones. Per the toolkit's
+    // T3MeshBoneEntry, each 56-byte entry is: mBoneName(symbol, 8) + mBoundingBox(min3f,max3f, 24) +
+    // a constant u32 (0x14) + mBoundingSphere(center3f,radius, 16) + mNumVerts(4). The bounds and the
+    // influence count are computed from the vertices each bone actually drives.
+    private static byte[] BuildV25PaletteBlock(ulong[] bones, List<V25Vertex> verts)
+    {
+        const uint BoneEntryConstant = 0x14; // fixed field between the box and the sphere in every entry
+        var blockSize = 12 + bones.Length * 56;
+        var bytes = new byte[blockSize];
+        var p = 0;
+        void U32w(uint value) { BinaryPrimitives.WriteUInt32LittleEndian(bytes.AsSpan(p, 4), value); p += 4; }
+        void F32w(float value) { BinaryPrimitives.WriteSingleLittleEndian(bytes.AsSpan(p, 4), value); p += 4; }
+
+        U32w((uint)blockSize);
+        U32w(1);
+        U32w((uint)bones.Length);
+        for (var i = 0; i < bones.Length; i++)
+        {
+            var (min, max, count) = BoneInfluence(verts, i);
+            U32w((uint)(bones[i] & 0xFFFFFFFF));
+            U32w((uint)(bones[i] >> 32));
+            F32w(min.X); F32w(min.Y); F32w(min.Z);
+            F32w(max.X); F32w(max.Y); F32w(max.Z);
+            U32w(BoneEntryConstant);
+            var center = (min + max) * 0.5f;
+            F32w(center.X); F32w(center.Y); F32w(center.Z);
+            F32w((max - min).Length() * 0.5f);
+            U32w((uint)count); // mNumVerts
+        }
+
+        return bytes;
+    }
+
+    private static (Vector3 Min, Vector3 Max, int Count) BoneInfluence(List<V25Vertex> verts, int boneIndex)
+    {
+        var min = new Vector3(float.MaxValue);
+        var max = new Vector3(float.MinValue);
+        var count = 0;
+        foreach (var v in verts)
+        {
+            for (var l = 0; l < 4; l++)
+            {
+                if (v.Bones[l] == boneIndex && v.Weights[l] > 0.0001f)
+                {
+                    min = Vector3.Min(min, v.Position);
+                    max = Vector3.Max(max, v.Position);
+                    count++;
+                    break;
+                }
+            }
+        }
+
+        return count > 0 ? (min, max, count) : (Vector3.Zero, Vector3.Zero, 0);
+    }
+
+    private static byte[] U32(int value)
+    {
+        var bytes = new byte[4];
+        BinaryPrimitives.WriteUInt32LittleEndian(bytes, (uint)value);
+        return bytes;
+    }
+
+    private static Vector2 Uv(Vector2[]? channel, int index)
+        => channel is not null && index < channel.Length ? channel[index] : Vector2.Zero;
+
+    private static bool HasChannel<T>(T[]? channel, int vertexCount)
+        => channel is not null && channel.Length >= vertexCount && vertexCount > 0;
+
+    private static Vector3[] ComputeNormals(GltfPrimitive prim)
+    {
+        var normals = new Vector3[prim.VertexCount];
+        for (var i = 0; i + 2 < prim.Indices.Length; i += 3)
+        {
+            int a = prim.Indices[i], b = prim.Indices[i + 1], c = prim.Indices[i + 2];
+            if ((uint)a >= (uint)prim.VertexCount || (uint)b >= (uint)prim.VertexCount || (uint)c >= (uint)prim.VertexCount)
+            {
+                continue;
+            }
+
+            var n = Vector3.Cross(prim.Positions[b] - prim.Positions[a], prim.Positions[c] - prim.Positions[a]);
+            normals[a] += n; normals[b] += n; normals[c] += n;
+        }
+
+        for (var i = 0; i < normals.Length; i++)
+        {
+            normals[i] = normals[i].LengthSquared() > 1e-12f ? Vector3.Normalize(normals[i]) : new Vector3(0, 1, 0);
+        }
+
+        return normals;
+    }
+
+    private static Vector4[] ComputeTangents(GltfPrimitive prim, Vector3[] normals)
+    {
+        // A stable orthonormal tangent per vertex (handedness +1). Adequate for static props; the GLB's
+        // own TANGENT is used when present.
+        var tangents = new Vector4[prim.VertexCount];
+        for (var i = 0; i < tangents.Length; i++)
+        {
+            var n = normals[i];
+            var helper = MathF.Abs(n.Y) < 0.99f ? Vector3.UnitY : Vector3.UnitX;
+            var t = Vector3.Normalize(Vector3.Cross(helper, n));
+            tangents[i] = new Vector4(t, 1f);
+        }
+
+        return tangents;
+    }
+
+    private static Vector4[] ComputeBinormals(Vector3[] normals, Vector4[] tangents)
+    {
+        var binormals = new Vector4[normals.Length];
+        for (var i = 0; i < binormals.Length; i++)
+        {
+            var n = normals[i];
+            var t = new Vector3(tangents[i].X, tangents[i].Y, tangents[i].Z);
+            var b = Vector3.Cross(n, t) * tangents[i].W;
+            binormals[i] = new Vector4(b, 0f);
+        }
+
+        return binormals;
     }
 }

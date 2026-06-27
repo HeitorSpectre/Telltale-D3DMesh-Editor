@@ -332,6 +332,23 @@ internal static class DamageVariantPlanner
             return;
         }
 
+        // Some TWD Michonne damage heads are complete alternate heads named headDamageA/B/C/D rather
+        // than surface decals. If they occupy the clean head region, they replace head instead of being
+        // layered together with it.
+        var headReplacement = anchors.FirstOrDefault(anchor =>
+            anchor.Tail.Equals("head", StringComparison.OrdinalIgnoreCase) &&
+            spot.Members.All(member =>
+                member.Tail.StartsWith("headDamage", StringComparison.OrdinalIgnoreCase) &&
+                (Coincidence(member, anchor.Cells) >= HeadReplaceCoincidence ||
+                 IoU(member.Bounds, anchor.Bounds) >= SameSpotIoU)));
+        if (headReplacement is not null)
+        {
+            spot.AnchorNormal = headReplacement;
+            spot.IsAnchorReplacement = true;
+            spot.Wounds.AddRange(spot.Members);
+            return;
+        }
+
         // 4) Body-sized replacements (Grendel armSevered/armSevering swap the whole body).
         var body = anchors
             .FirstOrDefault(anchor => anchor.Tail.Equals("body", StringComparison.OrdinalIgnoreCase));

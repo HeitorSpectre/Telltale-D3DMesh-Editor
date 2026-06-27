@@ -231,9 +231,11 @@ public sealed class ModelAssetGroup
 
     // Parts that should never be combined. Headlight beam cones ("..._lightsBeamsHeadlights") are
     // volumetric light projections, not body geometry: combined, they show up as large stray shapes
-    // that do not fit the car. They are kept out of every group and remain available on their own.
+    // that do not fit the car. The plain Skip Jack companion shell is a grey static carrier for
+    // separately-textured boat parts, so it is also kept out of combined groups.
     private static bool IsExcludedFromCombine(string stem)
-        => stem.Contains("BeamsHeadlights", StringComparison.OrdinalIgnoreCase);
+        => stem.Contains("BeamsHeadlights", StringComparison.OrdinalIgnoreCase) ||
+           stem.Equals("obj_skipJackCompanion", StringComparison.OrdinalIgnoreCase);
 
 
     private static IEnumerable<ModelAssetGroup> AppendOptionalAccessories(
@@ -309,7 +311,8 @@ public sealed class ModelAssetGroup
                 BuildGroupsForModel(skeletonPath, group.Key, relativeDirectory, group.ToList()));
         }
 
-        return BuildGroupsForModel(skeletonPath, skeletonStem, relativeDirectory, assets);
+        var onlyModel = byModel[0];
+        return BuildGroupsForModel(skeletonPath, onlyModel.Key, relativeDirectory, onlyModel.ToList());
     }
 
     // Builds the groups for one model (identified by <paramref name="stem"/>, which is the skeleton name
@@ -370,6 +373,17 @@ public sealed class ModelAssetGroup
                 {
                     groups.AddRange(BuildCharacterGroups(
                         skeletonStem, skeletonPath, relativeDirectory, recognized, parts, includeDamagePresets: false));
+                    var existingNames = groups
+                        .Select(group => group.Name)
+                        .ToHashSet(StringComparer.OrdinalIgnoreCase);
+                    foreach (var stateGroup in BuildExplicitExclusiveStateGroups(
+                                 skeletonStem, skeletonPath, relativeDirectory, recognized))
+                    {
+                        if (existingNames.Add(stateGroup.Name))
+                        {
+                            groups.Add(stateGroup);
+                        }
+                    }
                 }
 
                 groups.AddRange(damagePresets);
@@ -529,6 +543,7 @@ public sealed class ModelAssetGroup
         // so the default picks the cleanest representative (prefer no variant, then the fewest
         // damage/state markers) instead of dropping the slot and leaving the body missing limbs.
         var defaultParts = recognized
+            .Where(part => !IsHeadReplacementNeckPart(part))
             .GroupBy(part => part.Slot, StringComparer.OrdinalIgnoreCase)
             .Select(PickSlotDefault)
             .ToList();
@@ -568,12 +583,48 @@ public sealed class ModelAssetGroup
                 recognized)
             .ToList();
         var completeVariantPartPaths = completeVariantGroups
-            .SelectMany(group => group.Group.Assets)
+            .SelectMany(group => group.VariantParts)
+            .Select(part => part.Asset)
             .Select(asset => asset.MeshPath)
             .ToHashSet(StringComparer.OrdinalIgnoreCase);
         foreach (var completeVariantGroup in completeVariantGroups)
         {
             yield return completeVariantGroup.Group;
+        }
+
+        foreach (var crabberLetterGroup in BuildIncompleteCrabberLetterGroups(
+                     skeletonStem, skeletonPath, relativeDirectory, defaultParts, recognized))
+        {
+            yield return crabberLetterGroup;
+        }
+
+        var completeVariantGroupNames = completeVariantGroups
+            .Select(group => group.Group.Name)
+            .ToHashSet(StringComparer.OrdinalIgnoreCase);
+        var explicitStateGroups = BuildExplicitExclusiveStateGroups(
+                skeletonStem,
+                skeletonPath,
+                relativeDirectory,
+                recognized)
+            .Where(group => !completeVariantGroupNames.Contains(group.Name))
+            .ToList();
+        foreach (var explicitStateGroup in explicitStateGroups)
+        {
+            foreach (var asset in explicitStateGroup.Assets)
+            {
+                completeVariantPartPaths.Add(asset.MeshPath);
+            }
+
+            yield return explicitStateGroup;
+        }
+
+        // Crabber is authored as lettered outfits. A/B/C have complete limb/torso sets in the
+        // shipped files, while later letters reuse whichever base pieces exist. Build each headless
+        // outfit explicitly so neckStump replaces the entire head assembly for every letter.
+        foreach (var crabberNeckStumpGroup in BuildCrabberNeckStumpGroups(
+                     skeletonStem, skeletonPath, relativeDirectory, defaultParts, recognized))
+        {
+            yield return crabberNeckStumpGroup;
         }
 
         // Additive variants (e.g. Beast's headBeastOutBrokenNose) are normally left out of variant
@@ -586,35 +637,56 @@ public sealed class ModelAssetGroup
         foreach (var variantGroup in variantParts.GroupBy(part => part.Variant, StringComparer.OrdinalIgnoreCase))
         {
             var variants = variantGroup.ToList();
+            if (IsCrabberStem(skeletonStem) && variants.All(IsNeckStumpPart))
+            {
+                continue;
+            }
+
+            if (IsCrabberStem(skeletonStem) && variants.All(IsSingleLetterCrabberHeadPart))
+            {
+                continue;
+            }
+
+            if (variants.All(IsNeckStumpPart) && recognized.Any(IsDecapitatedHeadPart))
+            {
+                continue;
+            }
+
             if (variants.Any(part => completeVariantPartPaths.Contains(part.Asset.MeshPath)))
             {
                 continue;
             }
 
             var relatedVariants = FindRelatedVariantParts(variants, variantParts).ToList();
+            var companionStateParts = FindCompanionStateParts(variants, recognized).ToList();
             // A variant occupying a slot replaces that slot's default part. Additive damage decals are
             // never in this loop for planner-driven characters, so additive variants reaching here (e.g.
             // Beast's headBeastOutBrokenNose) are real replacements and must override their slot.
             var overriddenSlots = variants
                 .Concat(relatedVariants)
+                .Concat(companionStateParts)
                 .Select(part => part.Slot)
                 .ToHashSet(StringComparer.OrdinalIgnoreCase);
+            AddHeadReplacementOverriddenSlots(overriddenSlots, variants);
+
             var groupParts = defaultParts
                 .Where(part => !overriddenSlots.Contains(part.Slot))
                 .ToList();
             groupParts.AddRange(relatedVariants);
+            groupParts.AddRange(companionStateParts);
             groupParts.AddRange(variants);
 
             // Keep exactly one part per slot so a preset never ends up with two left arms / two heads.
             // Prefer the explicitly selected variant, then a related variant, then the default part.
             var variantPaths = variants.Select(part => part.Asset.MeshPath).ToHashSet(StringComparer.OrdinalIgnoreCase);
             var relatedPaths = relatedVariants.Select(part => part.Asset.MeshPath).ToHashSet(StringComparer.OrdinalIgnoreCase);
+            var companionPaths = companionStateParts.Select(part => part.Asset.MeshPath).ToHashSet(StringComparer.OrdinalIgnoreCase);
             var unique = groupParts
                 .DistinctBy(part => part.Asset.MeshPath, StringComparer.OrdinalIgnoreCase)
                 .GroupBy(part => part.Slot, StringComparer.OrdinalIgnoreCase)
                 .Select(slotGroup => slotGroup
                     .OrderByDescending(part => variantPaths.Contains(part.Asset.MeshPath) ? 2
-                        : relatedPaths.Contains(part.Asset.MeshPath) ? 1 : 0)
+                        : relatedPaths.Contains(part.Asset.MeshPath) || companionPaths.Contains(part.Asset.MeshPath) ? 1 : 0)
                     .ThenBy(part => part.Asset.MeshPath, StringComparer.OrdinalIgnoreCase)
                     .First())
                 .ToList();
@@ -993,6 +1065,8 @@ public sealed class ModelAssetGroup
             var overriddenSlots = variants
                 .Select(part => part.Slot)
                 .ToHashSet(StringComparer.OrdinalIgnoreCase);
+            AddHeadReplacementOverriddenSlots(overriddenSlots, variants);
+
             var groupParts = defaultParts
                 .Where(part => !overriddenSlots.Contains(part.Slot))
                 .ToList();
@@ -1014,6 +1088,42 @@ public sealed class ModelAssetGroup
                     unique.Select(part => part.Asset)),
                 variants);
         }
+
+        foreach (var decapitatedHead in variantParts.Where(IsDecapitatedHeadPart))
+        {
+            var neckStumps = recognized.Where(IsNeckStumpPart).ToList();
+            if (neckStumps.Count == 0)
+            {
+                continue;
+            }
+
+            var relatedVariants = FindRelatedVariantParts([decapitatedHead], variantParts).ToList();
+            var overriddenSlots = relatedVariants
+                .Append(decapitatedHead)
+                .Concat(neckStumps)
+                .Select(part => part.Slot)
+                .ToHashSet(StringComparer.OrdinalIgnoreCase);
+
+            var groupParts = defaultParts
+                .Where(part => !overriddenSlots.Contains(part.Slot))
+                .Concat(relatedVariants)
+                .Append(decapitatedHead)
+                .Concat(neckStumps)
+                .DistinctBy(part => part.Asset.MeshPath, StringComparer.OrdinalIgnoreCase)
+                .ToList();
+            if (groupParts.Count <= 1)
+            {
+                continue;
+            }
+
+            yield return new CompleteVariantGroup(
+                CreateGroup(
+                    $"{skeletonStem}_Decapitation",
+                    skeletonPath,
+                    relativeDirectory,
+                    groupParts.Select(part => part.Asset)),
+                groupParts.Where(part => part.Asset == decapitatedHead.Asset || neckStumps.Contains(part)).ToList());
+        }
     }
 
     private static IEnumerable<PartInfo> BuildDefaultGroupParts(
@@ -1025,6 +1135,43 @@ public sealed class ModelAssetGroup
             .DistinctBy(part => part.Asset.MeshPath, StringComparer.OrdinalIgnoreCase);
     }
 
+    private static IEnumerable<ModelAssetGroup> BuildExplicitExclusiveStateGroups(
+        string skeletonStem,
+        string skeletonPath,
+        string relativeDirectory,
+        IReadOnlyList<PartInfo> recognized)
+    {
+        var defaultParts = recognized
+            .Where(part => !IsHeadReplacementNeckPart(part))
+            .GroupBy(part => part.Slot, StringComparer.OrdinalIgnoreCase)
+            .Select(PickSlotDefault)
+            .ToList();
+        foreach (var variant in recognized
+                     .Where(part => !string.IsNullOrEmpty(part.Variant) && IsExclusiveStatePart(part))
+                     .Where(part => !IsCrabberStem(skeletonStem) || !IsNeckStumpPart(part))
+                     .OrderBy(part => part.Tail, StringComparer.OrdinalIgnoreCase))
+        {
+            var overriddenSlots = new HashSet<string>(StringComparer.OrdinalIgnoreCase) { variant.Slot };
+            AddHeadReplacementOverriddenSlots(overriddenSlots, [variant]);
+
+            var groupParts = defaultParts
+                .Where(part => !overriddenSlots.Contains(part.Slot))
+                .Append(variant)
+                .DistinctBy(part => part.Asset.MeshPath, StringComparer.OrdinalIgnoreCase)
+                .ToList();
+            if (groupParts.Count <= 1)
+            {
+                continue;
+            }
+
+            yield return CreateGroup(
+                $"{skeletonStem}_{variant.Tail}",
+                skeletonPath,
+                relativeDirectory,
+                groupParts.Select(part => part.Asset));
+        }
+    }
+
     private static bool IsCompleteVariantSlot(string slot)
     {
         return slot.Equals("body", StringComparison.OrdinalIgnoreCase) ||
@@ -1034,6 +1181,14 @@ public sealed class ModelAssetGroup
                slot.Equals("headHands", StringComparison.OrdinalIgnoreCase) ||
                slot.Equals("hands", StringComparison.OrdinalIgnoreCase) ||
                slot.Equals("arms", StringComparison.OrdinalIgnoreCase) ||
+               slot.Equals("torso", StringComparison.OrdinalIgnoreCase) ||
+               slot.Equals("arm", StringComparison.OrdinalIgnoreCase) ||
+               slot.Equals("armL", StringComparison.OrdinalIgnoreCase) ||
+               slot.Equals("armR", StringComparison.OrdinalIgnoreCase) ||
+               slot.Equals("armLeft", StringComparison.OrdinalIgnoreCase) ||
+               slot.Equals("armRight", StringComparison.OrdinalIgnoreCase) ||
+               slot.Equals("armMiniLeft", StringComparison.OrdinalIgnoreCase) ||
+               slot.Equals("armMiniRight", StringComparison.OrdinalIgnoreCase) ||
                slot.Equals("legs", StringComparison.OrdinalIgnoreCase) ||
                slot.Equals("feet", StringComparison.OrdinalIgnoreCase) ||
                slot.Equals("eyes", StringComparison.OrdinalIgnoreCase) ||
@@ -1047,6 +1202,181 @@ public sealed class ModelAssetGroup
                slot.Equals("weapon", StringComparison.OrdinalIgnoreCase) ||
                slot.Equals("gun", StringComparison.OrdinalIgnoreCase);
     }
+
+    private static bool IsCrabberStem(string skeletonStem)
+        => skeletonStem.EndsWith("_crabber", StringComparison.OrdinalIgnoreCase);
+
+    private static IEnumerable<ModelAssetGroup> BuildCrabberNeckStumpGroups(
+        string skeletonStem,
+        string skeletonPath,
+        string relativeDirectory,
+        IReadOnlyList<PartInfo> defaultParts,
+        IReadOnlyList<PartInfo> recognized)
+    {
+        if (!IsCrabberStem(skeletonStem))
+        {
+            yield break;
+        }
+
+        var neckStump = recognized.FirstOrDefault(IsNeckStumpPart);
+        if (neckStump is null)
+        {
+            yield break;
+        }
+
+        // A valid head marks an actual Crabber outfit. The rest of the lettered components are
+        // selected where present, then the game's shared base component fills the remaining slots.
+        var letters = recognized
+            .Where(part => part.Slot.Equals("head", StringComparison.OrdinalIgnoreCase) &&
+                           part.Variant.Length == 1 &&
+                           part.Variant[0] is >= 'A' and <= 'G')
+            .Select(part => part.Variant)
+            .Distinct(StringComparer.OrdinalIgnoreCase)
+            .OrderBy(letter => letter, StringComparer.OrdinalIgnoreCase);
+        foreach (var letter in letters)
+        {
+            var letterParts = recognized
+                .Where(part => part.Variant.Equals(letter, StringComparison.OrdinalIgnoreCase))
+                .GroupBy(part => part.Slot, StringComparer.OrdinalIgnoreCase)
+                .Select(PickSlotDefault)
+                .ToList();
+            var overriddenSlots = letterParts
+                .Select(part => part.Slot)
+                .ToHashSet(StringComparer.OrdinalIgnoreCase);
+            foreach (var headSlot in HeadAttachmentSlots)
+            {
+                overriddenSlots.Add(headSlot);
+            }
+
+            var parts = defaultParts
+                .Where(part => !overriddenSlots.Contains(part.Slot) && !IsHeadAttachmentSlot(part.Slot))
+                .Concat(letterParts.Where(part => !IsHeadAttachmentSlot(part.Slot)))
+                .Append(neckStump)
+                .DistinctBy(part => part.Asset.MeshPath, StringComparer.OrdinalIgnoreCase)
+                .ToList();
+            if (parts.Count > 1)
+            {
+                yield return CreateGroup(
+                    $"{skeletonStem}_{letter}_neckStump",
+                    skeletonPath,
+                    relativeDirectory,
+                    parts.Select(part => part.Asset));
+            }
+        }
+    }
+
+    private static IEnumerable<ModelAssetGroup> BuildIncompleteCrabberLetterGroups(
+        string skeletonStem,
+        string skeletonPath,
+        string relativeDirectory,
+        IReadOnlyList<PartInfo> defaultParts,
+        IReadOnlyList<PartInfo> recognized)
+    {
+        if (!IsCrabberStem(skeletonStem))
+        {
+            yield break;
+        }
+
+        foreach (var head in recognized.Where(IsSingleLetterCrabberHeadPart))
+        {
+            var letterParts = recognized
+                .Where(part => part.Variant.Equals(head.Variant, StringComparison.OrdinalIgnoreCase))
+                .GroupBy(part => part.Slot, StringComparer.OrdinalIgnoreCase)
+                .Select(PickSlotDefault)
+                .ToList();
+            if (letterParts.Count >= 2)
+            {
+                // Complete lettered outfits are already emitted by BuildCompleteVariantGroups.
+                continue;
+            }
+
+            var overriddenSlots = letterParts
+                .Select(part => part.Slot)
+                .ToHashSet(StringComparer.OrdinalIgnoreCase);
+            var parts = defaultParts
+                .Where(part => !overriddenSlots.Contains(part.Slot))
+                .Concat(letterParts)
+                .DistinctBy(part => part.Asset.MeshPath, StringComparer.OrdinalIgnoreCase)
+                .ToList();
+            if (parts.Count > 1)
+            {
+                yield return CreateGroup(
+                    $"{skeletonStem}_{head.Variant}",
+                    skeletonPath,
+                    relativeDirectory,
+                    parts.Select(part => part.Asset));
+            }
+        }
+    }
+
+    private static bool IsSingleLetterCrabberHeadPart(PartInfo part)
+        => part.Slot.Equals("head", StringComparison.OrdinalIgnoreCase) &&
+           part.Variant.Length == 1 &&
+           part.Variant[0] is >= 'A' and <= 'G';
+
+    private static bool IsNeckStumpPart(PartInfo part)
+        => part.Slot.Equals("neck", StringComparison.OrdinalIgnoreCase) &&
+           part.Tail.Equals("neckStump", StringComparison.OrdinalIgnoreCase);
+
+    private static bool IsNeckChopPart(PartInfo part)
+        => part.Slot.Equals("neck", StringComparison.OrdinalIgnoreCase) &&
+           part.Tail.Contains("neckChop", StringComparison.OrdinalIgnoreCase);
+
+    private static bool IsNeckGoreCapPart(PartInfo part)
+        => part.Slot.Equals("neck", StringComparison.OrdinalIgnoreCase) &&
+           part.Tail.Contains("neckGoreCap", StringComparison.OrdinalIgnoreCase);
+
+    private static bool IsHeadReplacementNeckPart(PartInfo part)
+        => IsNeckStumpPart(part) || IsNeckChopPart(part) || IsNeckGoreCapPart(part);
+
+    private static void AddHeadReplacementOverriddenSlots(
+        HashSet<string> overriddenSlots,
+        IEnumerable<PartInfo> variants)
+    {
+        if (!variants.Any(IsHeadReplacementNeckPart))
+        {
+            return;
+        }
+
+        foreach (var slot in HeadAttachmentSlots)
+        {
+            overriddenSlots.Add(slot);
+        }
+    }
+
+    private static readonly string[] HeadAttachmentSlots =
+    [
+        "head", "hair", "eye", "eyes", "eyeLeft", "eyeRight", "brow", "brows", "teeth", "mouth",
+    ];
+
+    private static bool IsHeadAttachmentSlot(string slot)
+        => HeadAttachmentSlots.Any(candidate => candidate.Equals(slot, StringComparison.OrdinalIgnoreCase));
+
+    private static bool IsDecapitatedHeadPart(PartInfo part)
+        => part.Slot.Equals("head", StringComparison.OrdinalIgnoreCase) &&
+           (part.Tail.Contains("Decapitation", StringComparison.OrdinalIgnoreCase) ||
+            part.Variant.Contains("Decapitation", StringComparison.OrdinalIgnoreCase));
+
+    private static bool IsExclusiveStatePart(PartInfo part)
+        => IsExclusiveStateSlot(part.Slot) &&
+           (string.IsNullOrEmpty(part.Variant) ||
+            IsHeadReplacementNeckPart(part) ||
+            StateWords.Any(word => part.Variant.Contains(word, StringComparison.OrdinalIgnoreCase)) ||
+            part.Variant.Contains("Sleeve", StringComparison.OrdinalIgnoreCase) ||
+            part.Variant.Contains("Tourniquet", StringComparison.OrdinalIgnoreCase));
+
+    private static bool IsExclusiveStateSlot(string slot)
+        => slot.Equals("body", StringComparison.OrdinalIgnoreCase) ||
+           slot.Equals("bodyUpper", StringComparison.OrdinalIgnoreCase) ||
+           slot.Equals("bodyLower", StringComparison.OrdinalIgnoreCase) ||
+           slot.Equals("legs", StringComparison.OrdinalIgnoreCase) ||
+           slot.Equals("neck", StringComparison.OrdinalIgnoreCase) ||
+           slot.Equals("armL", StringComparison.OrdinalIgnoreCase) ||
+           slot.Equals("armR", StringComparison.OrdinalIgnoreCase) ||
+           slot.Equals("armMiniLeft", StringComparison.OrdinalIgnoreCase) ||
+           slot.Equals("armMiniRight", StringComparison.OrdinalIgnoreCase) ||
+           slot.Equals("armLeft", StringComparison.OrdinalIgnoreCase) ||
+           slot.Equals("armRight", StringComparison.OrdinalIgnoreCase);
 
     private static IEnumerable<PartInfo> FindRelatedVariantParts(
         IReadOnlyList<PartInfo> selectedVariants,
@@ -1074,6 +1404,21 @@ public sealed class ModelAssetGroup
         }
     }
 
+    private static IEnumerable<PartInfo> FindCompanionStateParts(
+        IReadOnlyList<PartInfo> selectedVariants,
+        IReadOnlyList<PartInfo> recognized)
+    {
+        if (!selectedVariants.Any(IsDecapitatedHeadPart))
+        {
+            yield break;
+        }
+
+        foreach (var part in recognized.Where(IsNeckStumpPart))
+        {
+            yield return part;
+        }
+    }
+
     private static ModelAssetGroup CreateGroup(
         string name,
         string skeletonPath,
@@ -1081,15 +1426,119 @@ public sealed class ModelAssetGroup
         IEnumerable<ModelAsset> assets,
         IReadOnlySet<string>? decalOffsetMeshPaths = null)
     {
+        var distinctAssets = assets
+            .DistinctBy(asset => asset.MeshPath, StringComparer.OrdinalIgnoreCase)
+            .ToList();
+        var skeletonStem = Path.GetFileNameWithoutExtension(skeletonPath);
+        var assetList = NormalizeExclusiveStateParts(
+            name,
+            InferClassificationStem(distinctAssets, skeletonStem),
+            distinctAssets);
         return new ModelAssetGroup(
             Sanitize(name),
             skeletonPath,
             relativeDirectory,
-            assets
-                .DistinctBy(asset => asset.MeshPath, StringComparer.OrdinalIgnoreCase)
+            assetList
                 .OrderBy(asset => asset.MeshPath, StringComparer.OrdinalIgnoreCase)
                 .ToList(),
             decalOffsetMeshPaths);
+    }
+
+    private static List<ModelAsset> NormalizeExclusiveStateParts(
+        string groupName,
+        string classificationStem,
+        List<ModelAsset> assets)
+    {
+        var parts = assets
+            .Select(asset => ClassifyPart(asset, classificationStem))
+            .ToList();
+        var selectedPaths = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        foreach (var slotGroup in parts.GroupBy(part => part.Slot, StringComparer.OrdinalIgnoreCase))
+        {
+            var slotParts = slotGroup.ToList();
+            if (slotParts.Count <= 1 || !slotParts.Any(IsExclusiveStatePart))
+            {
+                foreach (var part in slotParts)
+                {
+                    selectedPaths.Add(part.Asset.MeshPath);
+                }
+
+                continue;
+            }
+
+            selectedPaths.Add(PickExclusiveStatePart(groupName, slotParts).Asset.MeshPath);
+        }
+
+        var groupSelectsHeadReplacement = parts.Any(part =>
+            IsHeadReplacementNeckPart(part) && ExclusiveStateGroupMatchScore(groupName, part) > 0);
+        var hasHeadAttachmentPart = parts.Any(part => IsHeadAttachmentSlot(part.Slot));
+        if (hasHeadAttachmentPart && groupSelectsHeadReplacement)
+        {
+            foreach (var headAttachment in parts.Where(part => IsHeadAttachmentSlot(part.Slot)))
+            {
+                selectedPaths.Remove(headAttachment.Asset.MeshPath);
+            }
+        }
+        else if (hasHeadAttachmentPart)
+        {
+            foreach (var headReplacement in parts.Where(IsHeadReplacementNeckPart))
+            {
+                selectedPaths.Remove(headReplacement.Asset.MeshPath);
+            }
+        }
+
+        return assets
+            .Where(asset => selectedPaths.Contains(asset.MeshPath))
+            .ToList();
+    }
+
+    private static string InferClassificationStem(IReadOnlyList<ModelAsset> assets, string skeletonStem)
+    {
+        return assets
+            .Select(asset => ModelStem(Path.GetFileNameWithoutExtension(asset.MeshPath), skeletonStem))
+            .GroupBy(stem => stem, StringComparer.OrdinalIgnoreCase)
+            .OrderByDescending(group => group.Count())
+            .ThenByDescending(group => group.Key.Length)
+            .FirstOrDefault()?.Key ?? skeletonStem;
+    }
+
+    private static PartInfo PickExclusiveStatePart(string groupName, IReadOnlyList<PartInfo> parts)
+    {
+        var matched = parts
+            .Where(part => ExclusiveStateGroupMatchScore(groupName, part) > 0)
+            .OrderByDescending(part => ExclusiveStateGroupMatchScore(groupName, part))
+            .ThenByDescending(part => part.Tail.Length)
+            .ThenBy(part => part.Asset.MeshPath, StringComparer.OrdinalIgnoreCase)
+            .FirstOrDefault();
+        if (matched is not null)
+        {
+            return matched;
+        }
+
+        return parts
+            .OrderBy(part => string.IsNullOrEmpty(part.Variant) ? 0 : 1)
+            .ThenBy(part => StateWords.Count(word => part.Variant.Contains(word, StringComparison.OrdinalIgnoreCase)))
+            .ThenBy(part => part.Variant.Length)
+            .ThenBy(part => part.Asset.MeshPath, StringComparer.OrdinalIgnoreCase)
+            .First();
+    }
+
+    private static int ExclusiveStateGroupMatchScore(string groupName, PartInfo part)
+    {
+        if (groupName.Contains(part.Tail, StringComparison.OrdinalIgnoreCase))
+        {
+            return 100;
+        }
+
+        if (!string.IsNullOrEmpty(part.Variant) &&
+            groupName.Contains(part.Variant, StringComparison.OrdinalIgnoreCase))
+        {
+            return 90;
+        }
+
+        return StateWords.Count(word =>
+            part.Variant.Contains(word, StringComparison.OrdinalIgnoreCase) &&
+            groupName.Contains(word, StringComparison.OrdinalIgnoreCase)) * 10;
     }
 
     private static PartInfo ClassifyPart(ModelAsset asset, string skeletonStem)
@@ -1137,7 +1586,7 @@ public sealed class ModelAssetGroup
     private static readonly string[] SidedBases =
     [
         "shoulder", "clavicle", "forearm", "elbow", "thigh", "knee", "ankle", "wrist",
-        "leg", "arm", "hand", "foot", "neck", "ear", "eye", "brow", "cheek", "lip", "horn",
+        "armMini", "leg", "arm", "hand", "foot", "neck", "ear", "eye", "brow", "cheek", "lip", "horn",
     ];
     // NOTE: "mouth" is deliberately NOT a sided base. Character mouths are visemes (mouthAA, mouthLL,
     // mouthI...), and treating "mouthLL" as "mouth" + side "L" split it into its own slot, so the combine
@@ -1185,7 +1634,7 @@ public sealed class ModelAssetGroup
     private static readonly string[] StateWords =
     [
         "Damage", "Bite", "Bitten", "Bandaged", "Sewn", "Dog", "Dried", "Broken", "Bloody", "Blood",
-        "Cut", "Amputated", "Gutted", "Ripped", "Torn", "Tourniqet", "Wound", "Scratch", "Bruise",
+        "Cut", "Chop", "Amputated", "Gutted", "Ripped", "Torn", "Sleeve", "Tourniqet", "Tourniquet", "Wound", "Scratch", "Bruise",
         "Sever", "Rotten", "Burn", "Gun", "Stomach", "NoBandage",
     ];
 

@@ -33,6 +33,8 @@ public sealed class GltfPrimitive
     public Vector2[]? Uv1 { get; init; }
     public Vector2[]? Uv2 { get; init; }
     public Vector2[]? Uv3 { get; init; }
+    public Vector2[]? Uv4 { get; init; }
+    public Vector2[]? Uv5 { get; init; }
     public Vector4[]? Color0 { get; init; }
     public Vector4[]? Tangents { get; init; }
     public Vector4[]? Binormals { get; init; }
@@ -1024,6 +1026,10 @@ public static class GltfReader
         var uv1 = ReadVec2(ctx, GetAttr(attrs, "TEXCOORD_1"));
         var uv2 = ReadVec2(ctx, GetAttr(attrs, "TEXCOORD_2"));
         var uv3 = ReadVec2(ctx, GetAttr(attrs, "TEXCOORD_3"));
+        // V25 (Michonne) meshes can carry up to six UV layers; the exporter maps uv5/uv6 to
+        // TEXCOORD_4/TEXCOORD_5, so read those back too for a faithful reinsert round-trip.
+        var uv4 = ReadVec2(ctx, GetAttr(attrs, "TEXCOORD_4"));
+        var uv5 = ReadVec2(ctx, GetAttr(attrs, "TEXCOORD_5"));
         var color0 = ReadVec4(ctx, GetAttr(attrs, "COLOR_0"));
         var unknown1 = ReadScalarFloats(ctx, GetAttr(attrs, "_TT_UNKNOWN1"));
         var joints0 = ReadUShort4(ctx, GetAttr(attrs, "JOINTS_0"));
@@ -1069,6 +1075,8 @@ public static class GltfReader
             Uv1 = uv1,
             Uv2 = uv2,
             Uv3 = uv3,
+            Uv4 = uv4,
+            Uv5 = uv5,
             Color0 = color0,
             Tangents = tangents,
             Binormals = binormals,

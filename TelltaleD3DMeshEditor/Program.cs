@@ -1,4 +1,5 @@
 using TelltaleD3DMeshEditor.Core;
+using TelltaleD3DMeshEditor.Core.Localization;
 using TelltaleD3DMeshEditor.Reinsert;
 using TelltaleD3DMeshEditor.UI;
 
@@ -9,6 +10,10 @@ internal static class Program
     [STAThread]
     private static void Main(string[] args)
     {
+        // Load the active UI language before any window is built. Uses the saved preference, or the
+        // closest match to the Windows UI culture on first run.
+        Loc.Initialize(AppPreferences.Load().Language);
+
         var launchMeshPath = GetLaunchMeshPath(args);
         if (launchMeshPath is null && ReinsertCli.TryRun(args))
         {
@@ -53,8 +58,8 @@ internal static class Program
     {
         var logPath = ErrorLog.Write(ex, context);
         MessageBox.Show(
-            $"The tool hit an unexpected error and wrote a log:\n{logPath}\n\n{ex.Message}",
-            "Telltale D3DMesh Editor",
+            Loc.T("msg.unhandled.body", logPath, ex.Message),
+            Loc.T("app.title"),
             MessageBoxButtons.OK,
             MessageBoxIcon.Error);
     }

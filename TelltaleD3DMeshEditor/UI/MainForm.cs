@@ -4,6 +4,7 @@ using System.Globalization;
 using System.Numerics;
 using System.Reflection;
 using TelltaleD3DMeshEditor.Core;
+using TelltaleD3DMeshEditor.Core.Localization;
 using TelltaleD3DMeshEditor.Formats.Archives;
 using TelltaleD3DMeshEditor.Formats.Mesh;
 using TelltaleD3DMeshEditor.Formats.Skeleton;
@@ -21,38 +22,53 @@ public sealed class MainForm : Form
     private const int PreferredTreePanelWidth = 360;
     private const int MinimumTreePanelWidth = 300;
     private const int MaxTreeNodesToMeasureForAutoFit = 1500;
+    private const string DiscordInviteUrl = "https://discord.com/invite/HqpnTenqwp";
+    private const int DiscordInviteReminderDays = 5;
 
     private readonly ToolStrip _toolStrip = new();
     private readonly ToolStrip _viewerOverlay = new();
-    private readonly ToolStripButton _btnOpen = new("Open Folder...");
-    private readonly ToolStripButton _btnOpenArchive = new("Open Archive...");
-    private readonly ToolStripButton _btnExtractSelected = new("Extract Selected...");
-    private readonly ToolStripButton _btnExtractAll = new("Extract All...");
-    private readonly ToolStripButton _btnReimportSelected = new("Reimport Selected...");
-    private readonly ToolStripButton _btnDiffuseAtlas = new("Texture Atlas");
-    private readonly ToolStripButton _btnCombineParts = new("Combine Parts");
+    private readonly ToolStripButton _btnOpen = new(Loc.T("toolbar.open_folder"));
+    private readonly ToolStripButton _btnOpenArchive = new(Loc.T("toolbar.open_archive"));
+    private readonly ToolStripButton _btnExtractSelected = new(Loc.T("toolbar.extract_selected"));
+    private readonly ToolStripButton _btnExtractAll = new(Loc.T("toolbar.extract_all"));
+    private readonly ToolStripButton _btnReimportSelected = new(Loc.T("toolbar.reimport_selected"));
+    private readonly ToolStripButton _btnDiffuseAtlas = new(Loc.T("toolbar.texture_atlas"));
+    private readonly ToolStripButton _btnCombineParts = new(Loc.T("toolbar.combine_parts"));
     private readonly ToolStripDropDownButton _gameSelector = new();
     private readonly Dictionary<GameId, Image> _gameMenuImages = new();
-    private readonly Button _btnReload = new() { Text = "Reload" };
-    private readonly ToolStripButton _btnPan = new("Pan");
-    private readonly ToolStripButton _btnPose = new("Pose");
-    private readonly ToolStripDropDownButton _btnView = new("View");
+    private readonly Button _btnFilter = new() { Text = Loc.T("tree.filter") };
+    private readonly ContextMenuStrip _filterMenu = new();
+    private readonly ToolStripMenuItem _miFilterHasSkeleton = new(Loc.T("filter.has_skeleton"));
+    private readonly ToolStripMenuItem _miFilterCharacters = new(Loc.T("filter.characters_only"));
+    private readonly Button _btnReload = new() { Text = Loc.T("tree.reload") };
+    private readonly ToolStripButton _btnPan = new(Loc.T("viewer.pan"));
+    private readonly ToolStripButton _btnPose = new(Loc.T("viewer.pose"));
+    private readonly ToolStripDropDownButton _btnView = new(Loc.T("viewer.view"));
     private readonly ToolStripLabel _progressLabel = new();
     private readonly ToolStripProgressBar _progress = new();
-    private readonly ToolStripButton _btnCredits = new("Credits");
-    private readonly ToolStripMenuItem _miFit = new("Center");
-    private readonly ToolStripMenuItem _miFaces = new("Solid");
-    private readonly ToolStripMenuItem _miPolygons = new("Polygons");
-    private readonly ToolStripMenuItem _miSkeleton = new("Skeleton");
-    private readonly ToolStripButton _btnCheckUpdates = new("Check for Updates");
-    private readonly ToolStripButton _btnReportIssue = new("Report an Issue");
-    private readonly ToolStripButton _btnSettings = new("Settings");
+    private readonly ToolStripButton _btnCredits = new(Loc.T("toolbar.credits"));
+    private readonly ToolStripMenuItem _miFit = new(Loc.T("view.center"));
+    private readonly ToolStripMenuItem _miShaded = new(Loc.T("view.shaded"));
+    private readonly ToolStripMenuItem _miUnlit = new(Loc.T("view.unlit"));
+    private readonly ToolStripMenuItem _miNoTexture = new(Loc.T("view.no_texture"));
+    private readonly ToolStripMenuItem _miUvView = new(Loc.T("view.uv_view"));
+    private readonly ToolStripMenuItem _miTextureSlotDebug = new(Loc.T("view.texture_slot_debug"));
+    private readonly ToolStripMenuItem _miNormals = new(Loc.T("view.normals"));
+    private readonly ToolStripMenuItem _miVertexColor = new(Loc.T("view.vertex_color"));
+    private readonly ToolStripMenuItem _miSkinWeights = new(Loc.T("view.skin_weights"));
+    private readonly ToolStripMenuItem _miPolygons = new(Loc.T("view.polygons"));
+    private readonly ToolStripMenuItem _miSkeleton = new(Loc.T("view.skeleton"));
+    private readonly ToolStripMenuItem _miTextureProbe = new(Loc.T("view.texture_probe"));
+    private readonly ToolStripButton _btnCheckUpdates = new(Loc.T("toolbar.check_updates"));
+    private readonly ToolStripButton _btnReportIssue = new(Loc.T("toolbar.report_issue"));
+    private readonly ToolStripButton _btnSettings = new(Loc.T("toolbar.settings"));
     private readonly SplitContainer _split = new();
     private readonly TreeView _tree = new();
     private readonly TextBox _searchText = new();
     private readonly System.Windows.Forms.Timer _searchDebounceTimer = new();
     private readonly System.Windows.Forms.Timer _treeFitDebounceTimer = new();
     private readonly MeshPreviewControl _preview = new();
+    private readonly DiscordPresenceService _discordPresence = new();
     private readonly StatusStrip _statusStrip = new();
     private readonly ToolStripStatusLabel _statusLabel = new();
     private readonly ToolStripStatusLabel _detailLabel = new();
@@ -71,6 +87,11 @@ public sealed class MainForm : Form
     private bool _normalizeFacialBonesOnReimport;
     private bool _viewerAntiAliasing;
     private bool _viewerFlightCamera;
+    private bool _discordRichPresence;
+    private int _textureProbeMode;
+    private bool _keepViewMenuOpenOnce;
+    private bool _filterHasSkeleton;
+    private bool _filterCharactersOnly;
     private bool _isBusy;
     private bool _applyingTreeSelection;
     private bool _treeRebuildQueued;
@@ -87,8 +108,10 @@ public sealed class MainForm : Form
 #else
         var build = GetLocalBuildTime().ToString("HH:mm:ss");
 #endif
-        Text = $"Telltale D3DMesh Editor - v{UpdateChecker.CurrentVersion} (build: {build})";
-        Width = 1180;
+        Text = Loc.T("app.window_title", UpdateChecker.CurrentVersion, build);
+        // A bit wider than the English-only minimum so the toolbar fits longer translations (Portuguese /
+        // Spanish button labels) without overflowing on first open.
+        Width = 1280;
         Height = 760;
         MinimumSize = new Size(920, 560);
         StartPosition = FormStartPosition.CenterScreen;
@@ -107,8 +130,11 @@ public sealed class MainForm : Form
         _normalizeFacialBonesOnReimport = preferences.NormalizeFacialBonesOnReimport;
         _viewerAntiAliasing = preferences.ViewerAntiAliasing;
         _viewerFlightCamera = preferences.ViewerFlightCamera;
+        _discordRichPresence = preferences.DiscordRichPresence;
         _preview.SetAntiAliasing(_viewerAntiAliasing);
         _preview.SetCameraMode(_viewerFlightCamera ? PreviewCameraMode.Flight : PreviewCameraMode.Orbit);
+        _discordPresence.SetEnabled(_discordRichPresence);
+        UpdateDiscordPresence();
 
         BuildUi();
         WireEvents();
@@ -125,8 +151,15 @@ public sealed class MainForm : Form
                 await OpenMeshFileAsync(_initialMeshPath);
             }
 
+            ShowDiscordInviteIfDue();
             await CheckForUpdatesAsync(silent: true);
         };
+    }
+
+    protected override void OnFormClosed(FormClosedEventArgs e)
+    {
+        _discordPresence.Dispose();
+        base.OnFormClosed(e);
     }
 
     private void BuildUi()
@@ -173,34 +206,65 @@ public sealed class MainForm : Form
         _btnSettings.Alignment = ToolStripItemAlignment.Right;
         _btnReportIssue.Alignment = ToolStripItemAlignment.Right;
         _btnCheckUpdates.Alignment = ToolStripItemAlignment.Right;
-        _btnCheckUpdates.ToolTipText = "Checks GitHub for a newer version and lets you install it.";
-        _btnReportIssue.ToolTipText = "Open a bug report form and create a pre-filled GitHub issue.";
-        _btnSettings.ToolTipText = "Open tool settings.";
+        // Keep the right-side action buttons pinned to the bar so they are never moved into the overflow
+        // dropdown. Longer translations (e.g. "Buscar Actualizaciones", "Verificar Atualizações") otherwise
+        // push "Check for Updates" into the hidden overflow area. If the window gets too narrow for the
+        // current language, the left-side items overflow instead, keeping these always reachable.
+        _btnCredits.Overflow = ToolStripItemOverflow.Never;
+        _btnSettings.Overflow = ToolStripItemOverflow.Never;
+        _btnReportIssue.Overflow = ToolStripItemOverflow.Never;
+        _btnCheckUpdates.Overflow = ToolStripItemOverflow.Never;
+        _btnCheckUpdates.ToolTipText = Loc.T("toolbar.check_updates.tooltip");
+        _btnReportIssue.ToolTipText = Loc.T("toolbar.report_issue.tooltip");
+        _btnSettings.ToolTipText = Loc.T("toolbar.settings.tooltip");
         _btnPan.CheckOnClick = true;
         _btnPose.CheckOnClick = true;
         _btnDiffuseAtlas.CheckOnClick = true;
         _btnCombineParts.CheckOnClick = true;
-        _btnOpenArchive.ToolTipText = "Opens one or more Telltale .ttarch/.ttarch2 game containers and extracts their .d3dmesh, .d3dtx and .skl files automatically, then loads them. Select a mesh + texture archive together to see models with their textures.";
-        _btnPan.ToolTipText = "Left-drag pans. Middle/Shift+drag also pans; mouse wheel zooms; F centers.";
-        _btnPose.ToolTipText = "Select and drag skeleton joints; weighted mesh vertices deform in the preview.";
-        _btnCombineParts.ToolTipText = "Shows detected combined model parts. Turn off to list every .d3dmesh separately.";
-        _btnReimportSelected.ToolTipText = "Reimports an edited GLB/GLTF into the selected .d3dmesh, or splits a selected Combined model back into its original parts.";
-        _btnDiffuseAtlas.ToolTipText = "When reimporting, packs diffuse/baseColor textures into one texture atlas and rewrites UV0 so the target can keep a single original diffuse texture name.";
-        _btnCredits.ToolTipText = "Show credits.";
+        _btnOpenArchive.ToolTipText = Loc.T("toolbar.open_archive.tooltip");
+        _btnPan.ToolTipText = Loc.T("viewer.pan.tooltip");
+        _btnPose.ToolTipText = Loc.T("viewer.pose.tooltip");
+        _btnCombineParts.ToolTipText = Loc.T("toolbar.combine_parts.tooltip");
+        _btnReimportSelected.ToolTipText = Loc.T("toolbar.reimport_selected.tooltip");
+        _btnDiffuseAtlas.ToolTipText = Loc.T("toolbar.texture_atlas.tooltip");
+        _btnCredits.ToolTipText = Loc.T("toolbar.credits.tooltip");
 
-        _miFaces.Checked = true;
+        _miShaded.Checked = true;
         _miPolygons.Checked = false;
         _miSkeleton.Checked = false;
+        _miTextureProbe.Checked = false;
         _btnView.DropDownItems.AddRange(new ToolStripItem[]
         {
             _miFit,
             new ToolStripSeparator(),
-            _miFaces,
+            _miShaded,
+            _miUnlit,
+            _miNoTexture,
+            _miUvView,
+            _miTextureSlotDebug,
+            _miNormals,
+            _miVertexColor,
+            _miSkinWeights,
+            new ToolStripSeparator(),
             _miPolygons,
-            _miSkeleton
+            _miSkeleton,
+            new ToolStripSeparator(),
+            _miTextureProbe
         });
+        _btnView.DropDown.ItemClicked += (_, e) =>
+        {
+            if (ReferenceEquals(e.ClickedItem, _miTextureProbe))
+                _keepViewMenuOpenOnce = true;
+        };
+        _btnView.DropDown.Closing += (_, e) =>
+        {
+            if (_keepViewMenuOpenOnce && e.CloseReason == ToolStripDropDownCloseReason.ItemClicked)
+                e.Cancel = true;
 
-        _gameSelector.ToolTipText = "Selects which Telltale game's texture/model rules to apply.";
+            _keepViewMenuOpenOnce = false;
+        };
+
+        _gameSelector.ToolTipText = Loc.T("game_selector.tooltip");
         _gameSelector.DisplayStyle = ToolStripItemDisplayStyle.ImageAndText;
         _gameSelector.TextImageRelation = TextImageRelation.ImageBeforeText;
         _gameSelector.ImageScaling = ToolStripItemImageScaling.None;
@@ -268,24 +332,36 @@ public sealed class MainForm : Form
         var panel = new TableLayoutPanel
         {
             Dock = DockStyle.Fill,
-            ColumnCount = 2,
+            ColumnCount = 3,
             RowCount = 2,
         };
         panel.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100));
+        // "Filter: SKL" needs more room than the old 70px cell (including its right margin),
+        // otherwise WinForms clips the active-filter suffix after the button loses focus.
+        panel.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 96));
         panel.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 76));
         panel.RowStyles.Add(new RowStyle(SizeType.AutoSize));
         panel.RowStyles.Add(new RowStyle(SizeType.Percent, 100));
 
         _searchText.Dock = DockStyle.Top;
-        _searchText.PlaceholderText = "Search files...";
+        _searchText.PlaceholderText = Loc.T("tree.search_placeholder");
         _searchText.Margin = new Padding(0, 0, 6, 6);
+        _filterMenu.Items.AddRange(new ToolStripItem[]
+        {
+            _miFilterHasSkeleton,
+            _miFilterCharacters
+        });
+        _btnFilter.Dock = DockStyle.Top;
+        _btnFilter.Height = _searchText.PreferredHeight;
+        _btnFilter.Margin = new Padding(0, 0, 6, 6);
         _btnReload.Dock = DockStyle.Top;
         _btnReload.Height = _searchText.PreferredHeight;
         _btnReload.Margin = new Padding(0, 0, 0, 6);
         panel.Controls.Add(_searchText, 0, 0);
-        panel.Controls.Add(_btnReload, 1, 0);
+        panel.Controls.Add(_btnFilter, 1, 0);
+        panel.Controls.Add(_btnReload, 2, 0);
         panel.Controls.Add(_tree, 0, 1);
-        panel.SetColumnSpan(_tree, 2);
+        panel.SetColumnSpan(_tree, 3);
         return panel;
     }
 
@@ -293,6 +369,9 @@ public sealed class MainForm : Form
     {
         _btnOpen.Click += async (_, _) => await OpenFolderDialogAsync();
         _btnOpenArchive.Click += async (_, _) => await OpenArchiveAsync();
+        _btnFilter.Click += (_, _) => _filterMenu.Show(_btnFilter, new Point(0, _btnFilter.Height));
+        _miFilterHasSkeleton.Click += (_, _) => SetExclusiveFilter(hasSkeleton: !_filterHasSkeleton, charactersOnly: false);
+        _miFilterCharacters.Click += (_, _) => SetExclusiveFilter(hasSkeleton: false, charactersOnly: !_filterCharactersOnly);
         _btnReload.Click += async (_, _) =>
         {
             if (_rootFolder is not null)
@@ -327,11 +406,14 @@ public sealed class MainForm : Form
             _preview.SetPoseMode(_btnPose.Checked);
         };
         _miFit.Click += (_, _) => _preview.Fit();
-        _miFaces.Click += (_, _) =>
-        {
-            _miFaces.Checked = !_miFaces.Checked;
-            _preview.ToggleFaces();
-        };
+        _miShaded.Click += (_, _) => ApplyPreviewRenderMode(PreviewRenderMode.Shaded);
+        _miUnlit.Click += (_, _) => ApplyPreviewRenderMode(PreviewRenderMode.Unlit);
+        _miNoTexture.Click += (_, _) => ApplyPreviewRenderMode(PreviewRenderMode.NoTexture);
+        _miUvView.Click += (_, _) => ApplyPreviewRenderMode(PreviewRenderMode.UvView);
+        _miTextureSlotDebug.Click += (_, _) => ApplyPreviewRenderMode(PreviewRenderMode.TextureSlotDebug);
+        _miNormals.Click += (_, _) => ApplyPreviewRenderMode(PreviewRenderMode.Normals);
+        _miVertexColor.Click += (_, _) => ApplyPreviewRenderMode(PreviewRenderMode.VertexColor);
+        _miSkinWeights.Click += (_, _) => ApplyPreviewRenderMode(PreviewRenderMode.SkinWeights);
         _miPolygons.Click += (_, _) =>
         {
             _miPolygons.Checked = !_miPolygons.Checked;
@@ -347,6 +429,11 @@ public sealed class MainForm : Form
             }
 
             _preview.SetSkeletonVisible(_miSkeleton.Checked);
+        };
+        _miTextureProbe.Click += (_, _) =>
+        {
+            _textureProbeMode = (_textureProbeMode + 1) % 3;
+            ApplyTextureProbeMode();
         };
         _tree.AfterSelect += (_, e) => HandleTreeAfterSelect(e.Node);
         _tree.NodeMouseClick += (_, e) => HandleTreeNodeMouseClick(e);
@@ -376,6 +463,45 @@ public sealed class MainForm : Form
         _preview.DragOver += (_, e) => HandleDragEnter(e);
         _preview.DragLeave += (_, _) => _preview.SetDragDropHintVisible(false);
         _preview.DragDrop += async (_, e) => await HandleDragDropAsync(e);
+    }
+
+    private void ApplyTextureProbeMode()
+    {
+        switch (_textureProbeMode)
+        {
+            case 1:
+                _miTextureProbe.Text = Loc.T("view.texture_probe.normal");
+                _miTextureProbe.Checked = true;
+                _preview.SetTextureProbeLiveHover(false);
+                _preview.SetTextureProbeEnabled(true);
+                break;
+            case 2:
+                _miTextureProbe.Text = Loc.T("view.texture_probe.live");
+                _miTextureProbe.Checked = true;
+                _preview.SetTextureProbeEnabled(true);
+                _preview.SetTextureProbeLiveHover(true);
+                break;
+            default:
+                _textureProbeMode = 0;
+                _miTextureProbe.Text = Loc.T("view.texture_probe");
+                _miTextureProbe.Checked = false;
+                _preview.SetTextureProbeLiveHover(false);
+                _preview.SetTextureProbeEnabled(false);
+                break;
+        }
+    }
+
+    private void ApplyPreviewRenderMode(PreviewRenderMode mode)
+    {
+        _miShaded.Checked = mode == PreviewRenderMode.Shaded;
+        _miUnlit.Checked = mode == PreviewRenderMode.Unlit;
+        _miNoTexture.Checked = mode == PreviewRenderMode.NoTexture;
+        _miUvView.Checked = mode == PreviewRenderMode.UvView;
+        _miTextureSlotDebug.Checked = mode == PreviewRenderMode.TextureSlotDebug;
+        _miNormals.Checked = mode == PreviewRenderMode.Normals;
+        _miVertexColor.Checked = mode == PreviewRenderMode.VertexColor;
+        _miSkinWeights.Checked = mode == PreviewRenderMode.SkinWeights;
+        _preview.SetRenderMode(mode);
     }
 
     private void HandleDragEnter(DragEventArgs e)
@@ -425,7 +551,7 @@ public sealed class MainForm : Form
         if (!File.Exists(meshPath))
         {
             MessageBox.Show(
-                $"Could not find the selected .d3dmesh file:\n{meshPath}",
+                Loc.T("msg.mesh_not_found", meshPath),
                 Text,
                 MessageBoxButtons.OK,
                 MessageBoxIcon.Warning);
@@ -439,18 +565,19 @@ public sealed class MainForm : Form
     private void UpdateFormatButton()
     {
         var format = _exportFormat == ExportFormat.Glb ? "GLB" : "GLTF";
-        var atlas = _btnDiffuseAtlas.Checked ? "on" : "off";
-        var aa = _viewerAntiAliasing ? "on" : "off";
-        var camera = _viewerFlightCamera ? "flight" : "orbit";
-        var faceBones = _normalizeFacialBonesOnReimport ? "on" : "off";
-        _btnSettings.ToolTipText = $"Open tool settings. Output Format: {format}; Texture Atlas: {atlas}; Facial Bones: {faceBones}; Viewer AA: {aa}; Camera: {camera}.";
+        var atlas = _btnDiffuseAtlas.Checked ? Loc.T("common.on") : Loc.T("common.off");
+        var aa = _viewerAntiAliasing ? Loc.T("common.on") : Loc.T("common.off");
+        var camera = _viewerFlightCamera ? Loc.T("settings.camera.flight") : Loc.T("settings.camera.orbit");
+        var faceBones = _normalizeFacialBonesOnReimport ? Loc.T("common.on") : Loc.T("common.off");
+        var discord = _discordRichPresence ? Loc.T("common.on") : Loc.T("common.off");
+        _btnSettings.ToolTipText = Loc.T("settings.tooltip_summary", format, atlas, faceBones, aa, camera, discord);
     }
 
     private void ShowSettingsDialog()
     {
         using var dialog = new Form
         {
-            Text = "Settings",
+            Text = Loc.T("settings.title"),
             StartPosition = FormStartPosition.CenterParent,
             FormBorderStyle = FormBorderStyle.FixedDialog,
             MinimizeBox = false,
@@ -474,9 +601,44 @@ public sealed class MainForm : Form
         layout.RowStyles.Add(new RowStyle(SizeType.AutoSize));
         layout.RowStyles.Add(new RowStyle(SizeType.AutoSize));
 
+        // Language picker lives at the top of the General tab (above Output Format). It is populated from
+        // the Languages/ folder next to the executable, so community-contributed translations show up here
+        // automatically. Switching language takes effect after a restart (offered below on OK).
+        var languageLabel = new Label
+        {
+            Text = Loc.T("settings.language_label"),
+            AutoSize = true,
+            Anchor = AnchorStyles.Left,
+            Margin = new Padding(0, 3, 8, 10),
+        };
+        var languageCombo = new ComboBox
+        {
+            DropDownStyle = ComboBoxStyle.DropDownList,
+            Anchor = AnchorStyles.Left | AnchorStyles.Right,
+            Margin = new Padding(0, 0, 0, 10),
+        };
+        var availableLanguages = Loc.AvailableLanguages;
+        foreach (var lang in availableLanguages)
+        {
+            languageCombo.Items.Add(lang);
+        }
+        var currentLanguageIndex = -1;
+        for (var i = 0; i < availableLanguages.Count; i++)
+        {
+            if (availableLanguages[i].Code.Equals(Loc.CurrentCode, StringComparison.OrdinalIgnoreCase))
+            {
+                currentLanguageIndex = i;
+                break;
+            }
+        }
+        if (currentLanguageIndex >= 0)
+        {
+            languageCombo.SelectedIndex = currentLanguageIndex;
+        }
+
         var formatLabel = new Label
         {
-            Text = "Output Format:",
+            Text = Loc.T("settings.output_format"),
             AutoSize = true,
             Anchor = AnchorStyles.Left,
             Margin = new Padding(0, 3, 8, 10),
@@ -493,14 +655,14 @@ public sealed class MainForm : Form
 
         var atlasLabel = new Label
         {
-            Text = "Texture Atlas:",
+            Text = Loc.T("settings.texture_atlas_label"),
             AutoSize = true,
             Anchor = AnchorStyles.Left,
             Margin = new Padding(0, 3, 8, 10),
         };
         var atlasCheck = new CheckBox
         {
-            Text = "Generate texture atlas",
+            Text = Loc.T("settings.generate_texture_atlas"),
             Checked = _btnDiffuseAtlas.Checked,
             AutoSize = true,
             Anchor = AnchorStyles.Left,
@@ -509,14 +671,14 @@ public sealed class MainForm : Form
 
         var compressionLabel = new Label
         {
-            Text = "Textures:",
+            Text = Loc.T("settings.textures_label"),
             AutoSize = true,
             Anchor = AnchorStyles.Left,
             Margin = new Padding(0, 3, 8, 10),
         };
         var uncompressedCheck = new CheckBox
         {
-            Text = "Uncompressed textures (no DXT)",
+            Text = Loc.T("settings.uncompressed_textures"),
             Checked = _uncompressedTextures,
             AutoSize = true,
             Anchor = AnchorStyles.Left,
@@ -526,80 +688,88 @@ public sealed class MainForm : Form
         var toolTip = new ToolTip();
         var scaleLabel = new Label
         {
-            Text = "Model size:",
+            Text = Loc.T("settings.model_size_label"),
             AutoSize = true,
             Anchor = AnchorStyles.Left,
             Margin = new Padding(0, 3, 8, 10),
         };
         var matchSizeCheck = new CheckBox
         {
-            Text = "Match original model size on reimport",
+            Text = Loc.T("settings.match_size"),
             Checked = _matchOriginalModelSize,
             AutoSize = true,
             Anchor = AnchorStyles.Left,
             Margin = new Padding(0, 0, 0, 10),
         };
-        toolTip.SetToolTip(matchSizeCheck,
-            "Uniformly rescales the imported model so its overall size matches the original mesh it replaces.\n" +
-            "Use it when a GLB carries an unintended export scale (e.g. a Blender node scale) and enters the game too big or too small.\n" +
-            "Proportions are preserved.");
+        toolTip.SetToolTip(matchSizeCheck, Loc.T("settings.match_size.tooltip"));
 
         var facialBonesLabel = new Label
         {
-            Text = "Facial bones:",
+            Text = Loc.T("settings.facial_bones_label"),
             AutoSize = true,
             Anchor = AnchorStyles.Left,
             Margin = new Padding(0, 3, 8, 10),
         };
         var facialBonesCheck = new CheckBox
         {
-            Text = "Normalize facial bones on reimport",
+            Text = Loc.T("settings.normalize_facial_bones"),
             Checked = _normalizeFacialBonesOnReimport,
             AutoSize = true,
             Anchor = AnchorStyles.Left,
             Margin = new Padding(0, 0, 0, 10),
         };
-        toolTip.SetToolTip(facialBonesCheck,
-            "Allows character-specific face bones with the same role to be retargeted by suffix, for example bigby_mouthCorner_L to rhys_mouthCorner_L.\n" +
-            "This can help compatible face rigs follow target lipsync, but can deform mismatched mouths. Off keeps each game's default safe behavior.");
+        toolTip.SetToolTip(facialBonesCheck, Loc.T("settings.normalize_facial_bones.tooltip"));
 
         var viewerLabel = new Label
         {
-            Text = "Viewer:",
+            Text = Loc.T("settings.viewer_label"),
             AutoSize = true,
             Anchor = AnchorStyles.Left,
             Margin = new Padding(0, 3, 8, 10),
         };
         var antiAliasCheck = new CheckBox
         {
-            Text = "Anti-aliasing (smoother preview)",
+            Text = Loc.T("settings.anti_aliasing"),
             Checked = _viewerAntiAliasing,
             AutoSize = true,
             Anchor = AnchorStyles.Left,
             Margin = new Padding(0, 0, 0, 10),
         };
-        toolTip.SetToolTip(antiAliasCheck,
-            "Renders the model preview at 2x resolution and downsamples it for smoother triangle edges.\n" +
-            "This is preview-only and may be slower on very large meshes.");
+        toolTip.SetToolTip(antiAliasCheck, Loc.T("settings.anti_aliasing.tooltip"));
 
         var cameraLabel = new Label
         {
-            Text = "Camera:",
+            Text = Loc.T("settings.camera_label"),
             AutoSize = true,
             Anchor = AnchorStyles.Left,
             Margin = new Padding(0, 3, 8, 10),
         };
         var flightCameraCheck = new CheckBox
         {
-            Text = "Flight camera (WASD + Q/E)",
+            Text = Loc.T("settings.flight_camera"),
             Checked = _viewerFlightCamera,
             AutoSize = true,
             Anchor = AnchorStyles.Left,
             Margin = new Padding(0, 0, 0, 10),
         };
-        toolTip.SetToolTip(flightCameraCheck,
-            "Switches the preview from orbit-style navigation to a free-flight camera.\n" +
-            "Left-drag looks around; W/S dolly, A/D strafe, Q/E move vertically. Shift moves faster, Ctrl slower.");
+        toolTip.SetToolTip(flightCameraCheck, Loc.T("settings.flight_camera.tooltip"));
+
+        var integrationLabel = new Label
+        {
+            Text = Loc.T("settings.discord_label"),
+            AutoSize = true,
+            Anchor = AnchorStyles.Left,
+            Margin = new Padding(0, 3, 8, 10),
+        };
+        var discordPresenceCheck = new CheckBox
+        {
+            Text = Loc.T("settings.discord_presence"),
+            Checked = _discordRichPresence,
+            AutoSize = true,
+            Anchor = AnchorStyles.Left,
+            Margin = new Padding(0, 0, 0, 10),
+        };
+        toolTip.SetToolTip(discordPresenceCheck, Loc.T("settings.discord_presence.tooltip"));
 
         var buttons = new FlowLayoutPanel
         {
@@ -608,45 +778,54 @@ public sealed class MainForm : Form
             AutoSize = true,
             Margin = new Padding(0, 12, 0, 0),
         };
-        var ok = new Button { Text = "OK", DialogResult = DialogResult.OK, Width = 86 };
-        var cancel = new Button { Text = "Cancel", DialogResult = DialogResult.Cancel, Width = 86 };
+        var ok = new Button { Text = Loc.T("common.ok"), DialogResult = DialogResult.OK, Width = 86 };
+        var cancel = new Button { Text = Loc.T("common.cancel"), DialogResult = DialogResult.Cancel, Width = 86 };
         buttons.Controls.Add(ok);
         buttons.Controls.Add(cancel);
 #if DEBUG
         // Debug-only: pull the latest release and show the update dialog as if an update had arrived, so
         // the update UI (HTML rendering, buttons) can be tested without publishing a newer version.
-        var simulateUpdate = new Button { Text = "Simulate update", AutoSize = true, Margin = new Padding(0, 0, 12, 0) };
+        var simulateUpdate = new Button { Text = Loc.T("settings.simulate_update"), AutoSize = true, Margin = new Padding(0, 0, 12, 0) };
         simulateUpdate.Click += async (_, _) => await SimulateUpdateAsync();
         buttons.Controls.Add(simulateUpdate);
+        var simulateDiscordInvite = new Button { Text = Loc.T("settings.simulate_discord_invite"), AutoSize = true, Margin = new Padding(0, 0, 12, 0) };
+        simulateDiscordInvite.Click += (_, _) => SimulateDiscordInvite();
+        buttons.Controls.Add(simulateDiscordInvite);
 #endif
 
         var tabs = new TabControl
         {
-            Size = new Size(386, 224),
             Margin = new Padding(0),
         };
-        var generalPage = new TabPage("General")
+        var generalPage = new TabPage(Loc.T("settings.tab.general"))
         {
             Padding = new Padding(10),
             UseVisualStyleBackColor = true,
         };
-        var viewerPage = new TabPage("Viewer")
+        var viewerPage = new TabPage(Loc.T("settings.tab.viewer"))
+        {
+            Padding = new Padding(10),
+            UseVisualStyleBackColor = true,
+        };
+        var integrationsPage = new TabPage(Loc.T("settings.tab.integrations"))
         {
             Padding = new Padding(10),
             UseVisualStyleBackColor = true,
         };
 
         var generalLayout = CreateSettingsPageLayout();
-        generalLayout.Controls.Add(formatLabel, 0, 0);
-        generalLayout.Controls.Add(formatCombo, 1, 0);
-        generalLayout.Controls.Add(atlasLabel, 0, 1);
-        generalLayout.Controls.Add(atlasCheck, 1, 1);
-        generalLayout.Controls.Add(compressionLabel, 0, 2);
-        generalLayout.Controls.Add(uncompressedCheck, 1, 2);
-        generalLayout.Controls.Add(scaleLabel, 0, 3);
-        generalLayout.Controls.Add(matchSizeCheck, 1, 3);
-        generalLayout.Controls.Add(facialBonesLabel, 0, 4);
-        generalLayout.Controls.Add(facialBonesCheck, 1, 4);
+        generalLayout.Controls.Add(languageLabel, 0, 0);
+        generalLayout.Controls.Add(languageCombo, 1, 0);
+        generalLayout.Controls.Add(formatLabel, 0, 1);
+        generalLayout.Controls.Add(formatCombo, 1, 1);
+        generalLayout.Controls.Add(atlasLabel, 0, 2);
+        generalLayout.Controls.Add(atlasCheck, 1, 2);
+        generalLayout.Controls.Add(compressionLabel, 0, 3);
+        generalLayout.Controls.Add(uncompressedCheck, 1, 3);
+        generalLayout.Controls.Add(scaleLabel, 0, 4);
+        generalLayout.Controls.Add(matchSizeCheck, 1, 4);
+        generalLayout.Controls.Add(facialBonesLabel, 0, 5);
+        generalLayout.Controls.Add(facialBonesCheck, 1, 5);
 
         var viewerLayout = CreateSettingsPageLayout();
         viewerLayout.Controls.Add(viewerLabel, 0, 0);
@@ -654,16 +833,30 @@ public sealed class MainForm : Form
         viewerLayout.Controls.Add(cameraLabel, 0, 1);
         viewerLayout.Controls.Add(flightCameraCheck, 1, 1);
 
+        var integrationsLayout = CreateSettingsPageLayout();
+        integrationsLayout.Controls.Add(integrationLabel, 0, 0);
+        integrationsLayout.Controls.Add(discordPresenceCheck, 1, 0);
+
         generalPage.Controls.Add(generalLayout);
         viewerPage.Controls.Add(viewerLayout);
+        integrationsPage.Controls.Add(integrationsLayout);
         tabs.TabPages.Add(generalPage);
         tabs.TabPages.Add(viewerPage);
+        tabs.TabPages.Add(integrationsPage);
 
         layout.Controls.Add(tabs, 0, 0);
         layout.Controls.Add(buttons, 0, 1);
         dialog.Controls.Add(layout);
         dialog.AcceptButton = ok;
         dialog.CancelButton = cancel;
+
+        // Size the tab area to the largest page so labels and checkboxes are never clipped in any language
+        // (label/checkbox text length varies a lot between translations). Measured after parenting so the
+        // controls use the dialog font, and the auto-sizing dialog grows to fit the result.
+        var pageLayouts = new[] { generalLayout, viewerLayout, integrationsLayout };
+        var contentWidth = pageLayouts.Max(page => page.PreferredSize.Width);
+        var contentHeight = pageLayouts.Max(page => page.PreferredSize.Height);
+        tabs.Size = new Size(Math.Max(contentWidth + 40, 360), contentHeight + 62);
 
         if (dialog.ShowDialog(this) != DialogResult.OK)
         {
@@ -677,8 +870,11 @@ public sealed class MainForm : Form
         _normalizeFacialBonesOnReimport = facialBonesCheck.Checked;
         _viewerAntiAliasing = antiAliasCheck.Checked;
         _viewerFlightCamera = flightCameraCheck.Checked;
+        _discordRichPresence = discordPresenceCheck.Checked;
         _preview.SetAntiAliasing(_viewerAntiAliasing);
         _preview.SetCameraMode(_viewerFlightCamera ? PreviewCameraMode.Flight : PreviewCameraMode.Orbit);
+        _discordPresence.SetEnabled(_discordRichPresence);
+        UpdateDiscordPresence();
         UpdateFormatButton();
         AppPreferences.SaveToolSettings(
             _exportFormat == ExportFormat.Glb ? "Glb" : "GltfSeparate",
@@ -687,7 +883,25 @@ public sealed class MainForm : Form
             _matchOriginalModelSize,
             _normalizeFacialBonesOnReimport,
             _viewerAntiAliasing,
-            _viewerFlightCamera);
+            _viewerFlightCamera,
+            _discordRichPresence);
+
+        // Language change is handled separately: the UI is built once at startup, so switching takes
+        // effect after a restart. Save the choice and offer to restart now.
+        if (languageCombo.SelectedItem is LanguageInfo chosenLanguage &&
+            !chosenLanguage.Code.Equals(Loc.CurrentCode, StringComparison.OrdinalIgnoreCase))
+        {
+            AppPreferences.SaveLanguage(chosenLanguage.Code);
+            var restart = MessageBox.Show(
+                Loc.T("settings.language_restart.body"),
+                Loc.T("settings.language_restart.title"),
+                MessageBoxButtons.YesNo,
+                MessageBoxIcon.Question);
+            if (restart == DialogResult.Yes)
+            {
+                Application.Restart();
+            }
+        }
     }
 
     private static TableLayoutPanel CreateSettingsPageLayout()
@@ -698,11 +912,13 @@ public sealed class MainForm : Form
             AutoSizeMode = AutoSizeMode.GrowAndShrink,
             Dock = DockStyle.Top,
             ColumnCount = 2,
-            RowCount = 5,
+            RowCount = 6,
         };
-        layout.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 116));
+        // The label column auto-sizes to the widest label so translations (which vary a lot in length)
+        // are never clipped; the second column takes the rest for the combos/checkboxes.
+        layout.ColumnStyles.Add(new ColumnStyle(SizeType.AutoSize));
         layout.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100));
-        for (var i = 0; i < 5; i++)
+        for (var i = 0; i < 6; i++)
         {
             layout.RowStyles.Add(new RowStyle(SizeType.AutoSize));
         }
@@ -716,17 +932,18 @@ public sealed class MainForm : Form
         _btnExtractAll.Enabled = false;
         _btnReimportSelected.Enabled = false;
         _btnCombineParts.Enabled = false;
+        _btnFilter.Enabled = false;
         _btnReload.Enabled = false;
         _searchText.Enabled = false;
-        SetStatusText("Open a folder containing .d3dmesh, .skl and .d3dtx files to begin.");
+        SetStatusText(Loc.T("status.ready"));
         SetDetailText("");
     }
 
     private static string BuildLoadedDetailText(int modelCount, int groupCount)
     {
-        var models = modelCount == 1 ? "1 model" : $"{modelCount} models";
-        var groups = groupCount == 1 ? "1 combined group" : $"{groupCount} combined groups";
-        return $"{models} | {groups}";
+        var models = modelCount == 1 ? Loc.T("detail.one_model") : Loc.T("detail.n_models", modelCount);
+        var groups = groupCount == 1 ? Loc.T("detail.one_group") : Loc.T("detail.n_groups", groupCount);
+        return Loc.T("detail.loaded_summary", models, groups);
     }
 
     private void SetStatusText(string text)
@@ -745,7 +962,7 @@ public sealed class MainForm : Form
     {
         using var dialog = new FolderBrowserDialog
         {
-            Description = "Select the folder containing the .d3dmesh, .d3dtx and .skl files",
+            Description = Loc.T("dialog.open_folder.description"),
             UseDescriptionForTitle = true
         };
 
@@ -764,8 +981,8 @@ public sealed class MainForm : Form
     {
         using var dialog = new OpenFileDialog
         {
-            Title = "Select one or more Telltale archives (.ttarch / .ttarch2)",
-            Filter = "Telltale archives (*.ttarch;*.ttarch2)|*.ttarch;*.ttarch2|All files (*.*)|*.*",
+            Title = Loc.T("dialog.open_archive.title"),
+            Filter = Loc.T("dialog.open_archive.filter"),
             CheckFileExists = true,
             Multiselect = true
         };
@@ -794,11 +1011,11 @@ public sealed class MainForm : Form
         await RunWithUiLockAsync(async () =>
         {
             SetStatusText(archivePaths.Length == 1
-                ? "Extracting archive..."
-                : $"Extracting {archivePaths.Length} archives...");
+                ? Loc.T("status.extracting_archive")
+                : Loc.T("status.extracting_n_archives", archivePaths.Length));
 
             IProgress<int> archiveProgress = new Progress<int>(done =>
-                SetProgress(done, archivePaths.Length, $"Extracting archive {Math.Min(done + 1, archivePaths.Length)}/{archivePaths.Length}..."));
+                SetProgress(done, archivePaths.Length, Loc.T("status.extracting_archive_progress", Math.Min(done + 1, archivePaths.Length), archivePaths.Length)));
             await Task.Run(() =>
             {
                 for (var i = 0; i < archivePaths.Length; i++)
@@ -831,20 +1048,20 @@ public sealed class MainForm : Form
                 TryAutoSelectGameForGeneric(loadFolder, archivePaths.Concat(detectedGames));
 
                 var loadProgress = new Progress<double>(fraction =>
-                    SetProgress((int)(fraction * 1000), 1000, $"Reading folder... {(int)(fraction * 100)}%"));
+                    SetProgress((int)(fraction * 1000), 1000, Loc.T("status.reading_folder_pct", (int)(fraction * 100))));
                 await ReloadAssetsAsync(loadFolder, loadProgress);
             }
 
             var detected = detectedGames.Count > 0
-                ? $"\n\nDetected: {string.Join(", ", detectedGames)}"
+                ? Loc.T("msg.archive.detected", string.Join(", ", detectedGames))
                 : "";
             var message = totalExtracted > 0
-                ? $"Extracted {totalExtracted} asset file(s) from {archivePaths.Length} archive(s)\n\ninto:\n{loadFolder}{detected}"
-                : "No .d3dmesh, .d3dtx or .skl files were found in the selected archive(s).";
+                ? Loc.T("msg.archive.extracted", totalExtracted, archivePaths.Length, loadFolder, detected)
+                : Loc.T("msg.archive.none");
 
             if (failures.Count > 0)
             {
-                message += $"\n\nCould not open {failures.Count} archive(s):\n" + string.Join("\n", failures);
+                message += Loc.T("msg.archive.failures", failures.Count) + string.Join("\n", failures);
             }
 
             return message;
@@ -853,7 +1070,7 @@ public sealed class MainForm : Form
 
     private void UpdateGameSelector()
     {
-        _gameSelector.Text = $"Game: {GameConfig.Current.DisplayName}";
+        _gameSelector.Text = Loc.T("game_selector.text", GameConfig.Current.DisplayName);
         if (TryGetGameMenuImage(GameConfig.Current.Id, out var image))
         {
             _gameSelector.Image = image;
@@ -879,6 +1096,7 @@ public sealed class MainForm : Form
                 GameId.BackToTheFutureEpisode4 or
                 GameId.BackToTheFutureEpisode5 or
                 GameId.WalkingDeadSeason2 or
+                GameId.WalkingDeadMichonne or
                 GameId.MinecraftStoryMode or
                 GameId.TalesFromTheBorderlands2014 or
                 GameId.TalesFromTheBorderlandsE3 or
@@ -908,6 +1126,7 @@ public sealed class MainForm : Form
             if (game.Id == GameId.WalkingDead)
             {
                 item.DropDownItems.Add(CreateGameMenuItem(GameConfig.WalkingDeadSeason2));
+                item.DropDownItems.Add(CreateGameMenuItem(GameConfig.WalkingDeadMichonne));
             }
 
             if (game.Id == GameId.MinecraftStoryModeGroup)
@@ -946,6 +1165,7 @@ public sealed class MainForm : Form
             GameId.Generic => "Auto-Generic",
             GameId.WalkingDead => "TWD",
             GameId.WalkingDeadSeason2 => "TWDS2",
+            GameId.WalkingDeadMichonne => "TWDM",
             GameId.WolfAmongUs => "TWAU",
             GameId.MinecraftStoryModeGroup => "MCSM",
             GameId.MinecraftStoryMode => "MCSMS1",
@@ -1061,6 +1281,7 @@ public sealed class MainForm : Form
         AppPreferences.SaveGameConfig(game);
         UpdateGameSelector();
         UpdateSelectionButtons();
+        UpdateDiscordPresence();
 
         if (_rootFolder is not null)
         {
@@ -1085,6 +1306,7 @@ public sealed class MainForm : Form
         AppPreferences.SaveGameConfig(inferred);
         UpdateGameSelector();
         UpdateSelectionButtons();
+        UpdateDiscordPresence();
     }
 
     private static GameConfig? InferGameConfigForAutoGeneric(string folder, IEnumerable<string>? extraHints)
@@ -1221,6 +1443,11 @@ public sealed class MainForm : Form
             return GameConfig.MinecraftStoryMode;
         }
 
+        if (metaStreamVersion == "MSV5" && meshVersion == 25)
+        {
+            return GameConfig.WalkingDeadMichonne;
+        }
+
         // Versions 13/14 are shared by nearby Telltale generations, and MTRE v12 appears in both
         // supported and unsupported games. Keep Auto / Generic unless the folder/archive name supplied
         // a stronger hint.
@@ -1240,6 +1467,14 @@ public sealed class MainForm : Form
             text.Contains("WD200", StringComparison.OrdinalIgnoreCase))
         {
             return GameConfig.WalkingDeadSeason2;
+        }
+
+        if (text.Contains("TWDM", StringComparison.OrdinalIgnoreCase) ||
+            text.Contains("Walking Dead: Michonne", StringComparison.OrdinalIgnoreCase) ||
+            text.Contains("Walking Dead Michonne", StringComparison.OrdinalIgnoreCase) ||
+            text.Contains("Michonne", StringComparison.OrdinalIgnoreCase))
+        {
+            return GameConfig.WalkingDeadMichonne;
         }
 
         if (text.Contains("TWAU", StringComparison.OrdinalIgnoreCase) ||
@@ -1326,17 +1561,17 @@ public sealed class MainForm : Form
         SetBusy(true);
         try
         {
-            SetProgress(0, 1000, "Reading folder... 0%");
+            SetProgress(0, 1000, Loc.T("status.reading_folder_pct", 0));
             var progress = new Progress<double>(fraction =>
-                SetProgress((int)(fraction * 1000), 1000, $"Reading folder... {(int)(fraction * 100)}%"));
+                SetProgress((int)(fraction * 1000), 1000, Loc.T("status.reading_folder_pct", (int)(fraction * 100))));
             await ReloadAssetsAsync(folder, progress);
         }
         catch (Exception ex)
         {
-            SetStatusText("Error.");
+            SetStatusText(Loc.T("status.error"));
             var logPath = ErrorLog.Write(ex, "Folder load failed");
             MessageBox.Show(
-                $"Could not load the folder. A detailed log was written to:\n{logPath}\n\n{ex.Message}",
+                Loc.T("msg.folder_load_failed", logPath, ex.Message),
                 Text,
                 MessageBoxButtons.OK,
                 MessageBoxIcon.Error);
@@ -1356,6 +1591,7 @@ public sealed class MainForm : Form
         _selectedAsset = null;
         _selectedGroup = null;
         _preview.SetScene(null, null);
+        UpdateDiscordPresence();
         progress?.Report(0);
 
         TryAutoSelectGameForGeneric(folder);
@@ -1371,6 +1607,7 @@ public sealed class MainForm : Form
         _assets = assets;
         _assetGroups = groups;
         _searchText.Enabled = true;
+        _btnFilter.Enabled = true;
         _searchDebounceTimer.Stop();
         if (_searchText.TextLength > 0)
         {
@@ -1387,7 +1624,7 @@ public sealed class MainForm : Form
         _btnReimportSelected.Enabled = false;
         SetDetailText(BuildLoadedDetailText(_assets.Count, _btnCombineParts.Checked ? _assetGroups.Count : 0));
         SetStatusText(_assets.Count == 0
-            ? "No .d3dmesh files were found in this folder."
+            ? Loc.T("status.no_meshes")
             : BuildLoadedFolderStatus(folder));
     }
 
@@ -1427,12 +1664,16 @@ public sealed class MainForm : Form
             return;
         }
 
+        // Tree refreshes must never leave the filter button showing a stale/default label.
+        UpdateFilterButtonText();
+
         var query = _searchText.Text.Trim();
         var visibleAssets = string.IsNullOrEmpty(query)
             ? _assets
             : _assets
                 .Where(asset => asset.Matches(_rootFolder, query))
                 .ToList();
+        visibleAssets = ApplyAssetFilters(visibleAssets);
         var visibleGroups = _btnCombineParts.Checked
             ? string.IsNullOrEmpty(query)
                 ? _assetGroups
@@ -1440,6 +1681,10 @@ public sealed class MainForm : Form
                     .Where(group => group.Matches(_rootFolder, query))
                     .ToList()
             : [];
+        if (_btnCombineParts.Checked)
+        {
+            visibleGroups = ApplyGroupFilters(visibleGroups);
+        }
         if (_btnCombineParts.Checked)
         {
             visibleAssets = FilterLooseAssetsForTree(visibleAssets, visibleGroups).ToList();
@@ -1480,21 +1725,28 @@ public sealed class MainForm : Form
             ResetTreeViewport(root, preferFirstResult: !string.IsNullOrEmpty(query));
         }
 
-        SetDetailText(string.IsNullOrEmpty(query)
+        var filtersActive = _filterHasSkeleton || _filterCharactersOnly;
+        SetDetailText(string.IsNullOrEmpty(query) && !filtersActive
             ? BuildLoadedDetailText(_assets.Count, visibleGroups.Count)
-            : $"{visibleAssets.Count} of {_assets.Count} models | {visibleGroups.Count} of {_assetGroups.Count} groups");
+            : Loc.T("detail.filtered_summary", visibleAssets.Count, _assets.Count, visibleGroups.Count, _assetGroups.Count));
         if ((_assets.Count > 0 || _assetGroups.Count > 0) && visibleAssets.Count == 0 && visibleGroups.Count == 0)
         {
-            SetStatusText($"No files match \"{query}\".");
+            SetStatusText(string.IsNullOrEmpty(query)
+                ? Loc.T("status.no_match_filter")
+                : Loc.T("status.no_match_query_filter", query));
         }
         else if (!string.IsNullOrEmpty(query))
         {
-            SetStatusText($"Search: \"{query}\"");
+            SetStatusText(filtersActive ? Loc.T("status.search_filter", query) : Loc.T("status.search", query));
+        }
+        else if (filtersActive)
+        {
+            SetStatusText(Loc.T("status.filter_active"));
         }
         else
         {
             SetStatusText(_assets.Count == 0
-                ? "No .d3dmesh files were found in this folder."
+                ? Loc.T("status.no_meshes")
                 : BuildLoadedFolderStatus(_rootFolder));
         }
 
@@ -1508,14 +1760,14 @@ public sealed class MainForm : Form
         var node = FindNodeByMeshPath(_tree.Nodes, fullPath);
         if (node is null)
         {
-            SetStatusText($"Loaded folder, but could not select: {Path.GetFileName(meshPath)}");
+            SetStatusText(Loc.T("status.loaded_could_not_select", Path.GetFileName(meshPath)));
             return;
         }
 
         ExpandParents(node);
         ApplyTreeSelection(node, additive: false, range: false);
         node.EnsureVisible();
-        SetStatusText($"Opened: {Path.GetFileName(meshPath)}");
+        SetStatusText(Loc.T("status.opened", Path.GetFileName(meshPath)));
     }
 
     private static TreeNode? FindNodeByMeshPath(TreeNodeCollection nodes, string meshPath)
@@ -1556,6 +1808,46 @@ public sealed class MainForm : Form
         _searchDebounceTimer.Stop();
         _searchDebounceTimer.Start();
     }
+
+    private void UpdateFilterButtonText()
+    {
+        _btnFilter.Text = _filterHasSkeleton
+            ? Loc.T("filter.button.skl")
+            : _filterCharactersOnly
+                ? Loc.T("filter.button.sk")
+                : Loc.T("tree.filter");
+    }
+
+    private void SetExclusiveFilter(bool hasSkeleton, bool charactersOnly)
+    {
+        _filterHasSkeleton = hasSkeleton;
+        _filterCharactersOnly = charactersOnly;
+        _miFilterHasSkeleton.Checked = _filterHasSkeleton;
+        _miFilterCharacters.Checked = _filterCharactersOnly;
+        UpdateFilterButtonText();
+        QueueAssetTreeRebuild(resetViewport: true);
+    }
+
+    private List<ModelAsset> ApplyAssetFilters(IEnumerable<ModelAsset> assets)
+        => assets
+            .Where(asset => !_filterHasSkeleton || !string.IsNullOrWhiteSpace(asset.SkeletonPath))
+            .Where(asset => !_filterCharactersOnly || IsCharacterAsset(asset))
+            .ToList();
+
+    private List<ModelAssetGroup> ApplyGroupFilters(IEnumerable<ModelAssetGroup> groups)
+        => groups
+            .Where(group => !_filterHasSkeleton || !string.IsNullOrWhiteSpace(group.SkeletonPath))
+            .Where(group => !_filterCharactersOnly || IsCharacterGroup(group))
+            .ToList();
+
+    private static bool IsCharacterAsset(ModelAsset asset)
+        => Path.GetFileNameWithoutExtension(asset.MeshPath)
+            .StartsWith("sk", StringComparison.OrdinalIgnoreCase);
+
+    private static bool IsCharacterGroup(ModelAssetGroup group)
+        => Path.GetFileNameWithoutExtension(group.SkeletonPath)
+               .StartsWith("sk", StringComparison.OrdinalIgnoreCase) ||
+           group.Assets.Any(IsCharacterAsset);
 
     private static IEnumerable<ModelAsset> FilterLooseAssetsForTree(
         IReadOnlyList<ModelAsset> assets,
@@ -1762,6 +2054,8 @@ public sealed class MainForm : Form
             _tree.SelectedNode = previewNode;
             OnTreeSelect(previewNode);
             UpdateSelectionButtons();
+            // Previewing a node updates the status/detail labels; keep the active filter visible too.
+            UpdateFilterButtonText();
         }
         finally
         {
@@ -1886,12 +2180,15 @@ public sealed class MainForm : Form
     // Tales from the Borderlands (Old) is the 2014 source-code leak: view/extract/GLB only, never
     // reinsertion (there is no playable build to put files back into). Every reimport entry point is
     // gated on this so the feature is fully unavailable while either profile is selected.
-    private static bool ReinsertionSupported => GameConfig.Current.Id is not GameId.Generic and not GameId.TalesFromTheBorderlandsOld;
+    private static bool ReinsertionSupported => GameConfig.Current.Id is not GameId.Generic
+        and not GameId.TalesFromTheBorderlandsOld;
 
     private static string GetReinsertionUnavailableMessage()
-        => GameConfig.Current.Id == GameId.Generic
-            ? "Reinsertion is disabled for Auto / Generic. Select a supported game profile before reimporting."
-            : "Reinsertion is disabled for Tales from the Borderlands (Old). This profile is view and GLB export only.";
+        => GameConfig.Current.Id switch
+        {
+            GameId.Generic => Loc.T("msg.reinsert.disabled_generic"),
+            _ => Loc.T("msg.reinsert.disabled_tftb_old"),
+        };
 
     private void OnTreeSelect(TreeNode? node)
     {
@@ -1901,6 +2198,7 @@ public sealed class MainForm : Form
             _selectedGroup = group;
             _btnExtractSelected.Enabled = true;
             _btnReimportSelected.Enabled = ReinsertionSupported;
+            UpdateDiscordPresence();
             PreviewAssetGroup(group);
             return;
         }
@@ -1912,6 +2210,7 @@ public sealed class MainForm : Form
             _btnExtractSelected.Enabled = false;
             _btnReimportSelected.Enabled = false;
             SetDetailText(BuildLoadedDetailText(_assets.Count, _assetGroups.Count));
+            UpdateDiscordPresence();
             return;
         }
 
@@ -1919,7 +2218,25 @@ public sealed class MainForm : Form
         _selectedGroup = null;
         _btnExtractSelected.Enabled = true;
         _btnReimportSelected.Enabled = ReinsertionSupported;
+        UpdateDiscordPresence();
         PreviewAsset(asset);
+    }
+
+    private void UpdateDiscordPresence()
+    {
+        if (_selectedGroup is not null)
+        {
+            _discordPresence.SetActivity(GameConfig.Current, _selectedGroup.OutputStem, combinedModel: true);
+            return;
+        }
+
+        if (_selectedAsset is not null)
+        {
+            _discordPresence.SetActivity(GameConfig.Current, Path.GetFileName(_selectedAsset.MeshPath));
+            return;
+        }
+
+        _discordPresence.SetActivity(GameConfig.Current, null);
     }
 
     private void UpdateSelectionButtons()
@@ -2010,15 +2327,14 @@ public sealed class MainForm : Form
             var textures = _rootFolder is null
                 ? new Dictionary<int, MaterialTextureSet>()
                 : TextureResolver.ResolveForMesh(_rootFolder, asset.MeshPath, mesh);
-            _preview.SetScene(mesh, skeleton, textures);
-            SetStatusText("Preview ready.");
-            var textureCount = textures.Values.Sum(set => set.Count);
-            SetDetailText($"textures: {textureCount}");
+            _preview.SetScene(mesh, skeleton, textures, partCount: 1);
+            SetStatusText(Loc.T("status.preview_ready"));
+            SetDetailText("");
         }
         catch (Exception ex)
         {
             _preview.SetScene(null, null);
-            SetStatusText($"Preview error: {Path.GetFileName(asset.MeshPath)}");
+            SetStatusText(Loc.T("status.preview_error", Path.GetFileName(asset.MeshPath)));
             SetDetailText(ex.Message);
         }
     }
@@ -2033,15 +2349,14 @@ public sealed class MainForm : Form
             }
 
             var previewAsset = ExtractionService.BuildPreviewAsset(group, _rootFolder);
-            _preview.SetScene(previewAsset.Mesh, previewAsset.Skeleton, previewAsset.Textures);
-            SetStatusText("Combined preview ready.");
-            var textureCount = previewAsset.Textures.Values.Sum(set => set.Count);
-            SetDetailText($"parts: {group.Assets.Count} | textures: {textureCount}");
+            _preview.SetScene(previewAsset.Mesh, previewAsset.Skeleton, previewAsset.Textures, partCount: group.Assets.Count);
+            SetStatusText(Loc.T("status.combined_preview_ready"));
+            SetDetailText("");
         }
         catch (Exception ex)
         {
             _preview.SetScene(null, null);
-            SetStatusText($"Preview error: {group}");
+            SetStatusText(Loc.T("status.preview_error", group));
             SetDetailText(ex.Message);
         }
     }
@@ -2069,7 +2384,7 @@ public sealed class MainForm : Form
         var root = _rootFolder;
         var format = _exportFormat;
         var progress = new Progress<(int Done, string Name)>(p =>
-            SetProgress(p.Done, selectedCount, $"Extracting {p.Done}/{selectedCount}: {p.Name}"));
+            SetProgress(p.Done, selectedCount, Loc.T("status.extracting_item", p.Done, selectedCount, p.Name)));
         await RunWithUiLockAsync(async () =>
         {
             var result = await Task.Run(() =>
@@ -2088,12 +2403,12 @@ public sealed class MainForm : Form
                     {
                         ExtractionService.ExtractAssetGroupToPath(group, root, outputPath, format);
                         ok++;
-                        lines.Add($"OK combined group: {group.Name} -> {Path.GetFileName(outputPath)}");
+                        lines.Add(Loc.T("report.ok_combined_group", group.Name, Path.GetFileName(outputPath)));
                     }
                     catch (Exception ex)
                     {
                         failed++;
-                        lines.Add($"FAIL combined group: {group.Name} -> {ex.Message}");
+                        lines.Add(Loc.T("report.fail_combined_group", group.Name, ex.Message));
                     }
                 }
 
@@ -2106,12 +2421,12 @@ public sealed class MainForm : Form
                     {
                         ExtractionService.ExtractAssetToPath(asset, root, outputPath, format);
                         ok++;
-                        lines.Add($"OK model: {stem} -> {Path.GetFileName(outputPath)}");
+                        lines.Add(Loc.T("report.ok_model", stem, Path.GetFileName(outputPath)));
                     }
                     catch (Exception ex)
                     {
                         failed++;
-                        lines.Add($"FAIL model: {stem} -> {ex.Message}");
+                        lines.Add(Loc.T("report.fail_model", stem, ex.Message));
                     }
                 }
 
@@ -2122,8 +2437,8 @@ public sealed class MainForm : Form
 
                 return string.Join(
                     Environment.NewLine,
-                    $"Extracted selected items to: {output}",
-                    $"OK: {ok}/{selectedCount}, failed: {failed}",
+                    Loc.T("report.extracted_selected_to", output),
+                    Loc.T("report.ok_failed_count", ok, selectedCount, failed),
                     string.Join(Environment.NewLine, lines));
             });
 
@@ -2172,11 +2487,11 @@ public sealed class MainForm : Form
             var progress = new Progress<string>(line =>
             {
                 SetStatusText(line);
-                SetProgress(++done, total, $"Extracting {Math.Min(done, total)}/{total}...");
+                SetProgress(++done, total, Loc.T("status.extracting_count", Math.Min(done, total), total));
             });
             var summary = await Task.Run(() => ExtractionService.ExtractAll(assets, root, output, format, progress));
             sw.Stop();
-            return $"{summary}\nTime: {sw.Elapsed:g}";
+            return Loc.T("report.time_suffix", summary, sw.Elapsed);
         });
     }
 
@@ -2186,7 +2501,7 @@ public sealed class MainForm : Form
         {
             MessageBox.Show(
                 GetReinsertionUnavailableMessage(),
-                "Reinsertion unavailable",
+                Loc.T("msg.reinsert.unavailable_title"),
                 MessageBoxButtons.OK,
                 MessageBoxIcon.Information);
             return;
@@ -2316,6 +2631,33 @@ public sealed class MainForm : Form
             return ReimportBttfSingleAsset(asset, model, input, output, effectiveUseDiffuseAtlas, uncompressedTextures, gameConfig, atlas);
         }
 
+        if (D3DMeshParser.Parse(templateBytes).Version == 25)
+        {
+            var v25Tex = ReinsertTextureService.WriteV25ReferencedTextures(model, asset.MeshPath, output, uncompressedTextures);
+            var v25Layout = D3DMeshLayout.BuildV25(templateBytes);
+            var v25SourceLayout = MeshReinserter.TryFindV25SourceMaterialLayout(model, asset.MeshPath, input);
+            var v25Bytes = MeshReinserter.ReinsertV25Geometry(v25Layout, model, v25Tex.PrimitiveSlots, v25SourceLayout);
+            File.WriteAllBytes(output, v25Bytes);
+            var v25TextureLine = v25Tex.Written.Count > 0
+                ? Loc.T("report.texture_line", v25Tex.Written.Count)
+                : "";
+            var v25WarnLine = v25Tex.TemplateNotFound.Count > 0
+                ? Loc.T("report.v25.no_template_warning", string.Join(", ", v25Tex.TemplateNotFound))
+                : "";
+            var v25DistinctTex = ReinsertTextureService.DistinctV25TextureCount(model);
+            var v25CollapseLine = v25DistinctTex > v25Layout.Materials.Count && !MeshReinserter.CanAddV25Materials(v25Layout)
+                ? Loc.T("report.v25.collapse_warning", v25DistinctTex, v25Layout.Materials.Count)
+                : "";
+            // Skinned (character) V25: rebuild the .skl from the GLB skeleton next to the output, same as
+            // the other games. No-op for static props (the model has no skin).
+            var v25SkeletonPath = ResolveReimportSkeletonPath(asset);
+            var v25SkeletonLine = v25Layout.IsSkinned
+                ? RebuildSkeletonForReimport(asset, v25SkeletonPath, model, output, 25, gameConfig)
+                : "";
+            var v25Kind = v25Layout.IsSkinned ? Loc.T("report.v25.kind_character") : Loc.T("report.v25.kind_static");
+            return Loc.T("report.v25.reimported", v25Kind, Path.GetFileName(asset.MeshPath), input, output, v25TextureLine, v25WarnLine, v25CollapseLine, v25SkeletonLine);
+        }
+
         var layout = D3DMeshLayout.Build(templateBytes);
         var skeletonPath = ResolveReimportSkeletonPath(asset);
         var skeleton = LoadSkeletonOrNull(skeletonPath, layout.Version);
@@ -2326,16 +2668,16 @@ public sealed class MainForm : Form
 
         var check = D3DMeshLayout.Build(bytes);
         var status = check.TailOffset + check.TailLength == bytes.Length
-            ? "Output verified: layout closes at EOF."
-            : "Warning: output was written, but the layout does not close at EOF.";
+            ? Loc.T("report.status_verified")
+            : Loc.T("report.status_eof_warning");
         var textureCount = textures.WrittenNames.Count;
         var textureLine = textureCount > 0
-            ? $"\nTextures: {textureCount} .d3dtx file(s) written next to the output mesh."
+            ? Loc.T("report.texture_line", textureCount)
             : "";
         var skeletonLine = RebuildSkeletonForReimport(asset, skeletonPath, model, output, layout.Version, gameConfig);
         var atlasLine = BuildAtlasStatusLine(atlas);
 
-        return $"Reimported: {Path.GetFileName(asset.MeshPath)}\nInput: {input}\nOutput: {output}{textureLine}{atlasLine}{skeletonLine}\n{status}";
+        return Loc.T("report.reimported", Path.GetFileName(asset.MeshPath), input, output, textureLine, atlasLine, skeletonLine, status);
     }
 
     // Rescales the imported model so its overall size matches the template mesh it replaces (Settings >
@@ -2426,18 +2768,18 @@ public sealed class MainForm : Form
         File.WriteAllBytes(output, bytes);
 
         var status = BttfMeshSupport.VerifyClosesAtEof(bytes)
-            ? "Output verified: layout closes at EOF."
-            : "Warning: output was written, but the layout does not close at EOF.";
+            ? Loc.T("report.status_verified")
+            : Loc.T("report.status_eof_warning");
         var textureLine = textureCount > 0
-            ? $"\nTextures: {textureCount} .d3dtx file(s) written next to the output mesh."
+            ? Loc.T("report.texture_line", textureCount)
             : "";
         var bakeLine = removedBakeRefs > 0
-            ? "\nBake: removed the inherited lightmap reference (imported model has no bake), so the model keeps its real colors in-game."
+            ? Loc.T("report.bttf.bake_removed")
             : "";
         var atlasLine = BuildAtlasStatusLine(atlas);
         var skeletonLine = RebuildBttfSkeletonForReimport(asset, model, output);
 
-        return $"Reimported: {Path.GetFileName(asset.MeshPath)} (Back to the Future v1)\nInput: {input}\nOutput: {output}{textureLine}{bakeLine}{atlasLine}{skeletonLine}\n{status}";
+        return Loc.T("report.bttf.reimported", Path.GetFileName(asset.MeshPath), input, output, textureLine, bakeLine, atlasLine, skeletonLine, status);
     }
 
     // Writes the .skl next to the reimported Back to the Future mesh, rebuilt from the GLB's own skeleton
@@ -2452,7 +2794,7 @@ public sealed class MainForm : Form
 
         if (asset.SkeletonPath is null || !File.Exists(asset.SkeletonPath))
         {
-            return "\nSkeleton: skipped (the target asset has no .skl to base the ERTM header on).";
+            return Loc.T("report.skeleton.bttf_skipped_no_skl");
         }
 
         try
@@ -2460,11 +2802,11 @@ public sealed class MainForm : Form
             var skeletonBytes = BttfSkeletonWriter.Build(File.ReadAllBytes(asset.SkeletonPath), model.Skeleton);
             var skeletonOutput = Path.Combine(Path.GetDirectoryName(output) ?? "", Path.GetFileName(asset.SkeletonPath));
             File.WriteAllBytes(skeletonOutput, skeletonBytes);
-            return $"\nSkeleton: {Path.GetFileName(asset.SkeletonPath)} rebuilt from the GLB ({model.Skeleton.Bones.Count} bones).";
+            return Loc.T("report.skeleton.bttf_rebuilt", Path.GetFileName(asset.SkeletonPath), model.Skeleton.Bones.Count);
         }
         catch (Exception ex)
         {
-            return $"\nSkeleton: could not rebuild the .skl ({ex.Message}); the target's original skeleton is left in use.";
+            return Loc.T("report.skeleton.bttf_rebuild_failed", ex.Message);
         }
     }
 
@@ -2479,7 +2821,7 @@ public sealed class MainForm : Form
         {
             if (skeletonPath is not null && File.Exists(skeletonPath))
             {
-                return "\nSkeleton: not written; imported model has no skin and was bound as static geometry.";
+                return Loc.T("report.skeleton.static_not_written");
             }
 
             return "";
@@ -2487,7 +2829,7 @@ public sealed class MainForm : Form
 
         if (skeletonPath is null || !File.Exists(skeletonPath))
         {
-            return "\nSkeleton: skipped because the target asset has no original .skl; imported rig was baked as static geometry.";
+            return Loc.T("report.skeleton.skipped_no_skl_static");
         }
 
         try
@@ -2511,7 +2853,7 @@ public sealed class MainForm : Form
 
             var skeletonBytes = RebuildSkeletonBytesForGame(skeletonPath, model.Skeleton, gameConfig);
             File.WriteAllBytes(skeletonOutput, skeletonBytes);
-            return $"\nSkeleton: {skeletonName} rebuilt from the original skeleton + your edits ({model.Skeleton.Bones.Count} bones).";
+            return Loc.T("report.skeleton.rebuilt_edits", skeletonName, model.Skeleton.Bones.Count);
         }
         catch (Exception ex)
         {
@@ -2520,7 +2862,7 @@ public sealed class MainForm : Form
                 throw new InvalidDataException($"Could not rebuild the TFTB original PC .skl for '{Path.GetFileName(asset.MeshPath)}'.", ex);
             }
 
-            return $"\nSkeleton: could not rebuild the .skl ({ex.Message}).";
+            return Loc.T("report.skeleton.rebuild_failed", ex.Message);
         }
     }
 
@@ -2569,7 +2911,7 @@ public sealed class MainForm : Form
             // meshes, so the assembly keeps its internal proportions and part alignment.
             GltfModelScaler.MatchBounds(combinedModel, combinedBounds);
         }
-        var sourcePrimitives = BuildCombinedSourcePrimitiveMap(group, combinedModel, inputRoot, out var splitModeLine);
+        var sourcePrimitives = BuildCombinedSourcePrimitiveMap(group, combinedModel, inputRoot, out var splitModeLine, out var externalSplit);
         var combinedSkeleton = BuildCombinedReferenceSkeletonForReimport(group, combinedModel, inputRoot, outputFolder, gameConfig, out var skeletonLine);
         var ok = 0;
         var skipped = 0;
@@ -2590,7 +2932,19 @@ public sealed class MainForm : Form
                     // than synthesising a v1 no-triangle placeholder.
                     File.WriteAllBytes(invisibleOutput, invisibleTemplateBytes);
                     invisible++;
-                    lines.Add($"INVISIBLE {Path.GetFileName(asset.MeshPath)}: no imported primitives were assigned; kept the original Back to the Future mesh.");
+                    lines.Add(Loc.T("report.invisible.bttf_kept", Path.GetFileName(asset.MeshPath)));
+                    continue;
+                }
+
+                if (D3DMeshParser.Parse(invisibleTemplateBytes).Version == 25)
+                {
+                    // Make the unassigned Michonne (V25) part invisible by zeroing its index buffer, same as
+                    // the other games — keeping the original mesh would leave the receiver's old part showing
+                    // through the replacement (e.g. the old hair over the new one).
+                    var invisibleV25 = BuildInvisibleV25MeshBytes(asset.MeshPath);
+                    File.WriteAllBytes(invisibleOutput, invisibleV25);
+                    invisible++;
+                    lines.Add(Loc.T("report.invisible.v25_placeholder", Path.GetFileName(asset.MeshPath)));
                     continue;
                 }
 
@@ -2598,9 +2952,9 @@ public sealed class MainForm : Form
                 File.WriteAllBytes(invisibleOutput, invisibleBytes);
 
                 var invisibleCheck = D3DMeshLayout.Build(invisibleBytes);
-                var invisibleStatus = invisibleCheck.TailOffset + invisibleCheck.TailLength == invisibleBytes.Length ? "verified" : "layout warning";
+                var invisibleStatus = invisibleCheck.TailOffset + invisibleCheck.TailLength == invisibleBytes.Length ? Loc.T("report.token.verified") : Loc.T("report.token.layout_warning");
                 invisible++;
-                lines.Add($"INVISIBLE {Path.GetFileName(asset.MeshPath)}: no imported primitives were assigned; wrote a valid no-triangle placeholder, {invisibleStatus}.");
+                lines.Add(Loc.T("report.invisible.placeholder", Path.GetFileName(asset.MeshPath), invisibleStatus));
                 continue;
             }
 
@@ -2614,7 +2968,7 @@ public sealed class MainForm : Form
                 Joints = combinedModel.Joints,
                 Skeleton = combinedModel.Skeleton,
             };
-            var autoDiffuseAtlas = ShouldAutoAtlasCombinedPart(gameConfig, useDiffuseAtlas, splitModeLine, partModel, asset.MeshPath);
+            var autoDiffuseAtlas = ShouldAutoAtlasCombinedPart(gameConfig, useDiffuseAtlas, externalSplit, partModel, asset.MeshPath);
             var effectiveUseDiffuseAtlas = useDiffuseAtlas || autoDiffuseAtlas;
             if (effectiveUseDiffuseAtlas)
             {
@@ -2643,8 +2997,26 @@ public sealed class MainForm : Form
                 RebuildBttfSkeletonForReimport(asset, partModel, output);
                 totalTextures += bttfTextureCount;
                 ok++;
-                var bttfStatus = BttfMeshSupport.VerifyClosesAtEof(bttfBytes) ? "verified" : "layout warning";
-                lines.Add($"OK {Path.GetFileName(asset.MeshPath)}: {primitives.Count} primitive(s), {bttfTextureCount} texture(s) (BTTF v1), {bttfStatus}.");
+                var bttfStatus = BttfMeshSupport.VerifyClosesAtEof(bttfBytes) ? Loc.T("report.token.verified") : Loc.T("report.token.layout_warning");
+                lines.Add(Loc.T("report.ok_part_bttf", Path.GetFileName(asset.MeshPath), primitives.Count, bttfTextureCount, bttfStatus));
+                continue;
+            }
+
+            if (D3DMeshParser.Parse(partTemplateBytes).Version == 25)
+            {
+                // Michonne (V25) part: reinsert via the dedicated V25 path. The combined .skl is rebuilt
+                // once by BuildCombinedReferenceSkeletonForReimport, so it is not written per part here.
+                // partModel.Joints is the combined skin's joints, so each part's blend indices resolve
+                // against its own template palette (a subset of the shared skeleton).
+                var v25Tex = ReinsertTextureService.WriteV25ReferencedTextures(partModel, asset.MeshPath, output, uncompressedTextures);
+                var v25Layout = D3DMeshLayout.BuildV25(partTemplateBytes);
+                var v25SourceLayout = MeshReinserter.TryFindV25SourceMaterialLayout(partModel, asset.MeshPath);
+                var v25Bytes = MeshReinserter.ReinsertV25Geometry(v25Layout, partModel, v25Tex.PrimitiveSlots, v25SourceLayout);
+                File.WriteAllBytes(output, v25Bytes);
+                totalTextures += v25Tex.Written.Count;
+                ok++;
+                var v25Kind = v25Layout.IsSkinned ? Loc.T("report.v25.kind_character") : Loc.T("report.v25.kind_static");
+                lines.Add(Loc.T("report.ok_part_v25", Path.GetFileName(asset.MeshPath), primitives.Count, v25Tex.Written.Count, v25Kind));
                 continue;
             }
 
@@ -2656,17 +3028,17 @@ public sealed class MainForm : Form
             File.WriteAllBytes(output, bytes);
 
             var check = D3DMeshLayout.Build(bytes);
-            var status = check.TailOffset + check.TailLength == bytes.Length ? "verified" : "layout warning";
+            var status = check.TailOffset + check.TailLength == bytes.Length ? Loc.T("report.token.verified") : Loc.T("report.token.layout_warning");
             totalTextures += textures.WrittenNames.Count;
             ok++;
             var atlasSummary = atlas.Applied
-                ? $", atlas {atlas.SourceTextureCount}->{atlas.AtlasWidth}x{atlas.AtlasHeight}"
+                ? Loc.T("report.atlas_summary", atlas.SourceTextureCount, atlas.AtlasWidth, atlas.AtlasHeight)
                 : "";
             if (autoDiffuseAtlas && atlas.Applied)
             {
-                atlasSummary += " (auto: original texture names)";
+                atlasSummary += Loc.T("report.atlas_auto_suffix");
             }
-            lines.Add($"OK {Path.GetFileName(asset.MeshPath)}: {primitives.Count} primitive(s), {textures.WrittenNames.Count} texture(s){atlasSummary}, {status}.");
+            lines.Add(Loc.T("report.ok_part", Path.GetFileName(asset.MeshPath), primitives.Count, textures.WrittenNames.Count, atlasSummary, status));
         }
 
         if (ok == 0)
@@ -2689,12 +3061,12 @@ public sealed class MainForm : Form
 
         return string.Join(
             Environment.NewLine,
-            $"Reimported combined group: {group.Name}",
-            $"Input: {input}",
-            $"Output folder: {outputFolder}",
+            Loc.T("report.combined.header", group.Name),
+            Loc.T("report.combined.input", input),
+            Loc.T("report.combined.output_folder", outputFolder),
             splitModeLine,
             skeletonLine,
-            $"Parts OK: {ok}/{group.Assets.Count}, invisible: {invisible}, skipped: {skipped}, companion parts: {companionParts}, textures written: {totalTextures}",
+            Loc.T("report.combined.parts_summary", ok, group.Assets.Count, invisible, skipped, companionParts, totalTextures),
             string.Join(Environment.NewLine, lines));
     }
 
@@ -2775,7 +3147,36 @@ public sealed class MainForm : Form
             var candidateName = Path.GetFileName(candidate);
             try
             {
-                var layout = D3DMeshLayout.Build(File.ReadAllBytes(candidate));
+                var candidateBytes = File.ReadAllBytes(candidate);
+                if (D3DMeshParser.Parse(candidateBytes).Version == 25)
+                {
+                    var donorMeshV25 = D3DMeshParser.ParseFile(donor);
+                    var primitivesV25 = DonorPartPrimitiveBuilder.Build(donorMeshV25, referenceSkeleton);
+                    if (primitivesV25.Count == 0)
+                    {
+                        continue;
+                    }
+
+                    // Joints0 from the donor builder index into the reference skeleton, so expose that
+                    // skeleton as the model's joint list for the V25 encoder to resolve against the palette.
+                    var partModelV25 = new GltfModel
+                    {
+                        Primitives = primitivesV25,
+                        Joints = referenceSkeleton.Bones.Select(b => new GltfJoint { Name = b.Name, Hash = b.Hash }).ToList(),
+                        Skeleton = referenceSkeleton,
+                    };
+                    var outputV25 = Path.Combine(outputFolder, candidateName);
+                    var texV25 = ReinsertTextureService.WriteV25ReferencedTextures(partModelV25, candidate, outputV25, forceUncompressed: false);
+                    var layoutV25 = D3DMeshLayout.BuildV25(candidateBytes);
+                    var sourceLayoutV25 = MeshReinserter.TryFindV25SourceMaterialLayout(partModelV25, candidate, donor);
+                    var bytesV25 = MeshReinserter.ReinsertV25Geometry(layoutV25, partModelV25, texV25.PrimitiveSlots, sourceLayoutV25);
+                    File.WriteAllBytes(outputV25, bytesV25);
+                    ported++;
+                    lines.Add(Loc.T("report.companion.ok_v25", candidateName, Path.GetFileName(donor)));
+                    continue;
+                }
+
+                var layout = D3DMeshLayout.Build(candidateBytes);
                 var donorMesh = D3DMeshParser.ParseFile(donor);
                 var primitives = DonorPartPrimitiveBuilder.Build(donorMesh, referenceSkeleton);
                 if (primitives.Count == 0)
@@ -2793,11 +3194,11 @@ public sealed class MainForm : Form
                     gameConfig);
                 File.WriteAllBytes(Path.Combine(outputFolder, candidateName), bytes);
                 ported++;
-                lines.Add($"OK {candidateName}: companion part ported from {Path.GetFileName(donor)}.");
+                lines.Add(Loc.T("report.companion.ok", candidateName, Path.GetFileName(donor)));
             }
             catch (Exception ex)
             {
-                lines.Add($"WARN {candidateName}: companion part not ported ({ex.Message}); the game's original file is left in use.");
+                lines.Add(Loc.T("report.companion.warn", candidateName, ex.Message));
             }
         }
 
@@ -2850,6 +3251,23 @@ public sealed class MainForm : Form
         var layout = D3DMeshLayout.Build(original);
         var result = (byte[])original.Clone();
         result.AsSpan(layout.FaceDataOffset, layout.FaceDataLength).Clear();
+        return result;
+    }
+
+    // V25 (Michonne) equivalent of BuildInvisibleMeshBytes: keep the game's own mesh fully intact and make
+    // it invisible by zeroing the index buffer so every triangle collapses to (0,0,0) — zero area, never
+    // drawn, in any pose. Used for Combined parts the imported GLB doesn't provide, so the receiver's old
+    // part (e.g. hair) doesn't show through the replacement instead of disappearing.
+    private static byte[] BuildInvisibleV25MeshBytes(string templateMeshPath)
+    {
+        var original = File.ReadAllBytes(templateMeshPath);
+        var layout = D3DMeshLayout.BuildV25(original);
+        var result = (byte[])original.Clone();
+        if (layout.FaceBuffer.PayloadLength > 0)
+        {
+            result.AsSpan(layout.FaceBuffer.PayloadOffset, layout.FaceBuffer.PayloadLength).Clear();
+        }
+
         return result;
     }
 
@@ -2910,7 +3328,7 @@ public sealed class MainForm : Form
         GameConfig gameConfig,
         out string statusLine)
     {
-        statusLine = "Skeleton: skipped.";
+        statusLine = Loc.T("report.skeleton.skipped");
         var skeletonVersion = ResolveCombinedSkeletonVersion(group);
         if (string.IsNullOrWhiteSpace(group.SkeletonPath) || !File.Exists(group.SkeletonPath))
         {
@@ -2919,11 +3337,11 @@ public sealed class MainForm : Form
                 var outputPath = Path.Combine(outputFolder, group.OutputStem + ".skl");
                 var skeletonBytes = SkeletonRebuilder.WriteNewSkeleton(foreignSkeleton, gameConfig.DisplayName);
                 File.WriteAllBytes(outputPath, skeletonBytes);
-                statusLine = $"Skeleton: {Path.GetFileName(outputPath)} created from the imported model ({foreignSkeleton.Bones.Count} bones).";
+                statusLine = Loc.T("report.skeleton.created", Path.GetFileName(outputPath), foreignSkeleton.Bones.Count);
                 return LoadSkeletonOrNull(outputPath, skeletonVersion);
             }
 
-            statusLine = "Skeleton: skipped because the Combined group has no original .skl and the imported model has no skeleton.";
+            statusLine = Loc.T("report.skeleton.skipped_no_skl");
             return null;
         }
 
@@ -2936,7 +3354,7 @@ public sealed class MainForm : Form
                 File.Copy(group.SkeletonPath, outputPath, overwrite: true);
             }
 
-            statusLine = $"Skeleton: kept {Path.GetFileName(group.SkeletonPath)}; imported model has no skeleton.";
+            statusLine = Loc.T("report.skeleton.kept", Path.GetFileName(group.SkeletonPath));
             return original;
         }
 
@@ -2963,11 +3381,11 @@ public sealed class MainForm : Form
                 : SkeletonRebuilder.RebuildWithEdits(group.SkeletonPath, model.Skeleton, scaleDonor);
             File.WriteAllBytes(outputPath, skeletonBytes);
             var rebuiltSkeleton = LoadSkeletonOrNull(outputPath, skeletonVersion);
-            var scalesNote = scaleDonor is not null ? " + donor translation scales" : "";
+            var scalesNote = scaleDonor is not null ? Loc.T("report.skeleton.scales_note") : "";
             var boneCountLine = rebuiltSkeleton is null
-                ? $"{model.Skeleton.Bones.Count} imported bones"
-                : $"{rebuiltSkeleton.Bones.Count} final bones, {model.Skeleton.Bones.Count} imported bones";
-            statusLine = $"Skeleton: {skeletonName} rebuilt from the original skeleton + imported model ({boneCountLine}){scalesNote}.";
+                ? Loc.T("report.skeleton.bones_imported", model.Skeleton.Bones.Count)
+                : Loc.T("report.skeleton.bones_final_imported", rebuiltSkeleton.Bones.Count, model.Skeleton.Bones.Count);
+            statusLine = Loc.T("report.skeleton.rebuilt_combined", skeletonName, boneCountLine, scalesNote);
             return rebuiltSkeleton;
         }
         catch (Exception ex)
@@ -2977,7 +3395,7 @@ public sealed class MainForm : Form
                 throw new InvalidDataException($"Could not rebuild the TFTB original PC Combined .skl for '{group.Name}'.", ex);
             }
 
-            statusLine = $"Skeleton: could not rebuild the .skl ({ex.Message}); original skeleton was used for mesh mapping.";
+            statusLine = Loc.T("report.skeleton.rebuild_failed_combined", ex.Message);
             return LoadSkeletonOrNull(group.SkeletonPath, skeletonVersion);
         }
     }
@@ -2988,7 +3406,9 @@ public sealed class MainForm : Form
         {
             try
             {
-                return D3DMeshLayout.Build(File.ReadAllBytes(asset.MeshPath)).Version;
+                // D3DMeshParser handles every supported version (incl. V25), unlike the V13/18-only
+                // D3DMeshLayout which throws for Michonne.
+                return D3DMeshParser.Parse(File.ReadAllBytes(asset.MeshPath)).Version;
             }
             catch
             {
@@ -3010,6 +3430,7 @@ public sealed class MainForm : Form
         originalSkeleton = LoadSkeletonOrNull(skeletonPath, version);
         normalizedSkeleton = imported;
         statusLine = "";
+        // (statusLine set below only when a normalization actually happens)
         if (originalSkeleton is null ||
             originalSkeleton.Bones.Count == 0 ||
             imported.Bones.Count == 0 ||
@@ -3019,8 +3440,7 @@ public sealed class MainForm : Form
         }
 
         normalizedSkeleton = NormalizeAxisConvertedSkeleton(originalSkeleton, imported);
-        statusLine =
-            $"Skeleton: rebuilt {Path.GetFileName(skeletonPath)} after normalizing Blender's rewritten local bone axes against the original skeleton.";
+        statusLine = Loc.T("report.skeleton.rebuilt_axis_normalized", Path.GetFileName(skeletonPath));
         return true;
     }
 
@@ -3255,13 +3675,13 @@ public sealed class MainForm : Form
     private static bool ShouldAutoAtlasCombinedPart(
         GameConfig gameConfig,
         bool useDiffuseAtlas,
-        string splitModeLine,
+        bool externalSplit,
         GltfModel model,
         string templateMeshPath)
     {
         if (useDiffuseAtlas ||
             gameConfig.Id != GameId.WolfAmongUs ||
-            !splitModeLine.Contains("external model auto-split", StringComparison.OrdinalIgnoreCase))
+            !externalSplit)
         {
             return false;
         }
@@ -3363,14 +3783,14 @@ public sealed class MainForm : Form
         if (!atlas.Applied)
         {
             return atlas.SourceTextureCount == 1
-                ? "\nTexture Atlas: skipped because the model already uses one diffuse texture."
+                ? Loc.T("report.atlas.skipped_single")
                 : "";
         }
 
-        var line = $"\nTexture Atlas: packed {atlas.SourceTextureCount} texture region(s) into one {atlas.AtlasWidth}x{atlas.AtlasHeight} atlas.";
+        var line = Loc.T("report.atlas.packed", atlas.SourceTextureCount, atlas.AtlasWidth, atlas.AtlasHeight);
         if (atlas.Warnings.Count > 0)
         {
-            line += "\nAtlas warnings: " + string.Join(" ", atlas.Warnings.Take(3));
+            line += Loc.T("report.atlas.warnings", string.Join(" ", atlas.Warnings.Take(3)));
         }
 
         return line;
@@ -3380,7 +3800,8 @@ public sealed class MainForm : Form
         ModelAssetGroup group,
         GltfModel model,
         string inputRoot,
-        out string modeLine)
+        out string modeLine,
+        out bool externalSplit)
     {
         var result = new Dictionary<string, List<GltfPrimitive>>(StringComparer.OrdinalIgnoreCase);
         var groupPaths = group.Assets
@@ -3406,12 +3827,14 @@ public sealed class MainForm : Form
 
         if (result.Values.Sum(static primitives => primitives.Count) == model.Primitives.Count)
         {
-            modeLine = "Split mode: original Combined source metadata.";
+            modeLine = Loc.T("report.split_mode.original");
+            externalSplit = false;
             return result;
         }
 
         var external = BuildExternalCombinedPrimitiveMap(group, model, inputRoot, result);
-        modeLine = "Split mode: external model auto-split by source/material/texture names; unmatched primitives were assigned to the main part.";
+        modeLine = Loc.T("report.split_mode.external");
+        externalSplit = true;
         return external;
     }
 
@@ -3949,7 +4372,7 @@ public sealed class MainForm : Form
         var selectedPath = SuggestedOutputFolder();
         using var dialog = new FolderBrowserDialog
         {
-            Description = "Select the extraction output folder",
+            Description = Loc.T("dialog.extract_output.description"),
             UseDescriptionForTitle = true,
             SelectedPath = selectedPath
         };
@@ -3982,8 +4405,8 @@ public sealed class MainForm : Form
     {
         using var dialog = new OpenFileDialog
         {
-            Title = "Select the edited GLB/GLTF to reimport",
-            Filter = "glTF model (*.glb;*.gltf)|*.glb;*.gltf|All files (*.*)|*.*",
+            Title = Loc.T("dialog.reimport_input.title"),
+            Filter = Loc.T("dialog.reimport_input.filter"),
             InitialDirectory = _lastOutputFolder ?? initialDirectory,
             CheckFileExists = true,
             Multiselect = false
@@ -4006,7 +4429,7 @@ public sealed class MainForm : Form
     {
         using var dialog = new FolderBrowserDialog
         {
-            Description = "Select the folder where the reimported files will be written",
+            Description = Loc.T("dialog.reimport_output.description"),
             UseDescriptionForTitle = true,
             SelectedPath = SuggestedReimportOutputFolder(fallbackFolder)
         };
@@ -4033,15 +4456,15 @@ public sealed class MainForm : Form
         try
         {
             var message = await operation();
-            SetStatusText("Done.");
+            SetStatusText(Loc.T("status.done"));
             MessageBox.Show(message, Text, MessageBoxButtons.OK, MessageBoxIcon.Information);
         }
         catch (Exception ex)
         {
-            SetStatusText("Error.");
+            SetStatusText(Loc.T("status.error"));
             var logPath = ErrorLog.Write(ex, "Operation failed");
             MessageBox.Show(
-                $"Operation failed. A detailed log was written to:\n{logPath}\n\n{ex.Message}",
+                Loc.T("msg.operation_failed", logPath, ex.Message),
                 Text,
                 MessageBoxButtons.OK,
                 MessageBoxIcon.Error);
@@ -4063,6 +4486,7 @@ public sealed class MainForm : Form
         UseWaitCursor = busy;
         _btnOpen.Enabled = !busy;
         _btnOpenArchive.Enabled = !busy;
+        _btnFilter.Enabled = !busy && _rootFolder is not null;
         _btnReload.Enabled = !busy && _rootFolder is not null;
         _btnExtractAll.Enabled = !busy && _rootFolder is not null && _assets.Count > 0;
         _btnExtractSelected.Enabled = !busy && _rootFolder is not null && HasExtractSelection();
@@ -4087,7 +4511,7 @@ public sealed class MainForm : Form
             _progress.Minimum = 0;
             _progress.Maximum = 100;
             _progress.Value = 0;
-            _progressLabel.Text = "Working... 0%";
+            _progressLabel.Text = Loc.T("status.working_zero");
             _progress.Visible = true;
             _progressLabel.Visible = true;
         }
@@ -4132,7 +4556,7 @@ public sealed class MainForm : Form
             if (!silent)
             {
                 MessageBox.Show(
-                    "Could not check for updates right now. Please try again later.",
+                    Loc.T("msg.update.check_failed"),
                     Text,
                     MessageBoxButtons.OK,
                     MessageBoxIcon.Warning);
@@ -4162,7 +4586,7 @@ public sealed class MainForm : Form
         if (info is null)
         {
             MessageBox.Show(
-                "Could not fetch the latest release to simulate (offline or rate-limited?).",
+                Loc.T("msg.update.simulate_fetch_failed"),
                 Text,
                 MessageBoxButtons.OK,
                 MessageBoxIcon.Warning);
@@ -4179,7 +4603,7 @@ public sealed class MainForm : Form
     {
         using var dialog = new Form
         {
-            Text = "Update available",
+            Text = Loc.T("dialog.update.title"),
             StartPosition = FormStartPosition.CenterParent,
             FormBorderStyle = FormBorderStyle.Sizable,
             MinimizeBox = false,
@@ -4203,7 +4627,7 @@ public sealed class MainForm : Form
 
         var header = new Label
         {
-            Text = $"A new version is available: {info.Title}",
+            Text = Loc.T("dialog.update.header", info.Title),
             AutoSize = true,
             Font = new Font(Font, FontStyle.Bold),
             Margin = new Padding(0, 0, 0, 4),
@@ -4211,8 +4635,7 @@ public sealed class MainForm : Form
 
         var subtitle = new Label
         {
-            Text = $"You have v{UpdateChecker.CurrentVersion}; the latest is v{info.Version}. "
-                 + "The installer will close the tool, update the files, and reopen it.",
+            Text = Loc.T("dialog.update.subtitle", UpdateChecker.CurrentVersion, info.Version),
             AutoSize = true,
             Margin = new Padding(0, 0, 0, 8),
         };
@@ -4256,11 +4679,11 @@ public sealed class MainForm : Form
             AutoSize = true,
             WrapContents = false,
         };
-        var close = new Button { Text = "Close", AutoSize = true, DialogResult = DialogResult.Cancel, Margin = new Padding(6, 0, 0, 0) };
-        var viewOnGitHub = new Button { Text = "View on GitHub", AutoSize = true, Margin = new Padding(6, 0, 0, 0) };
+        var close = new Button { Text = Loc.T("common.close"), AutoSize = true, DialogResult = DialogResult.Cancel, Margin = new Padding(6, 0, 0, 0) };
+        var viewOnGitHub = new Button { Text = Loc.T("common.view_on_github"), AutoSize = true, Margin = new Padding(6, 0, 0, 0) };
         var download = new Button
         {
-            Text = string.IsNullOrEmpty(info.DownloadUrl) ? "Open Download" : "Install Update",
+            Text = string.IsNullOrEmpty(info.DownloadUrl) ? Loc.T("dialog.update.open_download") : Loc.T("dialog.update.install_update"),
             AutoSize = true,
             Margin = new Padding(6, 0, 0, 0)
         };
@@ -4293,7 +4716,7 @@ public sealed class MainForm : Form
     {
         using var dialog = new Form
         {
-            Text = "You're up to date",
+            Text = Loc.T("dialog.uptodate.title"),
             StartPosition = FormStartPosition.CenterParent,
             FormBorderStyle = FormBorderStyle.FixedDialog,
             MinimizeBox = false,
@@ -4320,7 +4743,7 @@ public sealed class MainForm : Form
 
         var header = new Label
         {
-            Text = $"You're on the latest version (v{UpdateChecker.CurrentVersion}).",
+            Text = Loc.T("dialog.uptodate.header", UpdateChecker.CurrentVersion),
             AutoSize = true,
             Font = new Font(Font, FontStyle.Bold),
             Margin = new Padding(0, 0, 0, 8),
@@ -4329,8 +4752,8 @@ public sealed class MainForm : Form
         var reinstallHint = new Label
         {
             Text = string.IsNullOrWhiteSpace(info.DownloadUrl)
-                ? "No downloadable installer was found for this release. You can open the release page manually."
-                : "If you want to reinstall this version, click Reinstall.",
+                ? Loc.T("dialog.uptodate.no_installer")
+                : Loc.T("dialog.uptodate.reinstall_hint"),
             AutoSize = true,
             MaximumSize = new Size(420, 0),
             Margin = new Padding(0, 0, 0, 14),
@@ -4343,15 +4766,15 @@ public sealed class MainForm : Form
             AutoSize = true,
             WrapContents = false,
         };
-        var close = new Button { Text = "Close", AutoSize = true, DialogResult = DialogResult.Cancel, Margin = new Padding(6, 0, 0, 0) };
-        var viewOnGitHub = new Button { Text = "View on GitHub", AutoSize = true, Margin = new Padding(6, 0, 0, 0) };
+        var close = new Button { Text = Loc.T("common.close"), AutoSize = true, DialogResult = DialogResult.Cancel, Margin = new Padding(6, 0, 0, 0) };
+        var viewOnGitHub = new Button { Text = Loc.T("common.view_on_github"), AutoSize = true, Margin = new Padding(6, 0, 0, 0) };
         viewOnGitHub.Click += (_, _) => OpenUrl(info.ReleaseUrl);
         buttons.Controls.Add(close);
         buttons.Controls.Add(viewOnGitHub);
 
         if (!string.IsNullOrWhiteSpace(info.DownloadUrl))
         {
-            var reinstall = new Button { Text = "Reinstall", AutoSize = true, Margin = new Padding(6, 0, 0, 0) };
+            var reinstall = new Button { Text = Loc.T("dialog.uptodate.reinstall_button"), AutoSize = true, Margin = new Padding(6, 0, 0, 0) };
             reinstall.Click += async (_, _) =>
             {
                 dialog.Close();
@@ -4370,11 +4793,10 @@ public sealed class MainForm : Form
 
     private async Task InstallUpdateAsync(UpdateInfo info, bool reinstall = false)
     {
-        var action = reinstall ? "reinstall" : "install";
-        var title = reinstall ? "Reinstall current version" : "Install update";
+        var title = reinstall ? Loc.T("dialog.install.title_reinstall") : Loc.T("dialog.install.title_install");
         var prompt = reinstall
-            ? $"Are you sure you want to reinstall {info.Title}?\n\nThe tool will download the release, close, replace its files, and reopen automatically."
-            : $"Install {info.Title} now?\n\nThe tool will download the release, close, replace its files, and reopen automatically.";
+            ? Loc.T("dialog.install.prompt_reinstall", info.Title)
+            : Loc.T("dialog.install.prompt_install", info.Title);
         var answer = MessageBox.Show(
             prompt,
             title,
@@ -4389,19 +4811,19 @@ public sealed class MainForm : Form
         SetBusy(true);
         try
         {
-            SetStatusText(reinstall ? $"Reinstalling version {info.Version}..." : $"Installing update {info.Version}...");
+            SetStatusText(reinstall ? Loc.T("status.reinstalling", info.Version) : Loc.T("status.installing", info.Version));
             var progress = new Progress<(int Done, int Total, string Label)>(p =>
                 SetProgress(p.Done, p.Total, p.Label));
             await SelfUpdater.DownloadExtractAndRestartAsync(info, progress);
-            SetStatusText(reinstall ? "Restarting to finish reinstall..." : "Restarting to apply update...");
+            SetStatusText(reinstall ? Loc.T("status.restarting_reinstall") : Loc.T("status.restarting_update"));
             Application.Exit();
         }
         catch (Exception ex)
         {
-            SetStatusText(reinstall ? "Reinstall failed." : "Update failed.");
+            SetStatusText(reinstall ? Loc.T("status.reinstall_failed") : Loc.T("status.update_failed"));
             MessageBox.Show(
-                $"Could not {action} automatically.\n\n{ex.Message}\n\nYou can still download it manually from GitHub.",
-                reinstall ? "Reinstall failed" : "Update failed",
+                reinstall ? Loc.T("msg.update.reinstall_failed_body", ex.Message) : Loc.T("msg.update.install_failed_body", ex.Message),
+                reinstall ? Loc.T("msg.update.reinstall_failed_title") : Loc.T("msg.update.update_failed_title"),
                 MessageBoxButtons.OK,
                 MessageBoxIcon.Error);
             OpenUrl(info.ReleaseUrl);
@@ -4462,7 +4884,7 @@ public sealed class MainForm : Form
 
         using var dialog = new Form
         {
-            Text = "Report an Issue",
+            Text = Loc.T("dialog.report.title"),
             StartPosition = FormStartPosition.CenterParent,
             FormBorderStyle = FormBorderStyle.Sizable,
             MinimizeBox = false,
@@ -4491,7 +4913,7 @@ public sealed class MainForm : Form
 
         var intro = new Label
         {
-            Text = "Fill in what happened. The tool will open a pre-filled GitHub issue in your browser.",
+            Text = Loc.T("dialog.report.intro"),
             AutoSize = true,
             Margin = new Padding(0, 0, 0, 10),
         };
@@ -4500,7 +4922,7 @@ public sealed class MainForm : Form
 
         var gameLabel = new Label
         {
-            Text = "Game:",
+            Text = Loc.T("dialog.report.game"),
             AutoSize = true,
             Anchor = AnchorStyles.Left | AnchorStyles.Top,
             Margin = new Padding(0, 4, 8, 8),
@@ -4534,7 +4956,7 @@ public sealed class MainForm : Form
 
         var descriptionLabel = new Label
         {
-            Text = "Description:",
+            Text = Loc.T("dialog.report.description"),
             AutoSize = true,
             Anchor = AnchorStyles.Left | AnchorStyles.Top,
             Margin = new Padding(0, 4, 8, 8),
@@ -4553,7 +4975,7 @@ public sealed class MainForm : Form
 
         var automaticLabel = new Label
         {
-            Text = "Auto info:",
+            Text = Loc.T("dialog.report.auto_info"),
             AutoSize = true,
             Anchor = AnchorStyles.Left | AnchorStyles.Top,
             Margin = new Padding(0, 4, 8, 8),
@@ -4580,7 +5002,7 @@ public sealed class MainForm : Form
 
         var note = new Label
         {
-            Text = "Note: the GitHub issue will include an Attachments section. Paste screenshots with Ctrl+V or drag files directly into that GitHub section before submitting.",
+            Text = Loc.T("dialog.report.note"),
             AutoSize = true,
             Margin = new Padding(0, 0, 0, 12),
         };
@@ -4594,15 +5016,15 @@ public sealed class MainForm : Form
             AutoSize = true,
             WrapContents = false,
         };
-        var cancel = new Button { Text = "Cancel", DialogResult = DialogResult.Cancel, AutoSize = true, Margin = new Padding(6, 0, 0, 0) };
-        var submit = new Button { Text = "Open GitHub Issue", AutoSize = true, Margin = new Padding(6, 0, 0, 0) };
+        var cancel = new Button { Text = Loc.T("common.cancel"), DialogResult = DialogResult.Cancel, AutoSize = true, Margin = new Padding(6, 0, 0, 0) };
+        var submit = new Button { Text = Loc.T("dialog.report.submit"), AutoSize = true, Margin = new Padding(6, 0, 0, 0) };
         submit.Click += (_, _) =>
         {
             var description = descriptionText.Text.Trim();
             if (description.Length == 0)
             {
                 MessageBox.Show(
-                    "Please describe what happened before opening the GitHub issue.",
+                    Loc.T("msg.report.describe_first"),
                     dialog.Text,
                     MessageBoxButtons.OK,
                     MessageBoxIcon.Information);
@@ -4694,7 +5116,7 @@ public sealed class MainForm : Form
     }
 
     private static string BuildLoadedFolderStatus(string? folder)
-        => $"Loaded: {GetSafeFolderName(folder)}";
+        => Loc.T("status.loaded_folder", GetSafeFolderName(folder));
 
     private static string BuildIssueUrl(string title, string body)
     {
@@ -4702,6 +5124,51 @@ public sealed class MainForm : Form
         return newIssueUrl
             + "?title=" + Uri.EscapeDataString(title)
             + "&body=" + Uri.EscapeDataString(body);
+    }
+
+    private void ShowDiscordInviteIfDue()
+    {
+        var preferences = AppPreferences.Load();
+        if (!ShouldShowDiscordInvite(preferences))
+        {
+            return;
+        }
+
+        using var dialog = new DiscordInviteDialog(Font);
+        if (dialog.ShowDialog(this) == DialogResult.OK)
+        {
+            AppPreferences.SaveDiscordInviteAccepted();
+            OpenUrl(DiscordInviteUrl);
+            return;
+        }
+
+        AppPreferences.SaveDiscordInviteDismissed();
+    }
+
+#if DEBUG
+    private void SimulateDiscordInvite()
+    {
+        using var dialog = new DiscordInviteDialog(Font);
+        if (dialog.ShowDialog(this) == DialogResult.OK)
+        {
+            OpenUrl(DiscordInviteUrl);
+        }
+    }
+#endif
+
+    private static bool ShouldShowDiscordInvite(AppPreferences preferences)
+    {
+        if (preferences.DiscordInviteAccepted)
+        {
+            return false;
+        }
+
+        if (preferences.DiscordInviteLastDismissedUtc is not { } dismissedUtc)
+        {
+            return true;
+        }
+
+        return DateTime.UtcNow - dismissedUtc.ToUniversalTime() >= TimeSpan.FromDays(DiscordInviteReminderDays);
     }
 
     private static Icon LoadDialogIcon(string iconFileName)
@@ -4713,7 +5180,7 @@ public sealed class MainForm : Form
     {
         using var dialog = new Form
         {
-            Text = "Credits",
+            Text = Loc.T("credits.title"),
             StartPosition = FormStartPosition.CenterParent,
             FormBorderStyle = FormBorderStyle.FixedDialog,
             MaximizeBox = false,
@@ -4741,7 +5208,7 @@ public sealed class MainForm : Form
 
         var title = new Label
         {
-            Text = "Telltale D3DMesh Editor",
+            Text = Loc.T("app.title"),
             AutoSize = true,
             Font = new Font(Font, FontStyle.Bold),
             Margin = new Padding(0, 0, 0, 6),
@@ -4749,11 +5216,14 @@ public sealed class MainForm : Form
 
         const string authorName = "HeitorSpectre";
         const string authorUrl = "https://github.com/HeitorSpectre";
+        var madeByText = Loc.T("credits.made_by", authorName);
+        var authorLinkStart = madeByText.IndexOf(authorName, StringComparison.Ordinal);
         var madeBy = new LinkLabel
         {
-            Text = $"Made by {authorName}.",
+            Text = madeByText,
             AutoSize = true,
-            LinkArea = new LinkArea("Made by ".Length, authorName.Length),
+            // Link only the author name, located within the (possibly translated) sentence.
+            LinkArea = authorLinkStart >= 0 ? new LinkArea(authorLinkStart, authorName.Length) : new LinkArea(0, 0),
             Margin = new Padding(0, 0, 0, 10),
         };
         madeBy.Links[0].LinkData = authorUrl;
@@ -4768,7 +5238,7 @@ public sealed class MainForm : Form
 
         var thanks = new Label
         {
-            Text = "Special thanks to:",
+            Text = Loc.T("credits.special_thanks_to"),
             AutoSize = true,
             Margin = new Padding(0, 0, 0, 5),
         };
@@ -4788,7 +5258,7 @@ public sealed class MainForm : Form
 
         var paragraph = new Label
         {
-            Text = "Without their analysis and the documentation available in their repositories, none of this would have happened. I would like to thank them for supporting the community, creating tools, and documenting the formats. Their work made it possible to build an editor capable of both extracting assets from the game and reinserting them back into it.",
+            Text = Loc.T("credits.paragraph"),
             AutoSize = true,
             MaximumSize = new Size(500, 0),
             Margin = new Padding(0, 0, 0, 10),
@@ -4798,8 +5268,7 @@ public sealed class MainForm : Form
         const string skunkapeName = "Skunkape Games";
         const string telltaleUrl = "https://telltale.com";
         const string skunkapeUrl = "https://skunkapegames.com";
-        var specialThanksText =
-            $"And a very special thank you to {telltaleName} and {skunkapeName} for their incredible games and their dedication to these wonderful experiences. Without them, we would never have these models to view, edit, and extract. This is a heartfelt tribute for creating such amazing games that helped shape video game culture.";
+        var specialThanksText = Loc.T("credits.special_thanks", telltaleName, skunkapeName);
         var specialThanks = new CreditLinkLabel
         {
             Text = specialThanksText,
@@ -4822,7 +5291,7 @@ public sealed class MainForm : Form
 
         var legalFooter = new Label
         {
-            Text = $"© {DateTime.Now.Year} All trademarks, copyrights, characters, worlds, game assets, names, and logos remain the property of their respective creators, publishers, licensors, and rights holders, including but not limited to Telltale Games, Skunkape Games, LCG Entertainment, Steve Purcell, Jeff Smith and Cartoon Books, CBS Studios, Ubisoft, NBCUniversal, Universal Pictures, Aardman Animations, Lucasfilm Games and Disney, Ron Gilbert, The Brothers Chaps, Valve Corporation, Penny Arcade, Skybound Entertainment, Robert Kirkman, DC Comics, Vertigo, Warner Bros., Bob Kane, Bill Finger, Bill Willingham, Gearbox Software, 2K and Take-Two Interactive, HBO and Warner Bros. Discovery, George R. R. Martin, Mojang Studios and Microsoft, Marvel and Disney, Netflix, Alcon Entertainment, Alcon Interactive Group, Deck Nine Games, Graham Annable, Straandlooper Animation, Adult Swim, Williams Street, Cartoon Network, Renaissance Pictures, Lionsgate, StudioCanal, Sierra Entertainment, Activision, and all other respective owners. This fan-made tool is not affiliated with, endorsed by, or sponsored by those owners.",
+            Text = Loc.T("credits.legal_footer", DateTime.Now.Year),
             AutoSize = true,
             MaximumSize = new Size(500, 0),
             ForeColor = SystemColors.GrayText,
@@ -4840,7 +5309,7 @@ public sealed class MainForm : Form
         };
         var ok = new Button
         {
-            Text = "OK",
+            Text = Loc.T("common.ok"),
             DialogResult = DialogResult.OK,
             AutoSize = true,
         };
@@ -4928,9 +5397,24 @@ public sealed class MainForm : Form
 
     private void AutoFitTreeWidth()
     {
+        // While minimized the form/splitter width collapses to ~0, leaving no valid SplitterDistance range
+        // (Panel1MinSize > Width - Panel2MinSize); skip rather than throw if a load finishes meanwhile.
+        if (WindowState == FormWindowState.Minimized)
+        {
+            return;
+        }
+
         if (_tree.Nodes.Count == 0)
         {
             EnsureTreePanelWidth();
+            return;
+        }
+
+        // The SplitContainer only accepts a distance in [Panel1MinSize, Width - Panel2MinSize - SplitterWidth].
+        // If the window is too narrow for any valid value, leave the splitter as-is.
+        var splitMax = _split.Width - _split.Panel2MinSize - _split.SplitterWidth;
+        if (splitMax < _split.Panel1MinSize)
+        {
             return;
         }
 
@@ -4945,6 +5429,7 @@ public sealed class MainForm : Form
         var minWidth = MinimumTreePanelWidth;
         var maxWidth = Math.Max(minWidth, ClientSize.Width / 2);
         target = Math.Clamp(target, minWidth, maxWidth);
+        target = Math.Clamp(target, _split.Panel1MinSize, splitMax);
         if (Math.Abs(_split.SplitterDistance - target) > 4)
         {
             _split.SplitterDistance = target;
@@ -4959,13 +5444,17 @@ public sealed class MainForm : Form
 
     private void EnsureTreePanelWidth()
     {
-        if (_split.Width <= 0)
+        // No valid SplitterDistance range while minimized / too narrow (Panel1MinSize > usable width):
+        // setting it would throw, so leave the splitter untouched.
+        var splitMax = _split.Width - _split.Panel2MinSize - _split.SplitterWidth;
+        if (WindowState == FormWindowState.Minimized || splitMax < _split.Panel1MinSize)
         {
             return;
         }
 
-        var maxWidth = Math.Max(MinimumTreePanelWidth, _split.Width - _split.Panel2MinSize - _split.SplitterWidth);
+        var maxWidth = Math.Max(MinimumTreePanelWidth, splitMax);
         var target = Math.Clamp(PreferredTreePanelWidth, MinimumTreePanelWidth, maxWidth);
+        target = Math.Clamp(target, _split.Panel1MinSize, splitMax);
         if (_split.SplitterDistance < target)
         {
             _split.SplitterDistance = target;

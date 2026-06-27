@@ -17,6 +17,18 @@ public enum PreviewCameraMode
     Flight,
 }
 
+public enum PreviewRenderMode
+{
+    Shaded,
+    Unlit,
+    NoTexture,
+    UvView,
+    TextureSlotDebug,
+    Normals,
+    VertexColor,
+    SkinWeights,
+}
+
 // Software 3D viewer (GDI+): rasterizes the mesh with a z-buffer, applies diffuse/detail/bake/
 // shadow/normal layers, draws the skeleton, and supports rotate, pan, zoom, and pose editing.
 // It does not require GPU/OpenGL and runs on any Windows setup. Preview only.
@@ -35,10 +47,14 @@ public sealed class MeshPreviewControl : Control
     private MeshBounds _bounds;
     private bool _hasBounds;
     private string _sizeInfo = "";
+    private int _partCount;
+    private int _textureCount;
     private int[] _pixelBuffer = [];
     private float[] _depthBuffer = [];
+    private TextureProbeHit[] _textureProbeHitBuffer = [];
     private Bitmap? _meshBitmap;
     private Point _lastMouse;
+    private Point _textureProbeMouse;
     private float _yaw = DefaultYaw;
     private float _pitch = DefaultPitch;
     private float _zoom = DefaultZoom;
@@ -48,6 +64,9 @@ public sealed class MeshPreviewControl : Control
     private bool _showPolygons;
     private bool _panMode;
     private bool _poseMode;
+    private bool _textureProbeEnabled;
+    private bool _textureProbeLiveHover;
+    private bool _textureProbeMouseInside;
     private bool _showDragDropHint;
     private Image? _dragDropImage;
     private Image? _emptyBackgroundImage;
@@ -57,7 +76,10 @@ public sealed class MeshPreviewControl : Control
     private Dictionary<int, int>? _rigidBoneMap;
     private bool _antiAliasing;
     private PreviewCameraMode _cameraMode = PreviewCameraMode.Orbit;
+    private PreviewRenderMode _renderMode = PreviewRenderMode.Shaded;
     private Vector3 _flightPosition;
+    private TextureProbeHit? _lockedTextureProbeHit;
+    private int _textureProbeLayerIndex;
 
     public MeshPreviewControl()
     {
@@ -68,7 +90,7 @@ public sealed class MeshPreviewControl : Control
         SetStyle(ControlStyles.Selectable | ControlStyles.AllPaintingInWmPaint | ControlStyles.OptimizedDoubleBuffer | ControlStyles.UserPaint | ControlStyles.ResizeRedraw, true);
     }
 
-    public void SetScene(MeshData? mesh, SkeletonData? skeleton, IReadOnlyDictionary<int, MaterialTextureSet>? textures = null)
+    public void SetScene(MeshData? mesh, SkeletonData? skeleton, IReadOnlyDictionary<int, MaterialTextureSet>? textures = null, int? partCount = null)
     {
         _mesh = mesh;
         _skeleton = skeleton;
@@ -76,10 +98,14 @@ public sealed class MeshPreviewControl : Control
         _bounds = mesh is null ? default : ComputeBounds(mesh);
         _hasBounds = mesh is not null;
         _sizeInfo = mesh is null ? "" : BuildSizeInfo(mesh);
+        _partCount = mesh is null ? 0 : Math.Max(1, partCount ?? 1);
+        _textureCount = mesh is null ? 0 : _textures.Values.Sum(set => set.Count);
         _boneOffsets.Clear();
         _boneRotations.Clear();
         _rigidBoneMap = null;
         _selectedBone = -1;
+        _lockedTextureProbeHit = null;
+        _textureProbeLayerIndex = 0;
         // Reset the camera to the default view so the new model does not inherit the previous orientation.
         _yaw = DefaultYaw;
         _pitch = DefaultPitch;
@@ -150,6 +176,17 @@ public sealed class MeshPreviewControl : Control
         Invalidate();
     }
 
+    public void SetRenderMode(PreviewRenderMode mode)
+    {
+        if (_renderMode == mode)
+        {
+            return;
+        }
+
+        _renderMode = mode;
+        Invalidate();
+    }
+
     public void SetPoseMode(bool enabled)
     {
         _poseMode = enabled;
@@ -165,6 +202,53 @@ public sealed class MeshPreviewControl : Control
 
         Cursor = enabled ? Cursors.Cross : _panMode ? Cursors.SizeAll : Cursors.Default;
         Invalidate();
+    }
+
+    public void SetTextureProbeEnabled(bool enabled)
+    {
+        if (_textureProbeEnabled == enabled)
+        {
+            return;
+        }
+
+        _textureProbeEnabled = enabled;
+        _lockedTextureProbeHit = null;
+        _textureProbeLayerIndex = 0;
+        Cursor = _poseMode ? Cursors.Cross : _panMode ? Cursors.SizeAll : Cursors.Default;
+        Invalidate();
+    }
+
+    public void SetTextureProbeLiveHover(bool enabled)
+    {
+        if (_textureProbeLiveHover == enabled)
+        {
+            return;
+        }
+
+        _textureProbeLiveHover = enabled;
+        if (enabled)
+        {
+            _lockedTextureProbeHit = null;
+        }
+
+        Invalidate();
+    }
+
+    protected override void OnMouseEnter(EventArgs e)
+    {
+        _textureProbeMouseInside = true;
+        base.OnMouseEnter(e);
+    }
+
+    protected override void OnMouseLeave(EventArgs e)
+    {
+        _textureProbeMouseInside = false;
+        if (_textureProbeEnabled)
+        {
+            Invalidate();
+        }
+
+        base.OnMouseLeave(e);
     }
 
     public void SetDragDropHintVisible(bool visible)
@@ -245,6 +329,17 @@ public sealed class MeshPreviewControl : Control
     {
         Focus();
         _lastMouse = e.Location;
+        _textureProbeMouse = e.Location;
+        if (_textureProbeEnabled && e.Button == MouseButtons.Left && TryGetTextureProbeHit(e.Location, out var probeHit))
+        {
+            var currentLayer = GetActiveTextureProbeLayerLabel();
+            _lockedTextureProbeHit = probeHit;
+            RestoreTextureProbeLayerIndex(probeHit, currentLayer);
+            Invalidate();
+            base.OnMouseDown(e);
+            return;
+        }
+
         if (_poseMode && e.Button == MouseButtons.Left)
         {
             _selectedBone = PickBone(e.Location);
@@ -258,6 +353,12 @@ public sealed class MeshPreviewControl : Control
     {
         var dx = e.X - _lastMouse.X;
         var dy = e.Y - _lastMouse.Y;
+        if (_textureProbeEnabled && (_textureProbeLiveHover || _lockedTextureProbeHit is not null))
+        {
+            _textureProbeMouse = e.Location;
+            Invalidate();
+        }
+
         if (_poseMode && e.Button == MouseButtons.Left && _selectedBone >= 0)
         {
             MoveSelectedBone(dx, dy);
@@ -285,6 +386,25 @@ public sealed class MeshPreviewControl : Control
 
     protected override void OnMouseWheel(MouseEventArgs e)
     {
+        if (_textureProbeEnabled && (ModifierKeys & Keys.Control) != Keys.Control)
+        {
+            var hit = _lockedTextureProbeHit;
+            if ((hit is null || _textureProbeLiveHover) && TryGetTextureProbeHit(e.Location, out var hoverHit))
+            {
+                hit = hoverHit;
+            }
+
+            var layers = hit is TextureProbeHit activeHit ? BuildTextureProbeLayers(activeHit) : [];
+            if (layers.Count > 1)
+            {
+                _textureProbeLayerIndex = WrapIndex(_textureProbeLayerIndex + (e.Delta > 0 ? -1 : 1), layers.Count);
+                Invalidate();
+            }
+
+            base.OnMouseWheel(e);
+            return;
+        }
+
         ZoomAt(e.Location, e.Delta > 0 ? 1.14f : 0.88f);
         base.OnMouseWheel(e);
     }
@@ -443,24 +563,41 @@ public sealed class MeshPreviewControl : Control
         var scale = GetViewScale(bounds);
         var center = GetViewportCenter();
 
-        DrawGroundShadow(g, bounds.Radius, scale, center);
+        if (_renderMode is PreviewRenderMode.Shaded or PreviewRenderMode.NoTexture)
+        {
+            DrawGroundShadow(g, bounds.Radius, scale, center);
+        }
+
         DrawMesh(g, transform, scale, center);
         if (_showSkeleton && _skeleton is not null && _skeleton.Bones.Count > 0)
         {
             DrawSkeleton(g, transform, scale, center);
         }
 
-        using var textBrush = new SolidBrush(Color.FromArgb(230, 245, 245, 245));
-        var info = $"{_mesh.Name}  |  submeshes: {_mesh.Submeshes.Count}  vertices: {_mesh.VertexCount}  polygons: {_mesh.FaceCount}";
-        if (_skeleton is not null)
+        if (_textureProbeEnabled)
         {
-            info += $"  bones: {_skeleton.Bones.Count}";
+            DrawTextureProbeOverlay(g);
         }
 
-        g.DrawString(info, Font, textBrush, 10, 10);
+        using var textBrush = new SolidBrush(Color.FromArgb(230, 245, 245, 245));
+        var fileInfo = $"{_mesh.Name}  |  version: {_mesh.Version}";
+        if (_partCount > 1)
+        {
+            fileInfo += $"  parts: {_partCount}";
+        }
+
+        fileInfo += $"  textures: {_textureCount}";
+        var geometryInfo = $"submeshes: {_mesh.Submeshes.Count}  vertices: {_mesh.VertexCount}  polygons: {_mesh.FaceCount}";
+        if (_skeleton is not null)
+        {
+            geometryInfo += $"  bones: {_skeleton.Bones.Count}";
+        }
+
+        g.DrawString(fileInfo, Font, textBrush, 10, 10);
+        g.DrawString(geometryInfo, Font, textBrush, 10, 28);
         if (_sizeInfo.Length > 0)
         {
-            g.DrawString(_sizeInfo, Font, textBrush, 10, 28);
+            g.DrawString(_sizeInfo, Font, textBrush, 10, 46);
         }
     }
 
@@ -491,6 +628,23 @@ public sealed class MeshPreviewControl : Control
         return (_pixelBuffer, _depthBuffer, _meshBitmap);
     }
 
+    private TextureProbeHit[]? PrepareTextureProbeHitBuffer(int width, int height)
+    {
+        if (!_textureProbeEnabled)
+        {
+            return null;
+        }
+
+        var pixelCount = checked(width * height);
+        if (_textureProbeHitBuffer.Length != pixelCount)
+        {
+            _textureProbeHitBuffer = new TextureProbeHit[pixelCount];
+        }
+
+        Array.Fill(_textureProbeHitBuffer, TextureProbeHit.Empty, 0, pixelCount);
+        return _textureProbeHitBuffer;
+    }
+
     private void DrawMesh(Graphics g, Matrix4x4 transform, float scale, PointF center)
     {
         if (_showFaces)
@@ -519,6 +673,7 @@ public sealed class MeshPreviewControl : Control
         var renderScale = scale * sample;
         var renderCenter = new PointF(center.X * sample, center.Y * sample);
         var (pixels, depth, bitmap) = PrepareRasterBuffers(width, height);
+        var probeHits = PrepareTextureProbeHitBuffer(width, height);
         var light = Vector3.Normalize(new Vector3(-0.45f, -0.65f, 1f));
         var baseBoneMatrices = _skeleton is not null ? BuildBoneWorldMatrices(_skeleton, null, null) : null;
         var hasPose = _boneOffsets.Count > 0 || _boneRotations.Count > 0;
@@ -551,7 +706,8 @@ public sealed class MeshPreviewControl : Control
                 }
 
                 _textures.TryGetValue(submeshIndex, out var textures);
-                if (IsTransparentPreviewMaterial(textures) != transparentPass)
+                var transparentMaterial = UsesTextureAlpha(_renderMode) && IsTransparentPreviewMaterial(submesh, textures);
+                if (transparentMaterial != transparentPass)
                 {
                     continue;
                 }
@@ -565,7 +721,8 @@ public sealed class MeshPreviewControl : Control
                     var posed = ApplyPose(vertex, rigidPose, boneMap, baseBoneMatrices, posedBoneMatrices);
                     var view = Vector3.Transform(posed, transform);
                     var screen = Project(view, renderScale, renderCenter);
-                    var normal = Vector3.TransformNormal(ApplyPoseNormal(vertex, rigidPose), transform);
+                    var posedNormal = ApplyPoseNormal(vertex, rigidPose);
+                    var normal = Vector3.TransformNormal(posedNormal, transform);
                     if (normal.LengthSquared() < 0.000001f)
                     {
                         normal = Vector3.UnitZ;
@@ -579,10 +736,12 @@ public sealed class MeshPreviewControl : Control
                     var (detailU, detailV) = SelectDetailUv(vertex);
                     var (bakeU, bakeV) = SelectBakeUv(vertex);
                     var (shadowU, shadowV) = SelectShadowUv(vertex);
+                    var debugColor = BuildDebugVertexColor(vertex, posedNormal, submesh, submeshIndex, boneMap, _renderMode);
                     renderVertices[i] = new RenderVertex(
                         screen.X, screen.Y, view.Z, shade,
                         vertex.U, vertex.V, detailU, detailV, bakeU, bakeV, shadowU, shadowV,
-                        vertex.ColorR, vertex.ColorG, vertex.ColorB, vertex.ColorA);
+                        vertex.ColorR, vertex.ColorG, vertex.ColorB, vertex.ColorA,
+                        debugColor.R, debugColor.G, debugColor.B, debugColor.A);
                 }
 
                 foreach (var (a, b, c) in submesh.Faces)
@@ -593,7 +752,11 @@ public sealed class MeshPreviewControl : Control
                     }
 
                     var writeDepth = !transparentPass && !IsTftbE3UiStrokeUnderlay(submesh);
-                    RasterizeTriangle(renderVertices[a], renderVertices[b], renderVertices[c], textures, pixels, depth, width, height, writeDepth);
+                    var useTextureAlpha = UsesTextureAlpha(_renderMode);
+                    var forceOpaqueTextureAlpha = useTextureAlpha && ShouldForceOpaqueTextureAlpha(submesh, textures);
+                    var forceDarkAlphaTexture = useTextureAlpha && ShouldForceDarkAlphaTexture(submesh, textures);
+                    var alphaCutoutThreshold = useTextureAlpha ? GetAlphaCutoutThreshold(submesh, textures) : 0;
+                    RasterizeTriangle(renderVertices[a], renderVertices[b], renderVertices[c], textures, pixels, depth, probeHits, submeshIndex, width, height, writeDepth, forceOpaqueTextureAlpha, forceDarkAlphaTexture, alphaCutoutThreshold, _renderMode);
                 }
             }
         }
@@ -656,12 +819,115 @@ public sealed class MeshPreviewControl : Control
         }
     }
 
-    private static bool IsTransparentPreviewMaterial(MaterialTextureSet? textures)
+    private static bool IsTransparentPreviewMaterial(SubmeshData submesh, MaterialTextureSet? textures)
     {
+        if (ShouldForceOpaqueTextureAlpha(submesh, textures))
+        {
+            return false;
+        }
+
         var diffuse = textures?.Diffuse;
-        return diffuse is not null &&
-               (diffuse.AverageAlpha < 0.95f || diffuse.NonOpaqueAlphaRatio > 0.08f);
+        return HasPreviewVertexAlpha(submesh) ||
+               (diffuse is not null &&
+                (diffuse.AverageAlpha < 0.95f || diffuse.NonOpaqueAlphaRatio > 0.08f));
     }
+
+    private static bool ShouldForceOpaqueTextureAlpha(SubmeshData submesh, MaterialTextureSet? textures)
+    {
+        if (GameConfig.Current.Id != GameId.GameOfThrones || textures?.Diffuse is null)
+        {
+            return false;
+        }
+
+        return IsGameOfThronesCharacterPreviewMaterial(submesh, textures) &&
+               !IsGameOfThronesTransparentPreviewMaterial(submesh, textures);
+    }
+
+    private static bool IsGameOfThronesCharacterPreviewMaterial(SubmeshData submesh, MaterialTextureSet textures)
+    {
+        return IsGameOfThronesCharacterPreviewName(submesh.Name) ||
+               IsGameOfThronesCharacterPreviewName(submesh.MaterialName) ||
+               submesh.TextureNames.Values.Any(IsGameOfThronesCharacterPreviewName) ||
+               IsGameOfThronesCharacterPreviewName(Path.GetFileNameWithoutExtension(textures.Diffuse?.SourcePath));
+    }
+
+    private static bool IsGameOfThronesCharacterPreviewName(string? name)
+    {
+        if (string.IsNullOrWhiteSpace(name))
+        {
+            return false;
+        }
+
+        return name.StartsWith("sk", StringComparison.OrdinalIgnoreCase);
+    }
+
+    private static bool IsGameOfThronesTransparentPreviewMaterial(SubmeshData submesh, MaterialTextureSet textures)
+    {
+        return IsGameOfThronesBlendPreviewName(submesh.Name) ||
+               IsGameOfThronesBlendPreviewName(submesh.MaterialName) ||
+               submesh.TextureNames.Values.Any(IsGameOfThronesBlendPreviewName) ||
+               IsGameOfThronesBlendPreviewName(Path.GetFileNameWithoutExtension(textures.Diffuse?.SourcePath));
+    }
+
+    private static bool IsGameOfThronesBlendPreviewName(string? name)
+    {
+        if (string.IsNullOrWhiteSpace(name))
+        {
+            return false;
+        }
+
+        return name.Contains("lens", StringComparison.OrdinalIgnoreCase) ||
+               name.Contains("glass", StringComparison.OrdinalIgnoreCase) ||
+               IsEyelashPreviewName(name) ||
+               name.Contains("alpha", StringComparison.OrdinalIgnoreCase);
+    }
+
+    private static bool ShouldForceDarkAlphaTexture(SubmeshData submesh, MaterialTextureSet? textures)
+    {
+        if (GameConfig.Current.Id != GameId.GameOfThrones || textures?.Diffuse is null)
+        {
+            return false;
+        }
+
+        return IsEyelashPreviewName(submesh.Name) ||
+               IsEyelashPreviewName(submesh.MaterialName) ||
+               submesh.TextureNames.Values.Any(IsEyelashPreviewName) ||
+               IsEyelashPreviewName(Path.GetFileNameWithoutExtension(textures.Diffuse.SourcePath));
+    }
+
+    private static bool IsEyelashPreviewName(string? name)
+    {
+        if (string.IsNullOrWhiteSpace(name))
+        {
+            return false;
+        }
+
+        return name.Contains("eyelash", StringComparison.OrdinalIgnoreCase) ||
+               name.Contains("eyelashes", StringComparison.OrdinalIgnoreCase) ||
+               name.Contains("lashes", StringComparison.OrdinalIgnoreCase);
+    }
+
+    private static int GetAlphaCutoutThreshold(SubmeshData submesh, MaterialTextureSet? textures)
+    {
+        if (GameConfig.Current.Id != GameId.GameOfThrones || textures?.Diffuse is null)
+        {
+            return 0;
+        }
+
+        return IsGameOfThronesCharacterPreviewMaterial(submesh, textures) && IsHairPreviewMaterial(submesh, textures) ? 96 : 0;
+    }
+
+    private static bool IsHairPreviewMaterial(SubmeshData submesh, MaterialTextureSet textures)
+    {
+        return IsHairPreviewName(submesh.Name) ||
+               IsHairPreviewName(submesh.MaterialName) ||
+               submesh.TextureNames.Values.Any(IsHairPreviewName) ||
+               IsHairPreviewName(Path.GetFileNameWithoutExtension(textures.Diffuse?.SourcePath));
+    }
+
+    private static bool IsHairPreviewName(string? name)
+        => !string.IsNullOrWhiteSpace(name) &&
+           name.Contains("hair", StringComparison.OrdinalIgnoreCase);
 
     private static bool IsTftbE3UiStrokeUnderlay(SubmeshData submesh)
     {
@@ -698,7 +964,22 @@ public sealed class MeshPreviewControl : Control
         return sum / submesh.Vertices.Count;
     }
 
-    private static void RasterizeTriangle(RenderVertex a, RenderVertex b, RenderVertex c, MaterialTextureSet? textures, int[] pixels, float[] depth, int width, int height, bool writeDepth)
+    private static void RasterizeTriangle(
+        RenderVertex a,
+        RenderVertex b,
+        RenderVertex c,
+        MaterialTextureSet? textures,
+        int[] pixels,
+        float[] depth,
+        TextureProbeHit[]? probeHits,
+        int submeshIndex,
+        int width,
+        int height,
+        bool writeDepth,
+        bool forceOpaqueTextureAlpha,
+        bool forceDarkAlphaTexture,
+        int alphaCutoutThreshold,
+        PreviewRenderMode renderMode)
     {
         var area = Edge(a.X, a.Y, b.X, b.Y, c.X, c.Y);
         if (MathF.Abs(area) < 0.00001f)
@@ -755,35 +1036,81 @@ public sealed class MeshPreviewControl : Control
                 var vertexColorB = Math.Clamp(a.ColorB * w0 + b.ColorB * w1 + c.ColorB * w2, 0f, 1f);
                 var vertexColorA = Math.Clamp(a.ColorA * w0 + b.ColorA * w1 + c.ColorA * w2, 0f, 1f);
                 int color;
-                if (textures?.Diffuse is null)
+                var u = a.U * w0 + b.U * w1 + c.U * w2;
+                var v = a.V * w0 + b.V * w1 + c.V * w2;
+                var detailU = a.DetailU * w0 + b.DetailU * w1 + c.DetailU * w2;
+                var detailV = a.DetailV * w0 + b.DetailV * w1 + c.DetailV * w2;
+                var bakeU = a.BakeU * w0 + b.BakeU * w1 + c.BakeU * w2;
+                var bakeV = a.BakeV * w0 + b.BakeV * w1 + c.BakeV * w2;
+                var shadowU = a.ShadowU * w0 + b.ShadowU * w1 + c.ShadowU * w2;
+                var shadowV = a.ShadowV * w0 + b.ShadowV * w1 + c.ShadowV * w2;
+
+                if (renderMode == PreviewRenderMode.Shaded)
+                {
+                    if (textures?.Diffuse is null)
+                    {
+                        color = ShadeColor(baseColor, shade).ToArgb();
+                        if (GameConfig.Current.Id == GameId.TalesFromTheBorderlandsE3 && textures?.Bake is not null)
+                        {
+                            color = ShadeTexture(textures.Bake.SampleClamped(bakeU, bakeV), shade);
+                        }
+                    }
+                    else
+                    {
+                        var normalBoost = SampleNormalBoost(textures.Normal, u, v);
+                        color = ShadeTexture(textures.Diffuse.Sample(u, v), shade * normalBoost);
+                        color = ApplyDetail(color, textures.Detail, detailU, detailV);
+                        color = ApplyBake(color, textures.Bake, bakeU, bakeV);
+                        color = ApplyOcclusion(color, textures.Occlusion, u, v);
+                        color = ApplyShadow(color, textures.Shadow, shadowU, shadowV);
+                        if (forceDarkAlphaTexture)
+                        {
+                            color &= unchecked((int)0xFF000000);
+                        }
+                    }
+                }
+                else if (renderMode == PreviewRenderMode.Unlit)
+                {
+                    color = textures?.Diffuse is null
+                        ? baseColor.ToArgb()
+                        : ApplyDetail(textures.Diffuse.Sample(u, v), textures.Detail, detailU, detailV);
+                }
+                else if (renderMode == PreviewRenderMode.NoTexture)
                 {
                     color = ShadeColor(baseColor, shade).ToArgb();
-                    if (GameConfig.Current.Id == GameId.TalesFromTheBorderlandsE3 && textures?.Bake is not null)
-                    {
-                        var bakeU = a.BakeU * w0 + b.BakeU * w1 + c.BakeU * w2;
-                        var bakeV = a.BakeV * w0 + b.BakeV * w1 + c.BakeV * w2;
-                        color = ShadeTexture(textures.Bake.SampleClamped(bakeU, bakeV), shade);
-                    }
+                }
+                else if (renderMode == PreviewRenderMode.UvView)
+                {
+                    color = BuildUvDebugColor(u, v);
                 }
                 else
                 {
-                    var u = a.U * w0 + b.U * w1 + c.U * w2;
-                    var v = a.V * w0 + b.V * w1 + c.V * w2;
-                    var normalBoost = SampleNormalBoost(textures.Normal, u, v);
-                    color = ShadeTexture(textures.Diffuse.Sample(u, v), shade * normalBoost);
-                    var detailU = a.DetailU * w0 + b.DetailU * w1 + c.DetailU * w2;
-                    var detailV = a.DetailV * w0 + b.DetailV * w1 + c.DetailV * w2;
-                    color = ApplyDetail(color, textures.Detail, detailU, detailV);
-                    var bakeU = a.BakeU * w0 + b.BakeU * w1 + c.BakeU * w2;
-                    var bakeV = a.BakeV * w0 + b.BakeV * w1 + c.BakeV * w2;
-                    color = ApplyBake(color, textures.Bake, bakeU, bakeV);
-                    color = ApplyOcclusion(color, textures.Occlusion, u, v);
-                    var shadowU = a.ShadowU * w0 + b.ShadowU * w1 + c.ShadowU * w2;
-                    var shadowV = a.ShadowV * w0 + b.ShadowV * w1 + c.ShadowV * w2;
-                    color = ApplyShadow(color, textures.Shadow, shadowU, shadowV);
+                    var debugR = Math.Clamp(a.DebugR * w0 + b.DebugR * w1 + c.DebugR * w2, 0f, 1f);
+                    var debugG = Math.Clamp(a.DebugG * w0 + b.DebugG * w1 + c.DebugG * w2, 0f, 1f);
+                    var debugB = Math.Clamp(a.DebugB * w0 + b.DebugB * w1 + c.DebugB * w2, 0f, 1f);
+                    var debugA = Math.Clamp(a.DebugA * w0 + b.DebugA * w1 + c.DebugA * w2, 0f, 1f);
+                    color = Color.FromArgb(
+                        Math.Clamp((int)MathF.Round(debugA * 255f), 0, 255),
+                        Math.Clamp((int)MathF.Round(debugR * 255f), 0, 255),
+                        Math.Clamp((int)MathF.Round(debugG * 255f), 0, 255),
+                        Math.Clamp((int)MathF.Round(debugB * 255f), 0, 255)).ToArgb();
                 }
 
-                color = ApplyVertexColor(color, vertexColorR, vertexColorG, vertexColorB, vertexColorA);
+                if (alphaCutoutThreshold > 0 && ((color >> 24) & 0xFF) < alphaCutoutThreshold)
+                {
+                    continue;
+                }
+
+                if (forceOpaqueTextureAlpha)
+                {
+                    color |= unchecked((int)0xFF000000);
+                }
+
+                if (renderMode is PreviewRenderMode.Shaded or PreviewRenderMode.Unlit)
+                {
+                    color = ApplyVertexColor(color, vertexColorR, vertexColorG, vertexColorB, vertexColorA);
+                }
+
                 var pixelAlpha = (color >> 24) & 0xFF;
                 if (pixelAlpha < 8)
                 {
@@ -802,6 +1129,12 @@ public sealed class MeshPreviewControl : Control
                 {
                     depth[index] = z;
                 }
+
+                if (probeHits is not null)
+                {
+                    probeHits[index] = new TextureProbeHit(submeshIndex, u, v, detailU, detailV, bakeU, bakeV, shadowU, shadowV);
+                }
+
                 pixels[index] = color;
             }
         }
@@ -820,6 +1153,832 @@ public sealed class MeshPreviewControl : Control
         var g = (((src >> 8) & 0xFF) * srcAlpha + ((dst >> 8) & 0xFF) * inv) / 255;
         var b = ((src & 0xFF) * srcAlpha + (dst & 0xFF) * inv) / 255;
         return (0xFF << 24) | (r << 16) | (g << 8) | b;
+    }
+
+    private bool TryGetTextureProbeHit(Point location, out TextureProbeHit hit)
+    {
+        hit = default;
+        if (!_textureProbeEnabled || _textureProbeHitBuffer.Length == 0 || ClientSize.Width <= 0 || ClientSize.Height <= 0)
+        {
+            return false;
+        }
+
+        var sample = _antiAliasing ? 2 : 1;
+        var width = ClientSize.Width * sample;
+        var height = ClientSize.Height * sample;
+        var x = location.X * sample;
+        var y = location.Y * sample;
+        if (x < 0 || y < 0 || x >= width || y >= height)
+        {
+            return false;
+        }
+
+        var index = y * width + x;
+        if ((uint)index >= _textureProbeHitBuffer.Length)
+        {
+            return false;
+        }
+
+        hit = _textureProbeHitBuffer[index];
+        return hit.SubmeshIndex >= 0;
+    }
+
+    private void DrawTextureProbeOverlay(Graphics g)
+    {
+        if (!_textureProbeMouseInside || !TryGetTextureProbeHit(_textureProbeMouse, out var hoverHit))
+        {
+            return;
+        }
+
+        var hit = _textureProbeLiveHover ? hoverHit : _lockedTextureProbeHit;
+        if (hit is not TextureProbeHit activeHit)
+        {
+            return;
+        }
+
+        var layers = BuildTextureProbeLayers(activeHit);
+        if (layers.Count == 0)
+        {
+            return;
+        }
+
+        _textureProbeLayerIndex = Math.Clamp(_textureProbeLayerIndex, 0, layers.Count - 1);
+        var layer = layers[_textureProbeLayerIndex];
+        const int diameter = 138;
+        const int gap = 18;
+        var circleX = _textureProbeMouse.X + 26;
+        var circleY = _textureProbeMouse.Y - diameter / 2;
+        if (circleX + diameter + 128 > ClientSize.Width)
+        {
+            circleX = _textureProbeMouse.X - diameter - 26;
+        }
+
+        circleX = Math.Clamp(circleX, 8, Math.Max(8, ClientSize.Width - diameter - 8));
+        circleY = Math.Clamp(circleY, 44, Math.Max(44, ClientSize.Height - diameter - 42));
+        var circle = new Rectangle(circleX, circleY, diameter, diameter);
+        var center = new Point(circle.Left + diameter / 2, circle.Top + diameter / 2);
+
+        using var pointerPen = new Pen(Color.FromArgb(230, 45, 135, 255), 1.4f);
+        using var pointBrush = new SolidBrush(Color.FromArgb(245, 45, 135, 255));
+        g.DrawLine(pointerPen, _textureProbeMouse, new Point(circle.Left + 10, center.Y));
+        g.FillEllipse(pointBrush, _textureProbeMouse.X - 3, _textureProbeMouse.Y - 3, 6, 6);
+
+        DrawTextureProbeCircle(g, circle, layer);
+
+        var labelSize = g.MeasureString(layer.Label, Font);
+        var labelRect = new RectangleF(
+            circle.Left + (circle.Width - labelSize.Width) * 0.5f - 10f,
+            circle.Top - labelSize.Height - 12f,
+            labelSize.Width + 20f,
+            labelSize.Height + 6f);
+        using var labelBack = new SolidBrush(Color.FromArgb(238, 248, 249, 252));
+        using var labelBorder = new Pen(Color.FromArgb(185, 74, 92, 114));
+        using var labelPath = RoundedRect(labelRect, 4f);
+        using var blueBrush = new SolidBrush(Color.FromArgb(255, 36, 131, 255));
+        g.FillPath(labelBack, labelPath);
+        g.DrawPath(labelBorder, labelPath);
+        g.DrawString(layer.Label, Font, blueBrush, labelRect.Left + 10f, labelRect.Top + 3f);
+
+        DrawTextureProbeLayerList(g, layers, circle.Right + gap, circle.Top + 8);
+        DrawTextureProbeName(g, layer.TextureName, circle);
+    }
+
+    private void DrawTextureProbeCircle(Graphics g, Rectangle circle, TextureProbeLayer layer)
+    {
+        using var path = new GraphicsPath();
+        path.AddEllipse(circle);
+        var previousClip = g.Clip;
+        g.SetClip(path);
+
+        using (var bitmap = BuildTextureProbeBitmap(layer, circle.Width, circle.Height))
+        {
+            g.DrawImageUnscaled(bitmap, circle.Left, circle.Top);
+        }
+
+        g.Clip = previousClip;
+        using var fill = new SolidBrush(Color.FromArgb(28, 255, 255, 255));
+        using var border = new Pen(Color.FromArgb(245, 45, 135, 255), 2f);
+        using var inner = new Pen(Color.FromArgb(190, 255, 255, 255), 1f);
+        g.FillEllipse(fill, circle);
+        g.DrawEllipse(inner, circle.Left + 4, circle.Top + 4, circle.Width - 8, circle.Height - 8);
+        g.DrawEllipse(border, circle);
+    }
+
+    private static Bitmap BuildTextureProbeBitmap(TextureProbeLayer layer, int width, int height)
+    {
+        var bitmap = new Bitmap(width, height, PixelFormat.Format32bppArgb);
+        var pixels = new int[width * height];
+        var zoom = MathF.Max(2f, MathF.Min(8f, MathF.Min(layer.Texture.Width, layer.Texture.Height) / 32f));
+        var swizzledNormal = layer.Kind == TextureProbeLayerKind.Normal && IsLikelyTelltaleSwizzledNormal(layer.Texture);
+        for (var y = 0; y < height; y++)
+        {
+            for (var x = 0; x < width; x++)
+            {
+                var u = layer.U + (x - width * 0.5f) / (width * zoom);
+                var v = layer.V - (y - height * 0.5f) / (height * zoom);
+                var sample = layer.Texture.Sample(u, v);
+                pixels[y * width + x] = layer.Kind switch
+                {
+                    TextureProbeLayerKind.Normal => VisualizeNormalProbePixel(sample, swizzledNormal),
+                    TextureProbeLayerKind.Detail => VisualizeDetailProbePixel(sample, layer.Texture),
+                    TextureProbeLayerKind.Auxiliary => VisualizeAuxiliaryProbePixel(sample, layer.Texture),
+                    _ => sample | unchecked((int)0xFF000000),
+                };
+            }
+        }
+
+        var data = bitmap.LockBits(new Rectangle(0, 0, width, height), ImageLockMode.WriteOnly, PixelFormat.Format32bppArgb);
+        try
+        {
+            Marshal.Copy(pixels, 0, data.Scan0, pixels.Length);
+        }
+        finally
+        {
+            bitmap.UnlockBits(data);
+        }
+
+        return bitmap;
+    }
+
+    private void DrawTextureProbeLayerList(Graphics g, IReadOnlyList<TextureProbeLayer> layers, int x, int y)
+    {
+        var panelWidth = MeasureTextureProbeLayerPanelWidth(g, layers);
+        if (x + panelWidth > ClientSize.Width)
+        {
+            x = Math.Max(8, x - ((panelWidth + 18) * 2));
+        }
+
+        using var activeBrush = new SolidBrush(Color.FromArgb(255, 36, 131, 255));
+        using var inactiveBrush = new SolidBrush(Color.FromArgb(245, 26, 32, 42));
+        using var dotBrush = new SolidBrush(Color.FromArgb(235, 210, 216, 226));
+        using var dotPen = new Pen(Color.FromArgb(235, 98, 108, 124));
+        using var panelBrush = new SolidBrush(Color.FromArgb(178, 244, 246, 250));
+        using var panelBorder = new Pen(Color.FromArgb(128, 122, 134, 152));
+
+        var panelHeight = layers.Count * 24 + 14;
+        var panelRect = new RectangleF(x - 10, y - 8, panelWidth, panelHeight);
+        using (var panelPath = RoundedRect(panelRect, 5f))
+        {
+            g.FillPath(panelBrush, panelPath);
+            g.DrawPath(panelBorder, panelPath);
+        }
+
+        for (var i = 0; i < layers.Count; i++)
+        {
+            var rowY = y + i * 24;
+            if (i == _textureProbeLayerIndex)
+            {
+                g.FillEllipse(activeBrush, x, rowY + 4, 10, 10);
+                g.DrawString(layers[i].Label, Font, activeBrush, x + 22, rowY);
+            }
+            else
+            {
+                g.FillEllipse(dotBrush, x + 2, rowY + 6, 7, 7);
+                g.DrawEllipse(dotPen, x + 2, rowY + 6, 7, 7);
+                g.DrawString(layers[i].Label, Font, inactiveBrush, x + 22, rowY);
+            }
+        }
+    }
+
+    private int MeasureTextureProbeLayerPanelWidth(Graphics g, IReadOnlyList<TextureProbeLayer> layers)
+    {
+        var maxTextWidth = 88f;
+        foreach (var layer in layers)
+        {
+            maxTextWidth = MathF.Max(maxTextWidth, g.MeasureString(layer.Label, Font).Width);
+        }
+
+        return Math.Clamp((int)MathF.Ceiling(maxTextWidth + 44f), 118, 190);
+    }
+
+    private void DrawTextureProbeName(Graphics g, string textureName, Rectangle circle)
+    {
+        var maxWidth = Math.Max(160, Math.Min(ClientSize.Width - 24, 360));
+        using var nameBrush = new SolidBrush(Color.FromArgb(235, 42, 48, 56));
+        using var nameBack = new SolidBrush(Color.FromArgb(230, 248, 249, 252));
+        using var nameBorder = new Pen(Color.FromArgb(150, 122, 134, 152));
+        var lines = WrapTextureProbeName(g, textureName, maxWidth - 16);
+        var lineHeight = Font.GetHeight(g) + 2f;
+        var textWidth = lines.Count == 0 ? 0f : lines.Max(line => g.MeasureString(line, Font).Width);
+        var rectWidth = Math.Min(maxWidth, MathF.Ceiling(textWidth + 16f));
+        var rectHeight = MathF.Ceiling(lines.Count * lineHeight + 8f);
+        var left = circle.Left + (circle.Width - rectWidth) * 0.5f;
+        left = Math.Clamp(left, 8f, Math.Max(8f, ClientSize.Width - rectWidth - 8f));
+        var top = circle.Bottom + 8f;
+        if (top + rectHeight > ClientSize.Height - 10)
+        {
+            top = circle.Top - rectHeight - 8f;
+        }
+
+        var rect = new RectangleF(left, top, rectWidth, rectHeight);
+        using var path = RoundedRect(rect, 3f);
+        g.FillPath(nameBack, path);
+        g.DrawPath(nameBorder, path);
+
+        for (var i = 0; i < lines.Count; i++)
+        {
+            g.DrawString(lines[i], Font, nameBrush, rect.Left + 8f, rect.Top + 4f + i * lineHeight);
+        }
+    }
+
+    private List<string> WrapTextureProbeName(Graphics g, string textureName, float maxWidth)
+    {
+        var lines = new List<string>();
+        if (string.IsNullOrWhiteSpace(textureName))
+        {
+            return [""];
+        }
+
+        var start = 0;
+        while (start < textureName.Length)
+        {
+            var best = 1;
+            for (var length = 1; start + length <= textureName.Length; length++)
+            {
+                var candidate = textureName.Substring(start, length);
+                if (g.MeasureString(candidate, Font).Width > maxWidth)
+                {
+                    break;
+                }
+
+                best = length;
+            }
+
+            lines.Add(textureName.Substring(start, best));
+            start += best;
+        }
+
+        return lines;
+    }
+
+    private List<TextureProbeLayer> BuildTextureProbeLayers(TextureProbeHit hit)
+    {
+        var layers = new List<TextureProbeLayer>();
+        if (_mesh is null || hit.SubmeshIndex < 0 || hit.SubmeshIndex >= _mesh.Submeshes.Count)
+        {
+            return layers;
+        }
+
+        var submesh = _mesh.Submeshes[hit.SubmeshIndex];
+        _textures.TryGetValue(hit.SubmeshIndex, out var textures);
+        AddTextureProbeLayer(layers, "diffuse", "Diffuse", TextureProbeLayerKind.Color, textures?.Diffuse, hit.U, hit.V, submesh);
+        AddTextureProbeLayer(layers, "bump", "Normal Map", TextureProbeLayerKind.Normal, textures?.Normal, hit.U, hit.V, submesh);
+        AddTextureProbeLayer(layers, "detail_diffuse", "Detail", TextureProbeLayerKind.Detail, textures?.Detail, hit.DetailU, hit.DetailV, submesh);
+        AddTextureProbeLayer(layers, "bake", "Lighting Map", TextureProbeLayerKind.Color, textures?.Bake, hit.BakeU, hit.BakeV, submesh);
+        AddTextureProbeLayer(layers, "shadow", "Shadow", TextureProbeLayerKind.Color, textures?.Shadow, hit.ShadowU, hit.ShadowV, submesh);
+        AddTextureProbeLayer(layers, "occlusion", "Ambient Occlusion", TextureProbeLayerKind.Auxiliary, textures?.Occlusion, hit.U, hit.V, submesh);
+        AddAuxiliaryTextureProbeLayers(layers, textures, hit, submesh);
+        return layers;
+    }
+
+    private static void AddAuxiliaryTextureProbeLayers(
+        List<TextureProbeLayer> layers,
+        MaterialTextureSet? textures,
+        TextureProbeHit hit,
+        SubmeshData submesh)
+    {
+        if (textures is null)
+        {
+            return;
+        }
+
+        foreach (var (slot, texture) in textures.Auxiliary.OrderBy(pair => pair.Key, StringComparer.OrdinalIgnoreCase))
+        {
+            AddTextureProbeLayer(
+                layers,
+                slot,
+                ResolveAuxiliaryTextureProbeLabel(slot, texture),
+                TextureProbeLayerKind.Auxiliary,
+                texture,
+                hit.U,
+                hit.V,
+                submesh);
+        }
+    }
+
+    private static void AddTextureProbeLayer(
+        List<TextureProbeLayer> layers,
+        string slot,
+        string fallbackLabel,
+        TextureProbeLayerKind kind,
+        TextureImage? texture,
+        float u,
+        float v,
+        SubmeshData submesh)
+    {
+        if (texture is null)
+        {
+            return;
+        }
+
+        var label = ResolveTextureProbeLabel(slot, fallbackLabel, submesh, texture);
+        if (layers.Any(layer => ReferenceEquals(layer.Texture, texture) && layer.Label.Equals(label, StringComparison.OrdinalIgnoreCase)))
+        {
+            return;
+        }
+
+        layers.Add(new TextureProbeLayer(label, GetTextureProbeName(slot, submesh, texture), kind, texture, u, v));
+    }
+
+    private string? GetActiveTextureProbeLayerLabel()
+    {
+        var hit = _lockedTextureProbeHit;
+        if (hit is null && TryGetTextureProbeHit(_textureProbeMouse, out var hoverHit))
+        {
+            hit = hoverHit;
+        }
+
+        if (hit is not TextureProbeHit activeHit)
+        {
+            return null;
+        }
+
+        var layers = BuildTextureProbeLayers(activeHit);
+        return _textureProbeLayerIndex >= 0 && _textureProbeLayerIndex < layers.Count
+            ? layers[_textureProbeLayerIndex].Label
+            : null;
+    }
+
+    private void RestoreTextureProbeLayerIndex(TextureProbeHit hit, string? preferredLabel)
+    {
+        var layers = BuildTextureProbeLayers(hit);
+        if (layers.Count == 0)
+        {
+            _textureProbeLayerIndex = 0;
+            return;
+        }
+
+        if (!string.IsNullOrWhiteSpace(preferredLabel))
+        {
+            for (var i = 0; i < layers.Count; i++)
+            {
+                if (layers[i].Label.Equals(preferredLabel, StringComparison.OrdinalIgnoreCase))
+                {
+                    _textureProbeLayerIndex = i;
+                    return;
+                }
+            }
+        }
+
+        _textureProbeLayerIndex = Math.Clamp(_textureProbeLayerIndex, 0, layers.Count - 1);
+    }
+
+    private static string ResolveTextureProbeLabel(string slot, string fallbackLabel, SubmeshData submesh, TextureImage texture)
+    {
+        var textureName = "";
+        if (!submesh.TextureNames.TryGetValue(slot, out textureName))
+        {
+            textureName = Path.GetFileNameWithoutExtension(texture.SourcePath);
+        }
+
+        if (slot.Equals("detail_diffuse", StringComparison.OrdinalIgnoreCase))
+        {
+            var normalized = NormalizeTextureName(textureName);
+            if (normalized.Contains("ink", StringComparison.OrdinalIgnoreCase))
+            {
+                return "InkLines";
+            }
+
+            if (normalized.Contains("line", StringComparison.OrdinalIgnoreCase))
+            {
+                return "Lines";
+            }
+        }
+
+        return fallbackLabel;
+    }
+
+    private static string ResolveAuxiliaryTextureProbeLabel(string slot, TextureImage texture)
+    {
+        var name = NormalizeTextureName(Path.GetFileNameWithoutExtension(texture.SourcePath));
+        var key = NormalizeTextureName(slot) + "|" + name;
+        if (key.Contains("light", StringComparison.OrdinalIgnoreCase))
+        {
+            return "Lighting Map";
+        }
+
+        if (key.Contains("_ao", StringComparison.OrdinalIgnoreCase) ||
+            key.EndsWith("ao", StringComparison.OrdinalIgnoreCase) ||
+            key.Contains("occlusion", StringComparison.OrdinalIgnoreCase))
+        {
+            return "Ambient Occlusion";
+        }
+
+        if (key.Contains("spec", StringComparison.OrdinalIgnoreCase))
+        {
+            return "Specular";
+        }
+
+        if (key.Contains("mask", StringComparison.OrdinalIgnoreCase))
+        {
+            return "Mask";
+        }
+
+        if (key.Contains("env", StringComparison.OrdinalIgnoreCase))
+        {
+            return "Environment";
+        }
+
+        if (key.Contains("emissive", StringComparison.OrdinalIgnoreCase) ||
+            key.Contains("glow", StringComparison.OrdinalIgnoreCase))
+        {
+            return "Emissive";
+        }
+
+        if (key.Contains("gradient", StringComparison.OrdinalIgnoreCase))
+        {
+            return "Gradient";
+        }
+
+        return string.IsNullOrWhiteSpace(slot) ? "Auxiliary Map" : ToTitleLabel(slot);
+    }
+
+    private static string ToTitleLabel(string value)
+    {
+        var parts = NormalizeTextureName(value)
+            .Replace('-', '_')
+            .Split('_', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries);
+        if (parts.Length == 0)
+        {
+            return "Auxiliary Map";
+        }
+
+        return string.Join(" ", parts.Select(part =>
+            part.Length == 0 ? part : char.ToUpperInvariant(part[0]) + part[1..].ToLowerInvariant()));
+    }
+
+    private static string GetTextureProbeName(string slot, SubmeshData submesh, TextureImage texture)
+    {
+        if (submesh.TextureNames.TryGetValue(slot, out var textureName) && !string.IsNullOrWhiteSpace(textureName))
+        {
+            return textureName;
+        }
+
+        var sourceName = Path.GetFileNameWithoutExtension(texture.SourcePath);
+        return string.IsNullOrWhiteSpace(sourceName) ? slot : sourceName;
+    }
+
+    private static bool UsesTextureAlpha(PreviewRenderMode renderMode)
+        => renderMode is PreviewRenderMode.Shaded or PreviewRenderMode.Unlit;
+
+    private static (float R, float G, float B, float A) BuildDebugVertexColor(
+        VertexData vertex,
+        Vector3 normal,
+        SubmeshData submesh,
+        int submeshIndex,
+        int[]? boneMap,
+        PreviewRenderMode renderMode)
+    {
+        return renderMode switch
+        {
+            PreviewRenderMode.TextureSlotDebug => BuildTextureSlotDebugColor(submesh, submeshIndex),
+            PreviewRenderMode.Normals => BuildNormalDebugColor(normal),
+            PreviewRenderMode.VertexColor => BuildVertexColorDebugColor(vertex),
+            PreviewRenderMode.SkinWeights => BuildSkinWeightDebugColor(vertex, boneMap),
+            _ => (1f, 1f, 1f, 1f),
+        };
+    }
+
+    private static int BuildUvDebugColor(float u, float v)
+    {
+        var fu = Fract(u);
+        var fv = Fract(v);
+        var checker = (((int)MathF.Floor(fu * 10f) + (int)MathF.Floor(fv * 10f)) & 1) == 0 ? 1f : 0.62f;
+        var gridU = Math.Min(fu, 1f - fu) < 0.015f;
+        var gridV = Math.Min(fv, 1f - fv) < 0.015f;
+        if (gridU || gridV)
+        {
+            return Color.FromArgb(255, 24, 26, 30).ToArgb();
+        }
+
+        return Color.FromArgb(
+            255,
+            Math.Clamp((int)MathF.Round((32f + fu * 210f) * checker), 0, 255),
+            Math.Clamp((int)MathF.Round((42f + fv * 200f) * checker), 0, 255),
+            Math.Clamp((int)MathF.Round((210f - fu * 90f + fv * 35f) * checker), 0, 255)).ToArgb();
+    }
+
+    private static float Fract(float value)
+    {
+        var floor = MathF.Floor(value);
+        return value - floor;
+    }
+
+    private static (float R, float G, float B, float A) BuildTextureSlotDebugColor(SubmeshData submesh, int submeshIndex)
+    {
+        if (submesh.TextureNames.Count == 0)
+        {
+            return HashToColor($"submesh:{submeshIndex}:{submesh.Name}", 0.72f, 0.95f);
+        }
+
+        var r = 0f;
+        var g = 0f;
+        var b = 0f;
+        var count = 0;
+        foreach (var (slot, textureName) in submesh.TextureNames.OrderBy(pair => pair.Key, StringComparer.OrdinalIgnoreCase))
+        {
+            var slotColor = SlotCategoryColor(slot);
+            var nameColor = HashToColor(textureName, 0.65f, 0.98f);
+            r += slotColor.R * 0.68f + nameColor.R * 0.32f;
+            g += slotColor.G * 0.68f + nameColor.G * 0.32f;
+            b += slotColor.B * 0.68f + nameColor.B * 0.32f;
+            count++;
+        }
+
+        return (
+            Math.Clamp(r / count, 0f, 1f),
+            Math.Clamp(g / count, 0f, 1f),
+            Math.Clamp(b / count, 0f, 1f),
+            1f);
+    }
+
+    private static (float R, float G, float B, float A) SlotCategoryColor(string slot)
+    {
+        var normalized = NormalizeTextureName(slot).ToLowerInvariant();
+        if (normalized.Contains("diffuse") || normalized.Contains("albedo") || normalized.Contains("base"))
+        {
+            return (0.20f, 0.72f, 0.38f, 1f);
+        }
+
+        if (normalized.Contains("bump") || normalized.Contains("normal"))
+        {
+            return (0.32f, 0.42f, 0.96f, 1f);
+        }
+
+        if (normalized.Contains("detail") || normalized.Contains("line") || normalized.Contains("ink"))
+        {
+            return (0.98f, 0.55f, 0.16f, 1f);
+        }
+
+        if (normalized.Contains("bake") || normalized.Contains("light"))
+        {
+            return (0.96f, 0.84f, 0.25f, 1f);
+        }
+
+        if (normalized.Contains("shadow"))
+        {
+            return (0.45f, 0.30f, 0.78f, 1f);
+        }
+
+        if (normalized.Contains("occlusion") || normalized.EndsWith("ao", StringComparison.Ordinal))
+        {
+            return (0.48f, 0.54f, 0.58f, 1f);
+        }
+
+        return HashToColor(normalized, 0.62f, 0.92f);
+    }
+
+    private static (float R, float G, float B, float A) BuildNormalDebugColor(Vector3 normal)
+    {
+        if (normal.LengthSquared() < 0.000001f)
+        {
+            normal = Vector3.UnitZ;
+        }
+        else
+        {
+            normal = Vector3.Normalize(normal);
+        }
+
+        return (
+            Math.Clamp(normal.X * 0.5f + 0.5f, 0f, 1f),
+            Math.Clamp(normal.Y * 0.5f + 0.5f, 0f, 1f),
+            Math.Clamp(normal.Z * 0.5f + 0.5f, 0f, 1f),
+            1f);
+    }
+
+    private static (float R, float G, float B, float A) BuildVertexColorDebugColor(VertexData vertex)
+    {
+        var r = Math.Clamp(vertex.ColorR, 0f, 1f);
+        var g = Math.Clamp(vertex.ColorG, 0f, 1f);
+        var b = Math.Clamp(vertex.ColorB, 0f, 1f);
+        var a = Math.Clamp(vertex.ColorA, 0f, 1f);
+        if (r + g + b <= 0.001f)
+        {
+            return (0.02f, 0.02f, 0.02f, 1f);
+        }
+
+        return (r, g, b, Math.Clamp(0.35f + a * 0.65f, 0f, 1f));
+    }
+
+    private static (float R, float G, float B, float A) BuildSkinWeightDebugColor(VertexData vertex, int[]? boneMap)
+    {
+        var bones = new[] { vertex.Bone0, vertex.Bone1, vertex.Bone2, vertex.Bone3 };
+        var weights = new[] { vertex.Weight0, vertex.Weight1, vertex.Weight2, vertex.Weight3 };
+        var bestIndex = 0;
+        var bestWeight = 0f;
+        for (var i = 0; i < weights.Length; i++)
+        {
+            if (weights[i] > bestWeight)
+            {
+                bestWeight = weights[i];
+                bestIndex = i;
+            }
+        }
+
+        if (bestWeight <= 0.0001f)
+        {
+            return (0.18f, 0.18f, 0.18f, 1f);
+        }
+
+        var bone = bones[bestIndex];
+        if (boneMap is not null && (uint)bone < boneMap.Length && boneMap[bone] >= 0)
+        {
+            bone = boneMap[bone];
+        }
+
+        var color = HashToColor($"bone:{bone}", 0.78f, 1f);
+        var intensity = Math.Clamp(0.28f + bestWeight * 0.72f, 0f, 1f);
+        return (color.R * intensity, color.G * intensity, color.B * intensity, 1f);
+    }
+
+    private static (float R, float G, float B, float A) HashToColor(string value, float saturation, float brightness)
+    {
+        unchecked
+        {
+            var hash = 2166136261u;
+            foreach (var ch in value)
+            {
+                hash ^= ch;
+                hash *= 16777619u;
+            }
+
+            var hue = (hash % 360) / 360f;
+            return HsvToRgb(hue, saturation, brightness);
+        }
+    }
+
+    private static (float R, float G, float B, float A) HsvToRgb(float h, float s, float v)
+    {
+        var c = v * s;
+        var x = c * (1f - MathF.Abs((h * 6f) % 2f - 1f));
+        var m = v - c;
+        var sector = (int)MathF.Floor(h * 6f);
+        var (r, g, b) = sector switch
+        {
+            0 => (c, x, 0f),
+            1 => (x, c, 0f),
+            2 => (0f, c, x),
+            3 => (0f, x, c),
+            4 => (x, 0f, c),
+            _ => (c, 0f, x),
+        };
+
+        return (r + m, g + m, b + m, 1f);
+    }
+
+    private static string ShortenMiddle(string value, int maxLength)
+    {
+        if (value.Length <= maxLength)
+        {
+            return value;
+        }
+
+        var keep = Math.Max(4, (maxLength - 3) / 2);
+        return value[..keep] + "..." + value[^keep..];
+    }
+
+    private static int WrapIndex(int value, int count)
+    {
+        if (count <= 0)
+        {
+            return 0;
+        }
+
+        var wrapped = value % count;
+        return wrapped < 0 ? wrapped + count : wrapped;
+    }
+
+    private static int VisualizeNormalProbePixel(int argb, bool swizzled)
+    {
+        var nxByte = swizzled ? (argb >> 24) & 0xFF : (argb >> 16) & 0xFF;
+        var nyByte = swizzled ? argb & 0xFF : (argb >> 8) & 0xFF;
+        var nx = nxByte / 127.5f - 1f;
+        var ny = -(nyByte / 127.5f - 1f);
+        var nz = MathF.Sqrt(MathF.Max(0f, 1f - nx * nx - ny * ny));
+        return Color.FromArgb(255, ToNormalByte(nx), ToNormalByte(ny), ToNormalByte(nz)).ToArgb();
+    }
+
+    private static int VisualizeDetailProbePixel(int argb, TextureImage texture)
+    {
+        var alpha = ((argb >> 24) & 0xFF) / 255f;
+        var r = (argb >> 16) & 0xFF;
+        var g = (argb >> 8) & 0xFF;
+        var b = argb & 0xFF;
+        var luminance = (r * 0.30f + g * 0.59f + b * 0.11f) / 255f;
+        var coverage = texture.AverageAlpha < 0.5f ? alpha : 1f - alpha;
+
+        if (coverage < 0.025f && luminance < 0.06f)
+        {
+            return Color.FromArgb(255, 245, 247, 250).ToArgb();
+        }
+
+        if (coverage > 0.025f)
+        {
+            var value = Math.Clamp((int)MathF.Round(245f - coverage * 220f), 18, 245);
+            return Color.FromArgb(255, value, value, value).ToArgb();
+        }
+
+        var gray = Math.Clamp((int)MathF.Round(luminance * 255f), 0, 255);
+        return Color.FromArgb(255, gray, gray, gray).ToArgb();
+    }
+
+    private static int VisualizeAuxiliaryProbePixel(int argb, TextureImage texture)
+    {
+        if (!IsMostlyGrayscale(texture))
+        {
+            return argb | unchecked((int)0xFF000000);
+        }
+
+        var alpha = (argb >> 24) & 0xFF;
+        var r = (argb >> 16) & 0xFF;
+        var g = (argb >> 8) & 0xFF;
+        var b = argb & 0xFF;
+        var gray = Math.Clamp((int)MathF.Round(r * 0.30f + g * 0.59f + b * 0.11f), 0, 255);
+        if (texture.AverageAlpha < 0.99f)
+        {
+            gray = Math.Clamp((gray + alpha) / 2, 0, 255);
+        }
+
+        return Color.FromArgb(255, gray, gray, gray).ToArgb();
+    }
+
+    private static bool IsMostlyGrayscale(TextureImage texture)
+    {
+        if (texture.Pixels.Length == 0)
+        {
+            return false;
+        }
+
+        var total = texture.Pixels.Length;
+        var step = Math.Max(1, total / Math.Min(4096, total));
+        var samples = 0;
+        var grayish = 0;
+        for (var i = 0; i < total; i += step)
+        {
+            var argb = texture.Pixels[i];
+            var r = (argb >> 16) & 0xFF;
+            var g = (argb >> 8) & 0xFF;
+            var b = argb & 0xFF;
+            var max = Math.Max(r, Math.Max(g, b));
+            var min = Math.Min(r, Math.Min(g, b));
+            if (max - min <= 24 || (r + g + b < 54))
+            {
+                grayish++;
+            }
+
+            samples++;
+        }
+
+        return grayish >= samples * 0.72f;
+    }
+
+    private static bool IsLikelyTelltaleSwizzledNormal(TextureImage texture)
+    {
+        var total = texture.Pixels.Length;
+        if (total == 0)
+        {
+            return false;
+        }
+
+        var step = Math.Max(1, total / Math.Min(10000, total));
+        var samples = 0;
+        var sumR = 0L;
+        var sumG = 0L;
+        var sumB = 0L;
+        var sumA = 0L;
+        for (var i = 0; i < total; i += step)
+        {
+            var pixel = texture.Pixels[i];
+            sumA += (pixel >> 24) & 0xFF;
+            sumR += (pixel >> 16) & 0xFF;
+            sumG += (pixel >> 8) & 0xFF;
+            sumB += pixel & 0xFF;
+            samples++;
+        }
+
+        var avgR = sumR / (float)samples;
+        var avgG = sumG / (float)samples;
+        var avgB = sumB / (float)samples;
+        var avgA = sumA / (float)samples;
+        return avgR > 240f &&
+               avgG > 220f &&
+               avgB is > 70f and < 185f &&
+               avgA is > 70f and < 185f;
+    }
+
+    private static int ToNormalByte(float value)
+        => Math.Clamp((int)MathF.Round((value * 0.5f + 0.5f) * 255f), 0, 255);
+
+    private static GraphicsPath RoundedRect(RectangleF rect, float radius)
+    {
+        var path = new GraphicsPath();
+        var diameter = radius * 2f;
+        path.AddArc(rect.Left, rect.Top, diameter, diameter, 180f, 90f);
+        path.AddArc(rect.Right - diameter, rect.Top, diameter, diameter, 270f, 90f);
+        path.AddArc(rect.Right - diameter, rect.Bottom - diameter, diameter, diameter, 0f, 90f);
+        path.AddArc(rect.Left, rect.Bottom - diameter, diameter, diameter, 90f, 90f);
+        path.CloseFigure();
+        return path;
     }
 
     private void DrawSkeleton(Graphics g, Matrix4x4 transform, float scale, PointF center)
@@ -1347,8 +2506,10 @@ public sealed class MeshPreviewControl : Control
         var center = GetViewportCenter();
         var world = BuildBoneWorldPositions(_skeleton, _boneOffsets, _boneRotations);
         var visibleBones = BuildVisibleSkeletonBones();
+        var influencedBones = BuildInfluencedSkeletonBones();
         var bestIndex = -1;
         var bestDistance = 14f;
+        var bestIsInfluenced = false;
         for (var i = 0; i < world.Length; i++)
         {
             if (visibleBones is not null && !visibleBones.Contains(i))
@@ -1358,10 +2519,12 @@ public sealed class MeshPreviewControl : Control
 
             var p = Project(world[i], transform, scale, center);
             var distance = MathF.Sqrt((p.X - location.X) * (p.X - location.X) + (p.Y - location.Y) * (p.Y - location.Y));
-            if (distance < bestDistance)
+            var isInfluenced = influencedBones.Contains(i);
+            if (IsBetterBonePick(distance, isInfluenced, bestDistance, bestIsInfluenced))
             {
                 bestDistance = distance;
                 bestIndex = i;
+                bestIsInfluenced = isInfluenced;
             }
         }
 
@@ -1383,14 +2546,27 @@ public sealed class MeshPreviewControl : Control
             var a = Project(world[parent], transform, scale, center);
             var b = Project(world[i], transform, scale, center);
             var distance = DistanceToSegment(location, a, b);
-            if (distance < bestDistance)
+            var isInfluenced = influencedBones.Contains(i);
+            if (IsBetterBonePick(distance, isInfluenced, bestDistance, bestIsInfluenced))
             {
                 bestDistance = distance;
                 bestIndex = i;
+                bestIsInfluenced = isInfluenced;
             }
         }
 
         return FindPoseBoneWithInfluence(bestIndex);
+    }
+
+    private static bool IsBetterBonePick(float distance, bool isInfluenced, float bestDistance, bool bestIsInfluenced)
+    {
+        const float tieEpsilon = 0.75f;
+        if (distance < bestDistance - tieEpsilon)
+        {
+            return true;
+        }
+
+        return isInfluenced && !bestIsInfluenced && distance <= bestDistance + tieEpsilon;
     }
 
     private static float DistanceToSegment(Point p, PointF a, PointF b)
@@ -1858,6 +3034,11 @@ public sealed class MeshPreviewControl : Control
 
     private static (float U, float V) SelectDetailUv(VertexData vertex)
     {
+        if (GameConfig.Current.Id == GameId.WalkingDeadMichonne)
+        {
+            return (vertex.U, vertex.V);
+        }
+
         if (HasDifferentUv(vertex.U, vertex.V, vertex.U3, vertex.V3))
         {
             return (vertex.U3, vertex.V3);
@@ -1868,6 +3049,14 @@ public sealed class MeshPreviewControl : Control
 
     private static (float U, float V) SelectBakeUv(VertexData vertex)
     {
+        // Michonne V25 stores the global *_000 lightmap in UV6. UV1 is usually a tiled
+        // diffuse channel, so sampling it here creates the repeated horizontal bands.
+        if (GameConfig.Current.Id == GameId.WalkingDeadMichonne &&
+            HasDifferentUv(vertex.U, vertex.V, vertex.U6, vertex.V6))
+        {
+            return (vertex.U6, vertex.V6);
+        }
+
         if (HasDifferentUv(vertex.U, vertex.V, vertex.U2, vertex.V2))
         {
             return (vertex.U2, vertex.V2);
@@ -1972,6 +3161,14 @@ public sealed class MeshPreviewControl : Control
 
     private static int ApplyVertexColor(int argb, float tintR, float tintG, float tintB, float tintA)
     {
+        if (GameConfig.Current.Id == GameId.WalkingDeadMichonne)
+        {
+            var baseAlpha = (argb >> 24) & 0xFF;
+            var rgb = argb & 0x00FFFFFF;
+            var alpha = Math.Clamp((int)MathF.Round(baseAlpha * Math.Clamp(tintA, 0f, 1f)), 0, 255);
+            return (alpha << 24) | rgb;
+        }
+
         if (tintR + tintG + tintB <= 0.001f)
         {
             tintR = 1f;
@@ -1983,11 +3180,18 @@ public sealed class MeshPreviewControl : Control
         var r = (argb >> 16) & 0xFF;
         var g = (argb >> 8) & 0xFF;
         var b = argb & 0xFF;
+        var effectiveTintA = GameConfig.Current.Id == GameId.GameOfThrones ? 1f : tintA;
         return Color.FromArgb(
-            Math.Clamp((int)(a * tintA), 0, 255),
+            Math.Clamp((int)(a * effectiveTintA), 0, 255),
             Math.Clamp((int)(r * tintR), 0, 255),
             Math.Clamp((int)(g * tintG), 0, 255),
             Math.Clamp((int)(b * tintB), 0, 255)).ToArgb();
+    }
+
+    private static bool HasPreviewVertexAlpha(SubmeshData submesh)
+    {
+        return GameConfig.Current.Id == GameId.WalkingDeadMichonne &&
+               submesh.Vertices.Any(vertex => vertex.ColorA < 0.98f);
     }
 
     private static float SampleNormalBoost(TextureImage? normal, float u, float v)
@@ -2093,5 +3297,33 @@ public sealed class MeshPreviewControl : Control
         float ColorR,
         float ColorG,
         float ColorB,
-        float ColorA);
+        float ColorA,
+        float DebugR,
+        float DebugG,
+        float DebugB,
+        float DebugA);
+
+    private readonly record struct TextureProbeHit(
+        int SubmeshIndex,
+        float U,
+        float V,
+        float DetailU,
+        float DetailV,
+        float BakeU,
+        float BakeV,
+        float ShadowU,
+        float ShadowV)
+    {
+        public static TextureProbeHit Empty { get; } = new(-1, 0f, 0f, 0f, 0f, 0f, 0f, 0f, 0f);
+    }
+
+    private enum TextureProbeLayerKind
+    {
+        Color,
+        Normal,
+        Detail,
+        Auxiliary,
+    }
+
+    private sealed record TextureProbeLayer(string Label, string TextureName, TextureProbeLayerKind Kind, TextureImage Texture, float U, float V);
 }

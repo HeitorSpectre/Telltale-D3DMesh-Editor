@@ -1,6 +1,7 @@
 using System.Drawing.Imaging;
 using System.Text;
 using TelltaleD3DMeshEditor.Core;
+using TelltaleD3DMeshEditor.Core.Localization;
 using TelltaleD3DMeshEditor.Export;
 using TelltaleD3DMeshEditor.Formats.Mesh;
 using TelltaleD3DMeshEditor.Formats.Skeleton;
@@ -85,21 +86,21 @@ public static class ExtractionService
             {
                 WriteCompleteAsset(asset, inputRoot, outputPath, format);
                 ok++;
-                progress?.Report($"OK {relativeMesh}");
+                progress?.Report(Loc.T("report.extract.ok", relativeMesh));
                 WriteReport(report, "OK", asset.MeshPath, outputPath, "mesh + textures + skeleton (when available)");
             }
             catch (Exception ex)
             {
                 failed++;
-                progress?.Report($"FAIL {relativeMesh}: {ex.Message}");
+                progress?.Report(Loc.T("report.extract.fail", relativeMesh, ex.Message));
                 WriteReport(report, "FAIL", asset.MeshPath, outputPath, ex.ToString());
             }
         }
 
         return string.Join(Environment.NewLine,
-            $"Output: {outputRoot}",
-            $"Report: {reportPath}",
-            $"Assets OK: {ok}/{assets.Count}, failed {failed}");
+            Loc.T("report.extract.output", outputRoot),
+            Loc.T("report.extract.report", reportPath),
+            Loc.T("report.extract.assets_count", ok, assets.Count, failed));
     }
 
     private static string GetUniqueOutputPath(
@@ -123,6 +124,7 @@ public static class ExtractionService
     {
         var mesh = WithSourceMetadata(D3DMeshParser.ParseFile(asset.MeshPath), inputRoot, asset.MeshPath);
         var textureSets = TextureResolver.ResolveForMesh(inputRoot, asset.MeshPath, mesh);
+        AddResolvedMaterialTextureSlots(mesh, textureSets);
         // Faithful export: diffuse and lines/detail textures remain separate, matching Telltale materials.
         var baseColorByName = BaseColorExporter.BuildRawDiffuse(mesh, textureSets);
         var auxiliaryTextures = BuildAuxiliaryTexturePngsForExport(mesh, inputRoot, asset.MeshPath, baseColorByName.Keys);
@@ -177,9 +179,42 @@ public static class ExtractionService
         return result;
     }
 
+    private static void AddResolvedMaterialTextureSlots(
+        MeshData mesh,
+        IReadOnlyDictionary<int, MaterialTextureSet> textureSets)
+    {
+        for (var i = 0; i < mesh.Submeshes.Count; i++)
+        {
+            if (!textureSets.TryGetValue(i, out var set))
+            {
+                continue;
+            }
+
+            AddResolvedTextureSlot(mesh.Submeshes[i], "diffuse", set.Diffuse);
+            AddResolvedTextureSlot(mesh.Submeshes[i], "detail_diffuse", set.Detail);
+            AddResolvedTextureSlot(mesh.Submeshes[i], "bump", set.Normal);
+            AddResolvedTextureSlot(mesh.Submeshes[i], "bake", set.Bake);
+            AddResolvedTextureSlot(mesh.Submeshes[i], "shadow", set.Shadow);
+            AddResolvedTextureSlot(mesh.Submeshes[i], "occlusion", set.Occlusion);
+        }
+    }
+
+    private static void AddResolvedTextureSlot(SubmeshData submesh, string slot, TextureImage? texture)
+    {
+        if (texture is null ||
+            submesh.TextureNames.ContainsKey(slot) ||
+            string.IsNullOrWhiteSpace(texture.SourcePath))
+        {
+            return;
+        }
+
+        submesh.TextureNames[slot] = Stem(texture.SourcePath);
+    }
+
     private static void WriteCompleteAssetGroup(ModelAssetGroup group, string inputRoot, string outputPath, ExportFormat format)
     {
         var combined = BuildCombinedAsset(group, inputRoot);
+        AddResolvedMaterialTextureSlots(combined.Mesh, combined.Textures);
         var baseColorByName = BaseColorExporter.BuildRawDiffuse(combined.Mesh, combined.Textures);
         var auxiliaryTextures = BuildAuxiliaryTexturePngsForExport(
             combined.Mesh,

@@ -1,4 +1,5 @@
 using TelltaleD3DMeshEditor.Core;
+using TelltaleD3DMeshEditor.Core.Localization;
 
 namespace TelltaleD3DMeshEditor.UI;
 
@@ -12,7 +13,7 @@ public sealed class GameSelectionDialog : Form
 
     public GameSelectionDialog(GameConfig current)
     {
-        Text = "Select Game";
+        Text = Loc.T("dialog.game.title");
         FormBorderStyle = FormBorderStyle.FixedDialog;
         StartPosition = FormStartPosition.CenterParent;
         MinimizeBox = false;
@@ -23,7 +24,7 @@ public sealed class GameSelectionDialog : Form
 
         var label = new Label
         {
-            Text = "Choose the game profile for these assets:",
+            Text = Loc.T("dialog.game.label"),
             AutoSize = true,
             Location = new Point(12, 14),
         };
@@ -44,12 +45,12 @@ public sealed class GameSelectionDialog : Form
         _gameCombo.SelectedItem = selected ?? _gameCombo.Items.Cast<GameConfig>().FirstOrDefault();
         _gameCombo.DisplayMember = nameof(GameConfig.DisplayName);
 
-        _okButton.Text = "OK";
+        _okButton.Text = Loc.T("common.ok");
         _okButton.DialogResult = DialogResult.OK;
         _okButton.Location = new Point(186, 94);
         _okButton.Size = new Size(75, 26);
 
-        _cancelButton.Text = "Cancel";
+        _cancelButton.Text = Loc.T("common.cancel");
         _cancelButton.DialogResult = DialogResult.Cancel;
         _cancelButton.Location = new Point(273, 94);
         _cancelButton.Size = new Size(75, 26);

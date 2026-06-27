@@ -104,6 +104,15 @@ public sealed class D3DMeshLayout
         var version = reader.ReadInt32();
         if (version is not (13 or 14 or 17 or 18))
         {
+            if (version == 25)
+            {
+                // Static V25 (Michonne) reinsertion uses the V25 layout/writer branch integrated below
+                // and in MeshReinserter, used by single-asset "Reimport Selected" and --reinsert-prop.
+                // This V13/17/18-shaped layout is only reached by the Combine-Parts / damage-variant
+                // flows, which are not wired for V25 yet.
+                throw new NotSupportedException("The Walking Dead: Michonne (V25): use single-asset 'Reimport Selected' for static meshes. Combine-Parts and skinned V25 reinsertion are not supported yet.");
+            }
+
             throw new NotSupportedException($"D3DMeshLayout currently supports only V13/14/17/18 (got {version}).");
         }
 
@@ -306,6 +315,9 @@ public sealed class D3DMeshLayout
         };
     }
 
+    public static V25MeshLayout BuildV25(byte[] data)
+        => V25MeshLayout.Build(data);
+
     private static void SkipSizedBlock(DataReader reader)
     {
         var size = (int)reader.ReadUInt32() - 4;
@@ -493,3 +505,639 @@ public sealed record VertexBufferLayout(
 {
     public int DataLength => VertexCount * VertexStride;
 }
+
+// ---- V25 layout moved from V25MeshLayout.cs ----
+
+
+// Layout map for a The Walking Dead: Michonne (.d3dmesh V25) file, built specifically for the
+// V25 engine layout (T3MeshData with LODs, property-set materials, and a vertex state whose
+// attribute array describes which buffer holds each stream). It walks the file read-for-read
+// exactly like D3DMeshParser.ParseV25, but records byte offsets/lengths of every region that a
+// static-mesh reinsert must rewrite (bounds, batch vertex/index ranges, vertex count, UV scales,
+// the index/vertex buffer headers and their async payloads) instead of decoding the data.
+//
+// This is V25-specific on purpose: it does NOT reuse the V13/17/18 D3DMeshLayout (different file
+// shape) and shares nothing with the experimental Back to the Future path.
+//
+// The MSV5 container stores the header (sync/"Default" section) and the buffer payloads
+// (async section) separately; their sizes live at file offsets 4 and 12 respectively. The sync
+// section ends exactly where the async section (faces) begins, i.e. at FaceDataStart.
+public sealed class V25MeshLayout
+{
+    public required byte[] Original { get; init; }
+    public required string Name { get; init; }
+    public int Version { get; init; }
+    public int DataOffset { get; init; }
+
+    // True only when this mesh is a pure static mesh (no blend weight/index attributes and no bone
+    // palettes). Skinned meshes set Reject with a clear reason; reinsertion refuses them for now.
+    public bool IsStatic { get; init; }
+    public string? RejectReason { get; init; }
+
+    // Mesh-level bounding box (T3MeshData header H), per-LOD and per-batch boxes. Each is 2x vec3
+    // (min,max) = 24 bytes. Patching all of them keeps in-game culling correct after a geometry swap.
+    public int MeshBoundsOffset { get; init; }
+    public required List<int> LodBoundsOffsets { get; init; }
+
+    public required List<V25BatchLayout> Batches { get; init; }
+
+    // One entry per material/property-set. Lets reinsertion rebind a material's diffuse texture or
+    // duplicate a whole property set to add materials when a model has more textures than the template.
+    public required List<V25MaterialLayout> Materials { get; init; }
+
+    // Offsets/details needed to add materials (duplicate property sets + their material-group entries).
+    public int MaterialCountFieldOffset { get; init; }
+    public int MaterialsEndOffset { get; init; }
+    public int MaterialGroupCountFieldOffset { get; init; }
+    public int MaterialGroupSizeFieldOffset { get; init; }
+    public int MaterialGroupEntriesEndOffset { get; init; }
+    public required List<V25MaterialGroupEntryLayout> MaterialGroupEntries { get; init; }
+
+    // T3MeshData mTextures. The game uses this resource list in addition to the property-set material
+    // hash, so adding V25 materials must also add matching texture entries.
+    public int TextureCountFieldOffset { get; init; }
+    public int TextureBlockSizeFieldOffset { get; init; }
+    public int TextureEntriesEndOffset { get; init; }
+    public required List<V25TextureEntryLayout> TextureEntries { get; init; }
+
+    // Block-size fields that enclose the LOD0 batch table, needed to rebuild it with a different batch
+    // count. All sizes shrink/grow by the same byte delta when the table is resized. lodCount is 1 for
+    // every shipped V25 mesh, so resizing only touches this single LOD entry.
+    public int LodCount { get; init; }
+    public int GeometryBlockSizeFieldOffset { get; init; }
+    public int LodBlockSizeFieldOffset { get; init; }
+    public int LodEntrySizeFieldOffset { get; init; }
+    public int BatchCountFieldOffset { get; init; }
+
+    // T3MeshData mVertexCount (header H).
+    public int VertexCountFieldOffset { get; init; }
+
+    // mTexCoordTransform entries actually present in the file (layer index + offset of its 4 floats:
+    // xMult,yMult,xStart,yStart). Only quantized (fmt19) UV layers that own an entry get rescaled.
+    public required List<V25UvScaleSlot> UvScaleSlots { get; init; }
+
+    // Vertex state attribute table (mAttributes) — drives the encoder: which buffer/format/layer holds
+    // each stream. Recorded in the same +1 convention the parser uses.
+    public required List<V25AttributeLayout> Attributes { get; init; }
+
+    // Index (face) buffer and the vertex buffers, in file order.
+    public required V25BufferLayout FaceBuffer { get; init; }
+    public required List<V25BufferLayout> VertexBuffers { get; init; }
+
+    // Bone palettes (mBonePalettes), reused as-is when reinserting a skinned model rigged to the same
+    // skeleton. Empty for static meshes. The block start/end bound the whole region for diagnostics.
+    public List<V25BonePaletteLayout> BonePalettes { get; init; } = [];
+    public int BonePaletteBlockStart { get; init; }
+    public int BonePaletteBlockEnd { get; init; }
+
+    // True when the mesh carries blend weight/index attributes and bone palettes (a character mesh).
+    public bool IsSkinned { get; init; }
+
+    // Start of the async section (= first index byte) and the trailing bytes after the last payload.
+    public int FaceDataStart { get; init; }
+    public int TailOffset { get; init; }
+    public int TailLength { get; init; }
+
+    public static V25MeshLayout Build(byte[] data)
+    {
+        var header = MetaStreamHeader.Parse(data);
+        var reader = new DataReader(data);
+        if (header.DataOffset > 0)
+        {
+            reader.Seek(header.DataOffset);
+        }
+
+        var nameHeaderLength = reader.ReadUInt32();
+        var nameLength = reader.ReadUInt32();
+        if (nameLength > nameHeaderLength)
+        {
+            reader.Seek(reader.Position - 4);
+            nameLength = nameHeaderLength;
+        }
+
+        var name = reader.ReadAscii((int)nameLength);
+        var version = reader.ReadInt32();
+        if (version != 25)
+        {
+            throw new NotSupportedException($"V25MeshLayout only supports V25 (got {version}).");
+        }
+
+        reader.Skip(1);
+        var materialCountFieldOffset = reader.Position;
+        var materialCount = checked((int)reader.ReadUInt32());
+        if (materialCount == 0)
+        {
+            return Rejected(data, name, header.DataOffset, "Mesh has no materials/geometry to reinsert.");
+        }
+
+        // Material/property-set block. Walk each material and record its full byte range, symbol offset
+        // and diffuse-hash offset so reinsertion can rebind a material's texture or duplicate a whole
+        // property set to add new materials/textures.
+        var materials = new List<V25MaterialLayout>(materialCount);
+        for (var i = 0; i < materialCount; i++)
+        {
+            var start = reader.Position;
+            var diffuseHashOffset = ReadMaterialDiffuseHashOffset(reader, out var materialEndForMat);
+            materials.Add(new V25MaterialLayout(start, materialEndForMat, start, diffuseHashOffset));
+            reader.Seek(materialEndForMat);
+        }
+
+        var materialsEndOffset = reader.Position;
+
+        // Geometry block (T3MeshData): inclusive sized block; async/face data begins at its end.
+        reader.ReadUInt32();
+        var geometryBlockSizeFieldOffset = reader.Position;
+        var geometryBlockSize = checked((int)reader.ReadUInt32());
+        var faceDataStart = reader.Position + geometryBlockSize - 4;
+
+        var lodBlockSizeFieldOffset = reader.Position;
+        var lodBlockEnd = reader.Position + checked((int)reader.ReadUInt32());
+        var lodCount = checked((int)reader.ReadUInt32());
+        var batches = new List<V25BatchLayout>();
+        var lodBoundsOffsets = new List<int>();
+        var anySkinnedBatch = false;
+        var lodEntrySizeFieldOffset = 0;
+        var batchCountFieldOffset = 0;
+        for (var lod = 1; lod <= lodCount; lod++)
+        {
+            if (lod == 1)
+            {
+                lodEntrySizeFieldOffset = reader.Position;
+            }
+
+            var lodEntryEnd = reader.Position + checked((int)reader.ReadUInt32() - 4);
+            if (lod == 1)
+            {
+                batchCountFieldOffset = reader.Position;
+            }
+
+            var submeshCount = checked((int)reader.ReadUInt32());
+            for (var i = 0; i < submeshCount; i++)
+            {
+                var batchBoundsOffset = reader.Position;
+                reader.ReadVec3();
+                reader.ReadVec3();
+                reader.ReadUInt32();
+                reader.Skip(16);
+                reader.ReadUInt32();
+                var vMinOffset = reader.Position;
+                reader.ReadUInt32();
+                var vMaxOffset = reader.Position;
+                reader.ReadUInt32();
+                var faceStartOffset = reader.Position;
+                var facePointStart = checked((int)reader.ReadUInt32());
+                var polyCountOffset = reader.Position;
+                var polygonCount = checked((int)reader.ReadUInt32());
+                var headerLength2 = reader.ReadUInt32();
+                if (headerLength2 == 0x10)
+                {
+                    reader.Skip(8);
+                }
+
+                var textureIndicesOffset = reader.Position;
+                var textureIndicesRaw = reader.ReadUInt32();
+                var materialIndexOffset = reader.Position;
+                var materialIndex = ReadOptionalIndexPlusOne(reader);
+                var boneSetOffset = reader.Position;
+                var boneSet = ReadOptionalIndexPlusOne(reader);
+                reader.ReadUInt32();
+                var batchEndOffset = reader.Position;
+
+                if (boneSet != 0)
+                {
+                    anySkinnedBatch = true;
+                }
+
+                if (lod == 1)
+                {
+                    batches.Add(new V25BatchLayout(
+                        BoundsOffset: batchBoundsOffset,
+                        VertexMinOffset: vMinOffset,
+                        VertexMaxOffset: vMaxOffset,
+                        FaceStartOffset: faceStartOffset,
+                        PolygonCountOffset: polyCountOffset,
+                        TextureIndicesOffset: textureIndicesOffset,
+                        MaterialIndexOffset: materialIndexOffset,
+                        EndOffset: batchEndOffset,
+                        FacePointStart: facePointStart,
+                        PolygonCount: polygonCount,
+                        TextureIndicesRaw: textureIndicesRaw,
+                        MaterialIndex: materialIndex,
+                        BoneSetOffset: boneSetOffset,
+                        BoneSetIndex: boneSet));
+                }
+            }
+
+            // LOD footer: usage, index, bbox (24), sphere(16+pad), trailing.
+            reader.ReadUInt32();
+            reader.ReadUInt32();
+            lodBoundsOffsets.Add(reader.Position);
+            reader.ReadVec3();
+            reader.ReadVec3();
+            reader.ReadUInt32();
+            reader.Skip(16);
+            reader.Skip(8);
+            if (reader.Position < lodEntryEnd)
+            {
+                reader.Seek(lodEntryEnd);
+            }
+        }
+        if (reader.Position < lodBlockEnd)
+        {
+            reader.Seek(lodBlockEnd);
+        }
+
+        // mTextures table (T3MeshTexture, 76 bytes/entry).
+        var textureBlockSizeFieldOffset = reader.Position;
+        var textureBlockEnd = reader.Position + checked((int)reader.ReadUInt32() - 4);
+        var textureCountFieldOffset = reader.Position;
+        var textureCount = checked((int)reader.ReadUInt32());
+        var textureEntries = new List<V25TextureEntryLayout>(textureCount);
+        for (var i = 0; i < textureCount; i++)
+        {
+            var entryStart = reader.Position;
+            var typeOffset = reader.Position;
+            reader.ReadUInt32();               // mTextureType
+            reader.Skip(16);                  // mhTexture
+            var symbolOffset = reader.Position; // mNameSymbol
+            reader.ReadUInt32();
+            reader.ReadUInt32();
+            reader.Skip(48);                  // bounds, sphere, metrics
+            textureEntries.Add(new V25TextureEntryLayout(entryStart, typeOffset, symbolOffset, reader.Position - entryStart));
+        }
+
+        var textureEntriesEndOffset = reader.Position;
+        if (reader.Position < textureBlockEnd)
+        {
+            reader.Seek(textureBlockEnd);
+        }
+
+        // mMaterials (material pairing) block — each entry links a batch's material index to a material
+        // (property-set) by symbol. Recorded so reinsertion can add entries for duplicated materials.
+        var materialGroupSizeFieldOffset = reader.Position;
+        var materialGroupEnd = reader.Position + checked((int)reader.ReadUInt32() - 4);
+        var materialGroupCountFieldOffset = reader.Position;
+        var materialGroupCount = checked((int)reader.ReadUInt32());
+        var materialGroupEntries = new List<V25MaterialGroupEntryLayout>(materialGroupCount);
+        for (var i = 0; i < materialGroupCount; i++)
+        {
+            var entryStart = reader.Position;
+            reader.ReadUInt32();               // entry length
+            var symbolOffset = reader.Position;
+            reader.ReadUInt32();               // matLow (symbol)
+            reader.ReadUInt32();               // matHigh
+            reader.Skip(8);
+            reader.Skip(24);
+            reader.ReadUInt32();
+            reader.Skip(16);
+            reader.ReadUInt32();
+            materialGroupEntries.Add(new V25MaterialGroupEntryLayout(entryStart, symbolOffset, reader.Position - entryStart));
+        }
+
+        var materialGroupEntriesEndOffset = reader.Position;
+        if (reader.Position < materialGroupEnd)
+        {
+            reader.Seek(materialGroupEnd);
+        }
+
+        // mMaterialOverrides (16 bytes/entry).
+        SkipV25SizedBlock(reader, 16);
+
+        // mBones / bone palettes. Each bone entry is 56 bytes: hash(8) + bounds(24) + pad(4) +
+        // center(12) + radius(4) + pad(4). The vertex bone bytes index into a submesh's palette, so the
+        // skinned encoder needs each palette's hash list to map GLB joints back to palette indices.
+        var bonePaletteBlockStart = reader.Position;
+        reader.ReadUInt32();
+        var bonePaletteCount = checked((int)reader.ReadUInt32());
+        var bonePalettes = new List<V25BonePaletteLayout>(bonePaletteCount);
+        for (var palette = 0; palette < bonePaletteCount; palette++)
+        {
+            var paletteStart = reader.Position;
+            var boneCount = checked((int)reader.ReadUInt32());
+            var hashes = new ulong[boneCount];
+            for (var bone = 0; bone < boneCount; bone++)
+            {
+                var low = reader.ReadUInt32();
+                var high = reader.ReadUInt32();
+                hashes[bone] = ((ulong)high << 32) | low;
+                reader.Skip(48); // bounds(24) + pad(4) + center(12) + radius(4) + pad(4)
+            }
+
+            bonePalettes.Add(new V25BonePaletteLayout(paletteStart, hashes));
+        }
+
+        var bonePaletteBlockEnd = reader.Position;
+
+        // mLocalTransforms + mMaterialRequirements style sized blocks.
+        SkipSizedBlock(reader);
+        SkipSizedBlock(reader);
+
+        // Header H: mesh bounds + vertex count + UV transforms.
+        reader.ReadUInt32();
+        reader.ReadUInt32();
+        var meshBoundsOffset = reader.Position;
+        reader.ReadVec3();
+        reader.ReadVec3();
+        reader.ReadUInt32();
+        reader.Skip(16);
+        reader.ReadUInt32();
+        reader.ReadUInt32();
+        reader.ReadUInt32();
+
+        var vertexCountFieldOffset = reader.Position;
+        reader.ReadUInt32();
+        reader.ReadUInt32();
+        var uvLayerCount = checked((int)reader.ReadUInt32());
+        var uvScaleSlots = new List<V25UvScaleSlot>(uvLayerCount);
+        for (var i = 0; i < uvLayerCount; i++)
+        {
+            var layer = checked((int)reader.ReadUInt32());
+            var valuesOffset = reader.Position;
+            reader.Skip(16); // 4 floats
+            uvScaleSlots.Add(new V25UvScaleSlot(layer, valuesOffset));
+        }
+
+        // The vertex state declares how many vertex buffers follow; the count is not fixed (a mesh with
+        // no UVs has fewer vertex buffers). The index/face buffer is gated by a trailing bool byte
+        // (hasIndexBuffer), matching the T3GFXVertexState serializer's "no mIndexBufferCount" branch.
+        var (attributes, vertexBufferCount) = ReadAttributes(reader);
+        var hasIndexBuffer = reader.ReadByte() != 0;
+        var indexBufferCount = hasIndexBuffer ? 1 : 0;
+
+        var indexBuffers = new List<V25BufferLayout>(indexBufferCount);
+        for (var i = 0; i < indexBufferCount; i++)
+        {
+            indexBuffers.Add(ReadBufferHeader(reader));
+        }
+
+        var vertexBufferHeaders = new List<V25BufferLayout>(vertexBufferCount);
+        for (var i = 0; i < vertexBufferCount; i++)
+        {
+            vertexBufferHeaders.Add(ReadBufferHeader(reader));
+        }
+
+        // Async payloads begin at FaceDataStart in buffer order: index buffer(s), then vertex buffers.
+        var cursor = faceDataStart;
+        V25BufferLayout faceBufferLaid = default;
+        for (var i = 0; i < indexBuffers.Count; i++)
+        {
+            var laid = indexBuffers[i] with { PayloadOffset = cursor, PayloadLength = indexBuffers[i].Count * indexBuffers[i].Stride };
+            cursor = laid.PayloadOffset + laid.PayloadLength;
+            if (i == 0)
+            {
+                faceBufferLaid = laid;
+            }
+        }
+
+        var vertexBuffers = new List<V25BufferLayout>(vertexBufferHeaders.Count);
+        foreach (var vb in vertexBufferHeaders)
+        {
+            var laid = vb with { PayloadOffset = cursor, PayloadLength = vb.Count * vb.Stride };
+            cursor = laid.PayloadOffset + laid.PayloadLength;
+            vertexBuffers.Add(laid);
+        }
+
+        var tailOffset = cursor;
+
+        var hasSkinningAttr = attributes.Any(a => a.Key is "weights" or "bones");
+        string? reject = null;
+        if (hasSkinningAttr || bonePaletteCount > 0 || anySkinnedBatch)
+        {
+            reject = "Only static V25 meshes can be reinserted for now (this mesh is skinned: it has bone weights/palettes). Skinned support is planned for a later phase.";
+        }
+        else if (batches.Count == 0)
+        {
+            reject = "Mesh has no LOD0 batches to reinsert.";
+        }
+
+        return new V25MeshLayout
+        {
+            Original = data,
+            Name = name,
+            Version = version,
+            DataOffset = header.DataOffset,
+            IsStatic = reject is null,
+            RejectReason = reject,
+            MeshBoundsOffset = meshBoundsOffset,
+            LodBoundsOffsets = lodBoundsOffsets,
+            Batches = batches,
+            Materials = materials,
+            MaterialCountFieldOffset = materialCountFieldOffset,
+            MaterialsEndOffset = materialsEndOffset,
+            MaterialGroupCountFieldOffset = materialGroupCountFieldOffset,
+            MaterialGroupSizeFieldOffset = materialGroupSizeFieldOffset,
+            MaterialGroupEntriesEndOffset = materialGroupEntriesEndOffset,
+            MaterialGroupEntries = materialGroupEntries,
+            TextureCountFieldOffset = textureCountFieldOffset,
+            TextureBlockSizeFieldOffset = textureBlockSizeFieldOffset,
+            TextureEntriesEndOffset = textureEntriesEndOffset,
+            TextureEntries = textureEntries,
+            LodCount = lodCount,
+            GeometryBlockSizeFieldOffset = geometryBlockSizeFieldOffset,
+            LodBlockSizeFieldOffset = lodBlockSizeFieldOffset,
+            LodEntrySizeFieldOffset = lodEntrySizeFieldOffset,
+            BatchCountFieldOffset = batchCountFieldOffset,
+            VertexCountFieldOffset = vertexCountFieldOffset,
+            UvScaleSlots = uvScaleSlots,
+            Attributes = attributes,
+            FaceBuffer = faceBufferLaid,
+            VertexBuffers = vertexBuffers,
+            BonePalettes = bonePalettes,
+            BonePaletteBlockStart = bonePaletteBlockStart,
+            BonePaletteBlockEnd = bonePaletteBlockEnd,
+            IsSkinned = hasSkinningAttr || bonePaletteCount > 0 || anySkinnedBatch,
+            FaceDataStart = faceDataStart,
+            TailOffset = tailOffset,
+            TailLength = data.Length - tailOffset,
+        };
+    }
+
+    private static V25MeshLayout Rejected(byte[] data, string name, int dataOffset, string reason) => new()
+    {
+        Original = data,
+        Name = name,
+        Version = 25,
+        DataOffset = dataOffset,
+        IsStatic = false,
+        RejectReason = reason,
+        MeshBoundsOffset = 0,
+        LodBoundsOffsets = [],
+        Batches = [],
+        Materials = [],
+        MaterialGroupEntries = [],
+        TextureEntries = [],
+        VertexCountFieldOffset = 0,
+        UvScaleSlots = [],
+        Attributes = [],
+        FaceBuffer = new V25BufferLayout(0, 0, 0, 0, 0, 0),
+        VertexBuffers = [],
+        FaceDataStart = 0,
+        TailOffset = data.Length,
+        TailLength = 0,
+    };
+
+    // Reads a T3GFXBuffer header (mResourceUsage, mBufferFormat, mBufferUsage, mCount, mStride) and
+    // records the offsets of the mCount and mStride fields. The payload lives later, in the async
+    // section; PayloadOffset/Length are filled in by the caller in buffer order.
+    private static V25BufferLayout ReadBufferHeader(DataReader reader)
+    {
+        reader.Skip(12); // mResourceUsage, mBufferFormat, mBufferUsage
+        var countFieldOffset = reader.Position;
+        var count = checked((int)reader.ReadUInt32());
+        var strideFieldOffset = reader.Position;
+        var stride = checked((int)reader.ReadUInt32());
+        return new V25BufferLayout(countFieldOffset, strideFieldOffset, count, stride, PayloadOffset: 0, PayloadLength: 0);
+    }
+
+    private static (List<V25AttributeLayout> Attributes, int VertexBufferCount) ReadAttributes(DataReader reader)
+    {
+        reader.ReadUInt32(); // mVertexCountPerInstance
+        reader.ReadUInt32(); // unused count slot (0 in WDM)
+        var vertexBufferCount = checked((int)reader.ReadUInt32()); // mVertexBufferCount
+        var count = checked((int)reader.ReadUInt32()); // mAttributeCount
+        var result = new List<V25AttributeLayout>(count);
+        for (var i = 0; i < count; i++)
+        {
+            var type = checked((int)reader.ReadUInt32() + 1);
+            var format = checked((int)reader.ReadUInt32() + 1);
+            var layer = checked((int)reader.ReadUInt32() + 1);
+            var buffer = checked((int)reader.ReadUInt32() + 1);
+            var bufferOffset = checked((int)reader.ReadUInt32()); // mBufferOffset (raw byte offset within its buffer stride)
+            var key = type switch
+            {
+                1 => "position",
+                2 when layer == 1 => "normals",
+                2 when layer == 2 => "binormals",
+                3 => "tangents",
+                4 => "weights",
+                5 => "bones",
+                6 when layer == 1 => "colors",
+                6 when layer == 2 => "colors2",
+                7 => $"uv{layer}",
+                _ => "",
+            };
+            result.Add(new V25AttributeLayout(key, type, format, layer, buffer, bufferOffset));
+        }
+
+        return (result, vertexBufferCount);
+    }
+
+    private static int ReadOptionalIndexPlusOne(DataReader reader)
+    {
+        var raw = reader.ReadUInt32();
+        return raw == uint.MaxValue ? 0 : checked((int)raw + 1);
+    }
+
+    // Walks one material/property-set: reads its 16-byte prefix (symbol + type hash) and inclusive block
+    // size, then scans the block for the texture-parameter section (marker F1C3F2C7/52A09151) and returns
+    // the byte offset of the diffuse entry's texture hash (texLow), or -1 if the material binds no diffuse.
+    private static int ReadMaterialDiffuseHashOffset(DataReader reader, out int materialEnd)
+    {
+        reader.ReadUInt32(); // symbol low
+        reader.ReadUInt32(); // symbol high
+        reader.Skip(8);      // type CRC64
+        materialEnd = reader.Position + checked((int)reader.ReadUInt32());
+
+        var diffuseHashOffset = -1;
+        for (var scan = reader.Position; scan + 12 <= materialEnd; scan += 4)
+        {
+            if (reader.PeekUInt32(scan) != 0xF1C3F2C7 || reader.PeekUInt32(scan + 4) != 0x52A09151)
+            {
+                continue;
+            }
+
+            var count = checked((int)reader.PeekUInt32(scan + 8));
+            var entry = scan + 12;
+            for (var t = 0; t < count && entry + 16 <= materialEnd; t++, entry += 16)
+            {
+                var typeLow = reader.PeekUInt32(entry);
+                var typeHigh = reader.PeekUInt32(entry + 4);
+                if (IsDiffuseTypeHash(typeHigh, typeLow))
+                {
+                    diffuseHashOffset = entry + 8; // texLow lives 8 bytes into the 16-byte entry
+                    break;
+                }
+            }
+
+            break;
+        }
+
+        return diffuseHashOffset;
+    }
+
+    // The V25 material type hashes that mean "diffuse / base colour" (same set the parser maps to the
+    // diffuse slot). Tuple order is (typeHigh, typeLow) to match the file's low-then-high field order.
+    private static bool IsDiffuseTypeHash(uint typeHigh, uint typeLow)
+        => (typeHigh, typeLow) is
+            (0x8648FA82, 0xD1DBEE1A) or
+            (0xDC6E83A0, 0x253F163A) or
+            (0x94A590DE, 0x74B1F5C1);
+
+    private static void SkipSizedBlock(DataReader reader)
+    {
+        var size = checked((int)reader.ReadUInt32() - 4);
+        reader.Skip(size);
+    }
+
+    private static void SkipV25SizedBlock(DataReader reader, int bytesPerEntry)
+    {
+        var end = reader.Position + checked((int)reader.ReadUInt32() - 4);
+        var count = checked((int)reader.ReadUInt32());
+        reader.Skip(count * bytesPerEntry);
+        if (reader.Position < end)
+        {
+            reader.Seek(end);
+        }
+    }
+}
+
+// One LOD0 batch (T3MeshBatch). Offsets point at the u32 fields the reinserter rewrites; BoundsOffset
+// and EndOffset bound the whole entry so it can be copied as a template when rebuilding the table.
+public readonly record struct V25BatchLayout(
+    int BoundsOffset,
+    int VertexMinOffset,
+    int VertexMaxOffset,
+    int FaceStartOffset,
+    int PolygonCountOffset,
+    int TextureIndicesOffset,
+    int MaterialIndexOffset,
+    int EndOffset,
+    int FacePointStart,
+    int PolygonCount,
+    uint TextureIndicesRaw,
+    int MaterialIndex,
+    int BoneSetOffset = 0,
+    int BoneSetIndex = 0);
+
+// One bone palette (mBonePalettes entry): the bone hashes it contains, in order. Vertex bone indices
+// are indices into this list. Reused as-is when reinserting a skinned model rigged to the same skeleton.
+public readonly record struct V25BonePaletteLayout(int Start, ulong[] BoneHashes);
+
+// One material/property-set: its byte range [Start, End), the offset of its symbol (object-name hash,
+// 8 bytes) and the offset of its diffuse texture hash (texLow, 8 bytes), or -1 if it binds no diffuse.
+public readonly record struct V25MaterialLayout(int Start, int End, int SymbolOffset, int DiffuseHashOffset);
+
+// One mMaterials (material-pairing) entry: its byte range and the offset of the material symbol it
+// references. New entries are cloned from an existing one when materials are added.
+public readonly record struct V25MaterialGroupEntryLayout(int Start, int SymbolOffset, int Length);
+
+// One T3MeshData mTextures entry. SymbolOffset points at mNameSymbol; added entries are cloned from a
+// real entry and all copies of the cloned texture hash inside the entry are rewritten to the new hash.
+public readonly record struct V25TextureEntryLayout(int Start, int TypeOffset, int SymbolOffset, int Length);
+
+// One mTexCoordTransform entry present in the file: the UV layer it applies to (0-based as stored)
+// and the offset of its 4 floats (xMult, yMult, xStart, yStart).
+public readonly record struct V25UvScaleSlot(int Layer, int ValuesOffset);
+
+// One vertex-state attribute (mAttributes). Key is the parser's semantic name; Type/Format/Layer/
+// Buffer are in the +1 convention (raw value + 1) the parser/RTB importer use.
+public readonly record struct V25AttributeLayout(string Key, int Type, int Format, int Layer, int Buffer, int BufferOffset);
+
+// A T3GFXBuffer: offsets of its mCount/mStride header fields and its async payload location.
+public readonly record struct V25BufferLayout(
+    int CountFieldOffset,
+    int StrideFieldOffset,
+    int Count,
+    int Stride,
+    int PayloadOffset,
+    int PayloadLength);

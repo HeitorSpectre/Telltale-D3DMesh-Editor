@@ -12,10 +12,22 @@ public static class D3dtxWriter
     private const uint Dxt1Format = 0x40;
     private const uint Dxt5Format = 0x42;
 
-    public static void WriteFromImageBytes(byte[] templateBytes, GltfImage image, string outputPath, bool forceUncompressed = false)
+    public static void WriteFromImageBytes(
+        byte[] templateBytes,
+        GltfImage image,
+        string outputPath,
+        bool forceUncompressed = false,
+        bool allowA8TemplateFormat = true)
     {
         var pixels = DecodeImage(image.Data, out var width, out var height);
-        var encoded = BuildFromTemplate(templateBytes, pixels, width, height, Path.GetFileName(outputPath), forceUncompressed);
+        var encoded = BuildFromTemplate(
+            templateBytes,
+            pixels,
+            width,
+            height,
+            Path.GetFileName(outputPath),
+            forceUncompressed,
+            allowA8TemplateFormat);
         File.WriteAllBytes(outputPath, encoded);
     }
 
@@ -27,7 +39,14 @@ public static class D3dtxWriter
         File.WriteAllBytes(outputPath, sourceBytes);
     }
 
-    private static byte[] BuildFromTemplate(byte[] template, int[] pixels, int width, int height, string textureFileName, bool forceUncompressed = false)
+    private static byte[] BuildFromTemplate(
+        byte[] template,
+        int[] pixels,
+        int width,
+        int height,
+        string textureFileName,
+        bool forceUncompressed = false,
+        bool allowA8TemplateFormat = true)
     {
         if (template.Length >= 4 && Encoding.ASCII.GetString(template, 0, 4) == "ERTM")
         {
@@ -39,15 +58,19 @@ public static class D3dtxWriter
         // When uncompressed output is requested, keep an already-uncompressed template format as-is
         // (ARGB8/RGBA8/A8) and convert any block-compressed template to ARGB8. Otherwise fall back to
         // the normal codec choice that mirrors the template (DXT1 without alpha, DXT5 with alpha).
+        var templateFormat = !allowA8TemplateFormat && tex.TextureFormat == A8Format
+            ? (hasAlpha ? Dxt5Format : Dxt1Format)
+            : tex.TextureFormat;
         var format = forceUncompressed
-            ? tex.TextureFormat switch
+            ? templateFormat switch
             {
-                Argb8Format or Rgba8Format or A8Format => tex.TextureFormat,
+                Argb8Format or Rgba8Format => templateFormat,
+                A8Format => Argb8Format,
                 _ => Argb8Format,
             }
-            : tex.TextureFormat switch
+            : templateFormat switch
             {
-                Argb8Format or Rgba8Format or A8Format => tex.TextureFormat,
+                Argb8Format or Rgba8Format or A8Format => templateFormat,
                 Dxt5Format => Dxt5Format,
                 Dxt1Format => hasAlpha ? Dxt5Format : Dxt1Format,
                 _ => hasAlpha ? Dxt5Format : Dxt1Format,
@@ -453,9 +476,12 @@ public static class D3dtxWriter
 
     private static ushort ToRgb565(Color color)
     {
-        var r = color.R * 31 / 255;
-        var g = color.G * 63 / 255;
-        var b = color.B * 31 / 255;
+        // Round to nearest, not truncate. Truncation always rounds the 8-bit channels DOWN, and because
+        // green has 6 bits (finer steps) while red/blue have 5, red/blue are pulled down more than green,
+        // which tints neutral/dark colors green. Symmetric rounding removes that systematic bias.
+        var r = (color.R * 31 + 127) / 255;
+        var g = (color.G * 63 + 127) / 255;
+        var b = (color.B * 31 + 127) / 255;
         return (ushort)((r << 11) | (g << 5) | b);
     }
 
@@ -474,10 +500,12 @@ public static class D3dtxWriter
 
     private static Color FromRgb565(ushort value)
     {
+        // Expand with bit replication, exactly how the GPU decodes BC1, so the palette used to pick block
+        // indices matches what the game will actually display.
         var r = (value >> 11) & 0x1F;
         var g = (value >> 5) & 0x3F;
         var b = value & 0x1F;
-        return Color.FromArgb(255, r * 255 / 31, g * 255 / 63, b * 255 / 31);
+        return Color.FromArgb(255, (r << 3) | (r >> 2), (g << 2) | (g >> 4), (b << 3) | (b >> 2));
     }
 
     private static int NearestColor(Color[] palette, Color color)
@@ -930,7 +958,11 @@ public static class D3dtxWriter
             {
                 3 => checkHeader == "ERTM" ? 0x24 : 0x28,
                 4 => 0x28,
-                5 or 7 => 0x34,
+                5 => 0x34,
+                // The Walking Dead: Michonne (5VSM, someValue 7) carries one extra fixed float in the
+                // metadata block (the V7 d3dtx layout) that the 0x34 size used for older 5/7 textures
+                // misses by 4 bytes, which derailed the following inclusive sub-block. 0x38 covers it.
+                7 => 0x38,
                 8 or 9 => 0x38,
                 _ => 0x24,
             };

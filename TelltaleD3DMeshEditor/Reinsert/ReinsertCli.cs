@@ -7,6 +7,7 @@ using TelltaleD3DMeshEditor.Core;
 using TelltaleD3DMeshEditor.Formats.Mesh;
 using TelltaleD3DMeshEditor.Formats.Skeleton;
 using TelltaleD3DMeshEditor.Formats.Texture;
+using TelltaleD3DMeshEditor.UI;
 
 namespace TelltaleD3DMeshEditor.Reinsert;
 
@@ -60,6 +61,10 @@ public static class ReinsertCli
                 Require(args, 2);
                 DumpMaterials(args[1]);
                 return;
+            case "--dump-uv-ranges":
+                Require(args, 2);
+                DumpUvRanges(args[1]);
+                return;
             case "--dump-bone-palettes":
                 Require(args, 2);
                 DumpBonePalettes(args[1], args.Length >= 3 ? args[2] : null);
@@ -68,6 +73,25 @@ public static class ReinsertCli
                 Require(args, 2);
                 DumpSkeleton(args[1], args.Length >= 3 ? args[2] : null);
                 return;
+            case "--validate-skl":
+            {
+                Require(args, 2);
+                var sklFiles = Directory.Exists(args[1])
+                    ? Directory.EnumerateFiles(args[1], "*.skl", SearchOption.TopDirectoryOnly).ToList()
+                    : [args[1]];
+                int ok = 0, fail = 0, err = 0;
+                foreach (var f in sklFiles)
+                {
+                    try
+                    {
+                        if (Formats.Skeleton.SkeletonRebuilder.ValidateRoundTrip(f)) ok++;
+                        else { fail++; if (fail <= 8) Console.WriteLine($"  MISMATCH: {Path.GetFileName(f)}"); }
+                    }
+                    catch (Exception ex) { err++; if (err <= 8) Console.WriteLine($"  ERROR {Path.GetFileName(f)}: {ex.Message}"); }
+                }
+                Console.WriteLine($".skl round-trip: {ok} byte-identical, {fail} mismatch, {err} error (of {sklFiles.Count})");
+                return;
+            }
             case "--dump-skeleton-summary":
                 Require(args, 2);
                 DumpSkeletonSummary(args[1], HasFlag(args, "--recursive"));
@@ -75,6 +99,18 @@ public static class ReinsertCli
             case "--dump-texture-formats":
                 Require(args, 2);
                 DumpTextureFormats(args[1], HasFlag(args, "--recursive"));
+                return;
+            case "--export-texture-png":
+                Require(args, 3);
+                ExportTexturePng(args[1], args[2]);
+                return;
+            case "--dump-combine-groups":
+                Require(args, 2);
+                DumpCombineGroups(args[1], args.Length >= 3 && !args[2].StartsWith("--", StringComparison.Ordinal) ? args[2] : null);
+                return;
+            case "--dump-part-classification":
+                Require(args, 3);
+                DumpPartClassification(args[1], args[2]);
                 return;
             case "--rewrite-texture":
                 Require(args, 4);
@@ -104,9 +140,30 @@ public static class ReinsertCli
                 Require(args, 5);
                 ReinsertCombined(args[1], args[2], args[3], args[4], HasFlag(args, "--diffuse-atlas"));
                 return;
+            case "--extract-combined":
+            {
+                Require(args, 4);
+                GameConfig.Current = ApplySavedReimportSettings(InferGameConfig(args[1]));
+                var exAssets = UI.ModelAsset.Discover(args[1]);
+                var exGroups = UI.ModelAssetGroup.Discover(exAssets, args[1]);
+                var exGroup = exGroups.FirstOrDefault(g => g.Name.Equals(args[2], StringComparison.OrdinalIgnoreCase))
+                    ?? exGroups.FirstOrDefault(g => g.Name.Contains(args[2], StringComparison.OrdinalIgnoreCase))
+                    ?? throw new InvalidOperationException($"No group matches '{args[2]}'.");
+                UI.ExtractionService.ExtractAssetGroupToPath(exGroup, args[1], args[3], UI.ExportFormat.Glb);
+                Console.WriteLine($"extracted   : {exGroup.Name} -> {args[3]}");
+                return;
+            }
             case "--dump-skeleton-rich":
                 Require(args, 2);
                 DumpSkeletonRich(args[1], args.Length >= 3 ? args[2] : null);
+                return;
+            case "--dump-v25-layout":
+                Require(args, 2);
+                DumpV25Layout(args[1]);
+                return;
+            case "--validate-v25-roundtrip":
+                Require(args, 2);
+                ValidateV25Roundtrip(args[1]);
                 return;
             default:
                 Console.WriteLine("Unknown command: " + args[0]);
@@ -114,10 +171,14 @@ public static class ReinsertCli
                 Console.WriteLine("  --dump-layout <mesh.d3dmesh>");
                 Console.WriteLine("  --dump-glb <model.glb|model.gltf>");
                 Console.WriteLine("  --dump-materials <mesh.d3dmesh>");
+                Console.WriteLine("  --dump-uv-ranges <mesh.d3dmesh>");
                 Console.WriteLine("  --dump-bone-palettes <mesh.d3dmesh> [skeleton.skl]");
                 Console.WriteLine("  --dump-skeleton <model.glb|model.gltf|skeleton.skl> [mesh.d3dmesh]");
                 Console.WriteLine("  --dump-skeleton-summary <folder> [--recursive]");
                 Console.WriteLine("  --dump-texture-formats <texture.d3dtx|texture.dds|folder> [--recursive]");
+                Console.WriteLine("  --export-texture-png <texture.d3dtx|texture.dds> <output.png>");
+                Console.WriteLine("  --dump-combine-groups <folder> [filter]");
+                Console.WriteLine("  --dump-part-classification <folder> <filter>");
                 Console.WriteLine("  --rewrite-texture <template.d3dtx> <image.png> <output.d3dtx>");
                 Console.WriteLine("  --extract-asset <mesh.d3dmesh> <output.glb|output.gltf> [skeleton.skl]");
                 Console.WriteLine("  --reinsert-prop <template.d3dmesh> <model.glb|model.gltf> <output.d3dmesh> [--diffuse-atlas]");
@@ -128,6 +189,259 @@ public static class ReinsertCli
         }
     }
 
+    private static void DumpV25Layout(string input)
+    {
+        var data = File.ReadAllBytes(input);
+        var layout = D3DMeshLayout.BuildV25(data);
+        var off4 = BitConverter.ToUInt32(data, 4);
+        var off12 = BitConverter.ToUInt32(data, 12);
+        Console.WriteLine($"file        : {Path.GetFileName(input)}");
+        Console.WriteLine($"version     : {layout.Version}");
+        Console.WriteLine($"static      : {layout.IsStatic}{(layout.RejectReason is null ? "" : $" ({layout.RejectReason})")}");
+        Console.WriteLine($"dataOffset  : {layout.DataOffset}");
+        Console.WriteLine($"defaultSize : {off4} (sync) -> syncEnd={layout.DataOffset + off4}");
+        Console.WriteLine($"asyncSize   : {off12}");
+        Console.WriteLine($"faceStart   : {layout.FaceDataStart}  (expect syncEnd={layout.DataOffset + off4})");
+        Console.WriteLine($"tail        : offset={layout.TailOffset} len={layout.TailLength} fileLen={data.Length}");
+        Console.WriteLine($"meshBounds  : {layout.MeshBoundsOffset}  lodBounds={layout.LodBoundsOffsets.Count}");
+        Console.WriteLine($"vertexCount@: {layout.VertexCountFieldOffset}");
+        Console.WriteLine($"batches     : {layout.Batches.Count}");
+        for (var b = 0; b < layout.Batches.Count; b++)
+        {
+            var batch = layout.Batches[b];
+            Console.WriteLine($"  batch {b}  : texIdxRaw=0x{batch.TextureIndicesRaw:X8} texIdx@{batch.TextureIndicesOffset} mat={batch.MaterialIndex} mat@{batch.MaterialIndexOffset}");
+        }
+        for (var m = 0; m < layout.Materials.Count; m++)
+        {
+            var mat = layout.Materials[m];
+            var diffHash = mat.DiffuseHashOffset > 0 ? BitConverter.ToUInt64(data, mat.DiffuseHashOffset) : 0;
+            var sym = BitConverter.ToUInt64(data, mat.SymbolOffset);
+            Console.WriteLine($"material {m}  : sym=0x{sym:X16} range=[{mat.Start},{mat.End}] diffHash@{mat.DiffuseHashOffset}=0x{diffHash:X16}");
+        }
+        Console.WriteLine($"matCount@   : {layout.MaterialCountFieldOffset}  matsEnd={layout.MaterialsEndOffset}");
+        Console.WriteLine($"textures    : count@{layout.TextureCountFieldOffset} size@{layout.TextureBlockSizeFieldOffset} entriesEnd={layout.TextureEntriesEndOffset} entries={layout.TextureEntries.Count}");
+        for (var t = 0; t < layout.TextureEntries.Count; t++)
+        {
+            var e = layout.TextureEntries[t];
+            var typeRaw = BitConverter.ToUInt32(data, e.TypeOffset);
+            var sym = BitConverter.ToUInt64(data, e.SymbolOffset);
+            Console.WriteLine($"  texture {t} : typeRaw={typeRaw} sym=0x{sym:X16} len={e.Length} start={e.Start}");
+        }
+        Console.WriteLine($"matGroup    : count@{layout.MaterialGroupCountFieldOffset} size@{layout.MaterialGroupSizeFieldOffset} entriesEnd={layout.MaterialGroupEntriesEndOffset} entries={layout.MaterialGroupEntries.Count}");
+        for (var g = 0; g < layout.MaterialGroupEntries.Count; g++)
+        {
+            var e = layout.MaterialGroupEntries[g];
+            var sym = BitConverter.ToUInt64(data, e.SymbolOffset);
+            Console.WriteLine($"  group {g}   : sym=0x{sym:X16} len={e.Length} start={e.Start}");
+        }
+        Console.WriteLine($"uvScaleSlots: {string.Join(", ", layout.UvScaleSlots.Select(s => $"layer{s.Layer}@{s.ValuesOffset}"))}");
+        Console.WriteLine($"attributes  : {string.Join(", ", layout.Attributes.Where(a => a.Key.Length > 0).Select(a => $"{a.Key}(b{a.Buffer} f{a.Format} @{a.BufferOffset})"))}");
+        Console.WriteLine($"palettes    : block@{layout.BonePaletteBlockStart}..{layout.BonePaletteBlockEnd} (len={layout.BonePaletteBlockEnd - layout.BonePaletteBlockStart}) count={layout.BonePalettes.Count} bones={string.Join("/", layout.BonePalettes.Select(p => p.BoneHashes.Length))}");
+        if (layout.BonePaletteBlockStart > 0 && layout.BonePaletteBlockStart + 8 <= layout.Original.Length)
+        {
+            Console.WriteLine($"  paletteLeadingU32={BitConverter.ToUInt32(layout.Original, layout.BonePaletteBlockStart)} (blockLen would be {layout.BonePaletteBlockEnd - layout.BonePaletteBlockStart})");
+        }
+        Console.WriteLine($"faceBuffer  : count={layout.FaceBuffer.Count} stride={layout.FaceBuffer.Stride} payload@{layout.FaceBuffer.PayloadOffset} len={layout.FaceBuffer.PayloadLength}");
+        for (var i = 0; i < layout.VertexBuffers.Count; i++)
+        {
+            var vb = layout.VertexBuffers[i];
+            Console.WriteLine($"vertexBuf{i}  : count={vb.Count} stride={vb.Stride} payload@{vb.PayloadOffset} len={vb.PayloadLength}");
+        }
+    }
+
+    // Two-part V25 reinsertion self-check (mesh only, no texture writes):
+    //  1) structural: the sync section ends where faces begin, payloads tile to EOF, async-size matches.
+    //  2) geometry round-trip: extract the static mesh to a GLB, reinsert it back into itself, reparse,
+    //     and confirm the submesh/vertex/triangle counts and bounding box survive the trip.
+    private static void ValidateV25Roundtrip(string inputPathOrFolder)
+    {
+        var files = Directory.Exists(inputPathOrFolder)
+            ? Directory.GetFiles(inputPathOrFolder, "*.d3dmesh", SearchOption.AllDirectories)
+            : [inputPathOrFolder];
+        int structOk = 0, structFail = 0, rtOk = 0, rtFail = 0, skipped = 0;
+        var tempDir = Path.Combine(Path.GetTempPath(), "v25rt_" + Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(tempDir);
+        try
+        {
+            foreach (var file in files)
+            {
+                try
+                {
+                    var data = File.ReadAllBytes(file);
+                    var layout = D3DMeshLayout.BuildV25(data);
+                    if (layout.FaceDataStart == 0)
+                    {
+                        skipped++;
+                        continue;
+                    }
+
+                    // 1) structural invariants.
+                    var off4 = BitConverter.ToUInt32(data, 4);
+                    var off12 = BitConverter.ToUInt32(data, 12);
+                    var syncEnd = layout.DataOffset + (int)off4;
+                    var structProblems = new List<string>();
+                    if (layout.FaceDataStart != syncEnd) structProblems.Add($"faceStart {layout.FaceDataStart}!=syncEnd {syncEnd}");
+                    if (layout.TailLength != 0) structProblems.Add($"tail {layout.TailLength}!=0");
+                    var payloadSum = layout.FaceBuffer.PayloadLength + layout.VertexBuffers.Sum(v => v.PayloadLength);
+                    if (payloadSum != (int)off12) structProblems.Add($"payloadSum {payloadSum}!=asyncSize {off12}");
+                    if (structProblems.Count == 0) structOk++;
+                    else { structFail++; Console.WriteLine($"STRUCT-FAIL {Path.GetFileName(file)}: {string.Join("; ", structProblems)}"); }
+
+                    if (!layout.IsStatic && !layout.IsSkinned)
+                    {
+                        skipped++;
+                        continue;
+                    }
+
+                    // 2) geometry round-trip (mesh only).
+                    var orig = D3DMeshParser.ParseFile(file);
+                    var glbPath = Path.Combine(tempDir, "rt.glb");
+                    GameConfig.Current = InferGameConfig(file);
+                    // Extract with the character's own skeleton so the GLB carries proper joints/bind pose
+                    // (a skinned mesh without its .skl exports degraded skinning, breaking the round-trip).
+                    var siblingSkl = ResolveExtractSkeletonPath(Path.GetFullPath(file), null);
+                    var asset = UI.ModelAsset.FromPaths(Path.GetFullPath(file), siblingSkl);
+                    UI.ExtractionService.ExtractAssetToPath(asset, Path.GetDirectoryName(Path.GetFullPath(file)) ?? ".", glbPath, UI.ExportFormat.Glb);
+                    var model = GltfReader.Load(glbPath);
+                    var result = MeshReinserter.ReinsertV25Geometry(layout, model);
+                    var rt = D3DMeshParser.Parse(result);
+
+                    var rtProblems = new List<string>();
+                    if (rt.Submeshes.Count != orig.Submeshes.Count) rtProblems.Add($"submeshes {rt.Submeshes.Count}!={orig.Submeshes.Count}");
+                    if (rt.VertexCount != orig.VertexCount) rtProblems.Add($"verts {rt.VertexCount}!={orig.VertexCount}");
+                    if (rt.FaceCount != orig.FaceCount) rtProblems.Add($"tris {rt.FaceCount}!={orig.FaceCount}");
+                    var ob = orig.GetBounds();
+                    var rb = rt.GetBounds();
+                    var boundsDelta = MathF.Max(MathF.Max(MathF.Abs(ob.MinX - rb.MinX), MathF.Abs(ob.MaxX - rb.MaxX)),
+                        MathF.Max(MathF.Abs(ob.MinY - rb.MinY), MathF.Abs(ob.MaxY - rb.MaxY)));
+                    if (boundsDelta > 0.01f) rtProblems.Add($"bounds drift {boundsDelta:0.####}");
+
+                    // UV drift: the diffuse maps via uv1, so verify it survives the trip (quantized layers
+                    // lose a little precision; a real swap/flip shows up as a large delta).
+                    var uvDelta = MaxUvDrift(orig, rt);
+                    if (uvDelta > 0.02f) rtProblems.Add($"uv1 drift {uvDelta:0.####}");
+
+                    // Skinning round-trip: palettes preserved, and matched vertices keep their dominant
+                    // bone + weight (a wrong joint->palette mapping shows up as dominant-bone mismatches).
+                    if (layout.IsSkinned)
+                    {
+                        if (rt.BonePalettes.Count != orig.BonePalettes.Count)
+                            rtProblems.Add($"palettes {rt.BonePalettes.Count}!={orig.BonePalettes.Count}");
+                        var (wDrift, boneMismatch, comparedSkin) = MaxSkinDrift(orig, rt);
+                        if (comparedSkin > 0 && boneMismatch > comparedSkin * 0.02f)
+                            rtProblems.Add($"dominant-bone mismatch {boneMismatch}/{comparedSkin}");
+                        if (wDrift > 0.05f) rtProblems.Add($"weight drift {wDrift:0.###}");
+                    }
+
+                    if (rtProblems.Count == 0) rtOk++;
+                    else { rtFail++; Console.WriteLine($"RT-FAIL {Path.GetFileName(file)}: {string.Join("; ", rtProblems)}"); }
+                }
+                catch (Exception ex)
+                {
+                    rtFail++;
+                    Console.WriteLine($"ERROR {Path.GetFileName(file)}: {ex.Message}");
+                }
+            }
+        }
+        finally
+        {
+            try { Directory.Delete(tempDir, recursive: true); } catch { /* best effort */ }
+        }
+
+        Console.WriteLine($"V25 structural: {structOk} ok, {structFail} fail | geometry round-trip: {rtOk} ok, {rtFail} fail | skipped {skipped} (of {files.Length})");
+    }
+
+    // Compares uv1 between two parses by matching vertices on position (reinsertion may reorder/dedupe
+    // vertices, so index-by-index would be unreliable). Returns the largest |Δu|/|Δv| found.
+    private static float MaxUvDrift(MeshData a, MeshData b)
+    {
+        static string Key(VertexData v) =>
+            $"{MathF.Round(v.X, 3)},{MathF.Round(v.Y, 3)},{MathF.Round(v.Z, 3)}";
+        // A position can host several UVs (a UV seam), so collect ALL uv1 values per position and match
+        // each original vertex to the closest reinserted uv at the same position.
+        var bByPos = new Dictionary<string, List<(float U, float V)>>();
+        foreach (var sm in b.Submeshes)
+        {
+            foreach (var v in sm.Vertices)
+            {
+                var key = Key(v);
+                if (!bByPos.TryGetValue(key, out var list))
+                {
+                    bByPos[key] = list = [];
+                }
+
+                list.Add((v.U, v.V));
+            }
+        }
+
+        var maxDelta = 0f;
+        foreach (var sm in a.Submeshes)
+        {
+            foreach (var v in sm.Vertices)
+            {
+                if (!bByPos.TryGetValue(Key(v), out var candidates))
+                {
+                    continue;
+                }
+
+                var best = float.MaxValue;
+                foreach (var c in candidates)
+                {
+                    best = MathF.Min(best, MathF.Max(MathF.Abs(v.U - c.U), MathF.Abs(v.V - c.V)));
+                }
+
+                maxDelta = MathF.Max(maxDelta, best);
+            }
+        }
+
+        return maxDelta;
+    }
+
+    // Compares skinning between two parses per submesh, vertex-by-vertex by INDEX. A V25 same-model
+    // round-trip preserves submesh and vertex order (counts match), so index comparison is exact —
+    // position-keyed matching produces false mismatches on dense meshes where many verts round to the
+    // same key. Compares the dominant bone's resolved hash and the largest single weight. Returns
+    // (max weight delta, dominant-bone mismatches, vertices compared).
+    private static (float WeightDrift, int BoneMismatch, int Compared) MaxSkinDrift(MeshData a, MeshData b)
+    {
+        static ulong DominantHash(VertexData v, IReadOnlyList<ulong[]> palettes, int paletteIndex)
+        {
+            var bones = new[] { v.Bone0, v.Bone1, v.Bone2, v.Bone3 };
+            var weights = new[] { v.Weight0, v.Weight1, v.Weight2, v.Weight3 };
+            var best = 0;
+            for (var i = 1; i < 4; i++) if (weights[i] > weights[best]) best = i;
+            var bone = bones[best];
+            return paletteIndex >= 0 && paletteIndex < palettes.Count && bone >= 0 && bone < palettes[paletteIndex].Length
+                ? palettes[paletteIndex][bone]
+                : 0;
+        }
+        static float MaxWeight(VertexData v) =>
+            MathF.Max(MathF.Max(v.Weight0, v.Weight1), MathF.Max(v.Weight2, v.Weight3));
+
+        float weightDrift = 0f;
+        int boneMismatch = 0, compared = 0;
+        var n = Math.Min(a.Submeshes.Count, b.Submeshes.Count);
+        for (var s = 0; s < n; s++)
+        {
+            var av = a.Submeshes[s].Vertices;
+            var bv = b.Submeshes[s].Vertices;
+            int aPi = a.Submeshes[s].BonePaletteIndex, bPi = b.Submeshes[s].BonePaletteIndex;
+            var vn = Math.Min(av.Count, bv.Count);
+            for (var i = 0; i < vn; i++)
+            {
+                compared++;
+                if (DominantHash(av[i], a.BonePalettes, aPi) != DominantHash(bv[i], b.BonePalettes, bPi))
+                {
+                    boneMismatch++;
+                }
+
+                weightDrift = MathF.Max(weightDrift, MathF.Abs(MaxWeight(av[i]) - MaxWeight(bv[i])));
+            }
+        }
+
+        return (weightDrift, boneMismatch, compared);
+    }
+
     private static bool HasFlag(string[] args, string flag)
         => args.Any(arg => arg.Equals(flag, StringComparison.OrdinalIgnoreCase));
 
@@ -136,6 +450,55 @@ public static class ReinsertCli
         if (args.Length < count)
         {
             throw new ArgumentException($"Command {args[0]} expects {count - 1} argument(s).");
+        }
+    }
+
+    private static void DumpCombineGroups(string folder, string? filter)
+    {
+        var assets = ModelAsset.Discover(folder);
+        var groups = ModelAssetGroup.Discover(assets, folder);
+        foreach (var group in groups.OrderBy(group => group.Name, StringComparer.OrdinalIgnoreCase))
+        {
+            if (!string.IsNullOrWhiteSpace(filter) &&
+                !group.Name.Contains(filter, StringComparison.OrdinalIgnoreCase) &&
+                !group.Assets.Any(asset => Path.GetFileNameWithoutExtension(asset.MeshPath).Contains(filter, StringComparison.OrdinalIgnoreCase)))
+            {
+                continue;
+            }
+
+            Console.WriteLine($"Combined: {group.Name} ({group.Assets.Count} parts)");
+            foreach (var asset in group.Assets.OrderBy(asset => asset.MeshPath, StringComparer.OrdinalIgnoreCase))
+            {
+                Console.WriteLine("  " + Path.GetFileNameWithoutExtension(asset.MeshPath));
+            }
+        }
+    }
+
+    private static void DumpPartClassification(string folder, string filter)
+    {
+        var assets = ModelAsset.Discover(folder)
+            .Where(asset => Path.GetFileNameWithoutExtension(asset.MeshPath).Contains(filter, StringComparison.OrdinalIgnoreCase))
+            .ToList();
+        var method = typeof(ModelAssetGroup).GetMethod(
+            "ClassifyPart",
+            System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Static)
+            ?? throw new MissingMethodException(nameof(ModelAssetGroup), "ClassifyPart");
+        var modelStemMethod = typeof(ModelAssetGroup).GetMethod(
+            "ModelStem",
+            System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Static)
+            ?? throw new MissingMethodException(nameof(ModelAssetGroup), "ModelStem");
+        foreach (var asset in assets)
+        {
+            var skeletonStem = Path.GetFileNameWithoutExtension(asset.SkeletonPath ?? asset.MeshPath);
+            var meshStem = Path.GetFileNameWithoutExtension(asset.MeshPath);
+            var classificationStem = modelStemMethod.Invoke(null, [meshStem, skeletonStem])?.ToString() ?? skeletonStem;
+            var part = method.Invoke(null, [asset, classificationStem])!;
+            string GetString(string name) => part.GetType().GetProperty(name)?.GetValue(part)?.ToString() ?? "";
+            bool GetBool(string name) => part.GetType().GetProperty(name)?.GetValue(part) is true;
+            Console.WriteLine(
+                $"{Path.GetFileNameWithoutExtension(asset.MeshPath)} | skeleton={skeletonStem} model={classificationStem} | " +
+                $"tail={GetString("Tail")} slot={GetString("Slot")} variant={GetString("Variant")} " +
+                $"recognized={GetBool("IsRecognized")} additive={GetBool("IsAdditive")}");
         }
     }
 
@@ -226,6 +589,74 @@ public static class ReinsertCli
         }
     }
 
+    private static void DumpUvRanges(string input)
+    {
+        var mesh = D3DMeshParser.ParseFile(input);
+        Console.WriteLine($"file       : {Path.GetFileName(input)}");
+        Console.WriteLine($"version    : {mesh.Version}");
+        Console.WriteLine($"submeshes  : {mesh.Submeshes.Count}");
+        for (var i = 0; i < mesh.Submeshes.Count; i++)
+        {
+            var submesh = mesh.Submeshes[i];
+            Console.WriteLine($"  submesh {i}: {submesh.Name}");
+            Console.WriteLine($"    uv1 {DescribeUvRange(submesh.Vertices, vertex => vertex.U, vertex => vertex.V)}");
+            Console.WriteLine($"    uv2 {DescribeUvRange(submesh.Vertices, vertex => vertex.U2, vertex => vertex.V2)}");
+            Console.WriteLine($"    uv3 {DescribeUvRange(submesh.Vertices, vertex => vertex.U3, vertex => vertex.V3)}");
+            Console.WriteLine($"    uv4 {DescribeUvRange(submesh.Vertices, vertex => vertex.U4, vertex => vertex.V4)}");
+            Console.WriteLine($"    uv5 {DescribeUvRange(submesh.Vertices, vertex => vertex.U5, vertex => vertex.V5)}");
+            Console.WriteLine($"    uv6 {DescribeUvRange(submesh.Vertices, vertex => vertex.U6, vertex => vertex.V6)}");
+        }
+    }
+
+    private static string DescribeUvRange(
+        IReadOnlyList<VertexData> vertices,
+        Func<VertexData, float> getU,
+        Func<VertexData, float> getV)
+    {
+        if (vertices.Count == 0)
+        {
+            return "empty";
+        }
+
+        var minU = float.PositiveInfinity;
+        var maxU = float.NegativeInfinity;
+        var minV = float.PositiveInfinity;
+        var maxV = float.NegativeInfinity;
+        foreach (var vertex in vertices)
+        {
+            var u = getU(vertex);
+            var v = getV(vertex);
+            minU = MathF.Min(minU, u);
+            maxU = MathF.Max(maxU, u);
+            minV = MathF.Min(minV, v);
+            maxV = MathF.Max(maxV, v);
+        }
+
+        return string.Format(
+            CultureInfo.InvariantCulture,
+            "u={0:0.###}..{1:0.###}, v={2:0.###}..{3:0.###}",
+            minU, maxU, minV, maxV);
+    }
+
+    private static void ExportTexturePng(string input, string output)
+    {
+        var texture = TextureLoader.Load(input);
+        var outputPath = Path.GetFullPath(output);
+        Directory.CreateDirectory(Path.GetDirectoryName(outputPath) ?? ".");
+        using var bitmap = new Bitmap(texture.Width, texture.Height, PixelFormat.Format32bppArgb);
+        for (var y = 0; y < texture.Height; y++)
+        {
+            for (var x = 0; x < texture.Width; x++)
+            {
+                bitmap.SetPixel(x, y, Color.FromArgb(texture.Pixels[y * texture.Width + x]));
+            }
+        }
+
+        bitmap.Save(outputPath, ImageFormat.Png);
+        Console.WriteLine($"texture    : {Path.GetFileName(input)} ({texture.Width}x{texture.Height})");
+        Console.WriteLine($"exported   : {outputPath}");
+    }
+
     private static string DescribeColorStats(IReadOnlyList<Vector4> colors)
     {
         var min = new Vector4(float.PositiveInfinity);
@@ -305,6 +736,7 @@ public static class ReinsertCli
             Console.WriteLine($"  submesh {i}: palette={submesh.BonePaletteIndex} {submesh.Name}");
         }
 
+        var influenceBounds = ComputePaletteInfluenceBounds(mesh);
         for (var i = 0; i < mesh.BonePalettes.Count; i++)
         {
             var palette = mesh.BonePalettes[i];
@@ -326,7 +758,18 @@ public static class ReinsertCli
                 var label = namesByHash is not null && namesByHash.TryGetValue(hash, out var name)
                     ? name
                     : $"0x{hash:X16}";
-                Console.WriteLine($"    {label}");
+                var entry = TryGetBonePaletteEntry(mesh, i, hash);
+                var influence = influenceBounds.TryGetValue((i, Array.IndexOf(palette, hash)), out var box)
+                    ? $" influence=({F(box.MinX)}, {F(box.MinY)}, {F(box.MinZ)})..({F(box.MaxX)}, {F(box.MaxY)}, {F(box.MaxZ)})"
+                    : "";
+                if (entry is { HasBounds: true })
+                {
+                    Console.WriteLine($"    {label} center=({F(entry.Value.CenterX)}, {F(entry.Value.CenterY)}, {F(entry.Value.CenterZ)}) radius={F(entry.Value.Radius)}{influence}");
+                }
+                else
+                {
+                    Console.WriteLine($"    {label}{influence}");
+                }
             }
 
             if (palette.Length > 12)
@@ -334,6 +777,65 @@ public static class ReinsertCli
                 Console.WriteLine("    ...");
             }
         }
+    }
+
+    private static Dictionary<(int Palette, int LocalBone), CliBoneBox> ComputePaletteInfluenceBounds(MeshData mesh)
+    {
+        var result = new Dictionary<(int, int), CliBoneBox>();
+        foreach (var submesh in mesh.Submeshes)
+        {
+            if (submesh.BonePaletteIndex < 0 || submesh.BonePaletteIndex >= mesh.BonePalettes.Count)
+            {
+                continue;
+            }
+
+            var palette = mesh.BonePalettes[submesh.BonePaletteIndex];
+            foreach (var vertex in submesh.Vertices)
+            {
+                AddInfluence(vertex.Bone0, vertex.Weight0, vertex, submesh.BonePaletteIndex, palette.Length, mesh.Version, result);
+                AddInfluence(vertex.Bone1, vertex.Weight1, vertex, submesh.BonePaletteIndex, palette.Length, mesh.Version, result);
+                AddInfluence(vertex.Bone2, vertex.Weight2, vertex, submesh.BonePaletteIndex, palette.Length, mesh.Version, result);
+                AddInfluence(vertex.Bone3, vertex.Weight3, vertex, submesh.BonePaletteIndex, palette.Length, mesh.Version, result);
+            }
+        }
+
+        return result;
+    }
+
+    private static void AddInfluence(
+        int rawBone,
+        float weight,
+        VertexData vertex,
+        int paletteIndex,
+        int paletteLength,
+        int meshVersion,
+        Dictionary<(int, int), CliBoneBox> result)
+    {
+        if (weight <= 0.000001f)
+        {
+            return;
+        }
+
+        var local = BoneIndexConvention.ToPaletteIndex(rawBone, meshVersion);
+        if (local < 0 || local >= paletteLength)
+        {
+            return;
+        }
+
+        var key = (paletteIndex, local);
+        result[key] = result.TryGetValue(key, out var existing)
+            ? existing.Include(vertex.X, vertex.Y, vertex.Z)
+            : CliBoneBox.From(vertex.X, vertex.Y, vertex.Z);
+    }
+
+    private static BonePaletteEntryData? TryGetBonePaletteEntry(MeshData mesh, int paletteIndex, ulong hash)
+    {
+        if (paletteIndex < 0 || paletteIndex >= mesh.BonePaletteEntries.Count)
+        {
+            return null;
+        }
+
+        return mesh.BonePaletteEntries[paletteIndex].FirstOrDefault(entry => entry.Hash == hash);
     }
 
     // Full per-joint dump straight from the Toolkit entry (local + rest transforms, bone dir/length,
@@ -656,9 +1158,42 @@ public static class ReinsertCli
             return;
         }
 
+        if (D3DMeshParser.Parse(templateBytes).Version == 25)
+        {
+            var v25Tex = ReinsertTextureService.WriteV25ReferencedTextures(model, template, output, forceUncompressed: false);
+            var v25Layout = D3DMeshLayout.BuildV25(templateBytes);
+            var v25SourceLayout = MeshReinserter.TryFindV25SourceMaterialLayout(model, template, glb);
+            var v25Result = MeshReinserter.ReinsertV25Geometry(v25Layout, model, v25Tex.PrimitiveSlots, v25SourceLayout);
+            File.WriteAllBytes(output, v25Result);
+
+            var v25Reparsed = D3DMeshParser.Parse(v25Result);
+            Console.WriteLine($"reinserted  : {output} (V25 static)");
+            Console.WriteLine($"template    : {Path.GetFileName(template)}");
+            Console.WriteLine($"input       : {Path.GetFileName(glb)}");
+            Console.WriteLine($"mesh        : {v25Result.Length} bytes, {v25Reparsed.Submeshes.Count} submeshes, {v25Reparsed.VertexCount} verts, {v25Reparsed.FaceCount} tris");
+            PrintBounds("bounds      ", v25Reparsed.GetBounds());
+            Console.WriteLine($"textures    : {v25Tex.Written.Count}");
+            foreach (var name in v25Tex.Written)
+            {
+                Console.WriteLine($"  {name}.d3dtx");
+            }
+            foreach (var missing in v25Tex.TemplateNotFound)
+            {
+                Console.WriteLine($"  WARNING: no original .d3dtx template for referenced texture '{missing}' (left untouched).");
+            }
+
+            var distinctTex = ReinsertTextureService.DistinctV25TextureCount(model);
+            if (distinctTex > v25Layout.Materials.Count && !MeshReinserter.CanAddV25Materials(v25Layout))
+            {
+                Console.WriteLine($"  WARNING: the model has {distinctTex} distinct textures but the template has " +
+                    $"{v25Layout.Materials.Count} material(s) and they can't be extended for this mesh; some textures " +
+                    "will repeat. Use a template with at least as many submeshes/materials as the model has textures.");
+            }
+            return;
+        }
+
         var textureOptions = BuildReinsertTextureOptions(useDiffuseAtlas);
         var textures = ReinsertTextureService.WriteAllReferencedTextures(model, template, output, gameConfig, textureOptions);
-
 
         var layout = D3DMeshLayout.Build(templateBytes);
         var result = MeshReinserter.ReinsertGeometry(layout, model, textures, gameConfig: gameConfig);
@@ -825,6 +1360,13 @@ public static class ReinsertCli
     {
         Directory.CreateDirectory(Path.GetDirectoryName(Path.GetFullPath(output)) ?? ".");
 
+        var templateBytes0 = File.ReadAllBytes(template);
+        if (D3DMeshParser.Parse(templateBytes0).Version == 25)
+        {
+            ReinsertV25Character(template, templateBytes0, skeletonPath, glb, output);
+            return;
+        }
+
         var layout = D3DMeshLayout.Build(File.ReadAllBytes(template));
         var skeleton = SkeletonLoader.Load(skeletonPath, layout.Version);
         var gameConfig = ApplySavedReimportSettings(InferGameConfig(template));
@@ -990,6 +1532,49 @@ public static class ReinsertCli
     {
         Preserve,
         ForceWhite,
+    }
+
+    // The Walking Dead: Michonne (V25) character path: same user-facing flow as the other games
+    // (template .d3dmesh + target .skl + rigged GLB -> skinned .d3dmesh + a .skl rebuilt from the GLB
+    // skeleton). The mesh's blend weights/indices are re-encoded against the template's bone palettes,
+    // and the .skl is rebuilt via the shared SkeletonRebuilder (validated byte-identical on Michonne).
+    private static void ReinsertV25Character(string template, byte[] templateBytes, string skeletonPath, string glb, string output)
+    {
+        var gameConfig = ApplySavedReimportSettings(InferGameConfig(template));
+        var model = GltfModelPreprocessor.ApplyGameReinsertRules(GltfReader.Load(glb), gameConfig);
+
+        var v25Tex = ReinsertTextureService.WriteV25ReferencedTextures(model, template, output, forceUncompressed: false);
+        var layout = D3DMeshLayout.BuildV25(templateBytes);
+        var sourceLayout = MeshReinserter.TryFindV25SourceMaterialLayout(model, template, glb);
+        var result = MeshReinserter.ReinsertV25Geometry(layout, model, v25Tex.PrimitiveSlots, sourceLayout);
+        File.WriteAllBytes(output, result);
+
+        string skeletonLine;
+        if (model.Skeleton is not null && model.Skeleton.Bones.Count > 0 && File.Exists(skeletonPath))
+        {
+            var skeletonOutput = Path.Combine(Path.GetDirectoryName(Path.GetFullPath(output)) ?? ".", Path.GetFileName(skeletonPath));
+            var skeletonBytes = RebuildSkeletonBytesForGame(skeletonPath, model.Skeleton, gameConfig);
+            File.WriteAllBytes(skeletonOutput, skeletonBytes);
+            skeletonLine = $"{Path.GetFileName(skeletonOutput)} ({model.Skeleton.Bones.Count} bones from GLB)";
+        }
+        else
+        {
+            skeletonLine = "no GLB skin; mesh reinserted without rewriting the skeleton";
+        }
+
+        var reparsed = D3DMeshParser.Parse(result);
+        Console.WriteLine($"reinserted  : {output} (V25 character)");
+        Console.WriteLine($"template    : {Path.GetFileName(template)}");
+        Console.WriteLine($"skeleton    : {skeletonLine}");
+        Console.WriteLine($"input       : {Path.GetFileName(glb)}");
+        Console.WriteLine($"mesh        : {result.Length} bytes, {reparsed.Submeshes.Count} submeshes, {reparsed.VertexCount} verts, {reparsed.FaceCount} tris");
+        Console.WriteLine($"palettes    : {reparsed.BonePalettes.Count}");
+        PrintBounds("bounds      ", reparsed.GetBounds());
+        Console.WriteLine($"textures    : {v25Tex.Written.Count}");
+        foreach (var name in v25Tex.Written)
+        {
+            Console.WriteLine($"  {name}.d3dtx");
+        }
     }
 
     private static void ReinsertCharacterTextureTests(string template, string skeletonPath, string glb, string outputFolder)
@@ -1991,6 +2576,14 @@ public static class ReinsertCli
             return GameConfig.WalkingDeadSeason2;
         }
 
+        if (text.Contains("TWDM", StringComparison.OrdinalIgnoreCase) ||
+            text.Contains("Walking Dead: Michonne", StringComparison.OrdinalIgnoreCase) ||
+            text.Contains("Walking Dead Michonne", StringComparison.OrdinalIgnoreCase) ||
+            text.Contains("Michonne", StringComparison.OrdinalIgnoreCase))
+        {
+            return GameConfig.WalkingDeadMichonne;
+        }
+
         if (text.Contains("TWAU", StringComparison.OrdinalIgnoreCase) ||
             text.Contains("Wolf Among Us", StringComparison.OrdinalIgnoreCase))
         {
@@ -2199,6 +2792,25 @@ public static class ReinsertCli
 
         state[index] = 2;
         return matrices[index];
+    }
+
+    private readonly record struct CliBoneBox(
+        float MinX,
+        float MinY,
+        float MinZ,
+        float MaxX,
+        float MaxY,
+        float MaxZ)
+    {
+        public static CliBoneBox From(float x, float y, float z) => new(x, y, z, x, y, z);
+
+        public CliBoneBox Include(float x, float y, float z) => new(
+            Math.Min(MinX, x),
+            Math.Min(MinY, y),
+            Math.Min(MinZ, z),
+            Math.Max(MaxX, x),
+            Math.Max(MaxY, y),
+            Math.Max(MaxZ, z));
     }
 
     private static void PrintBounds(string label, (float MinX, float MinY, float MinZ, float MaxX, float MaxY, float MaxZ) b)

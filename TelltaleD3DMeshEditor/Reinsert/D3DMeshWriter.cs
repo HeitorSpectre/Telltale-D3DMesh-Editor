@@ -7,8 +7,12 @@ namespace TelltaleD3DMeshEditor.Reinsert;
 public static class D3DMeshWriter
 {
     public static byte[] Apply(D3DMeshLayout layout, IReadOnlyList<RegionPatch> patches)
+        => Apply(layout.Original, patches);
+
+    // Generic byte-level template patcher: replaces the requested regions in the original bytes,
+    // copying everything else verbatim. Regions may grow or shrink; later offsets shift accordingly.
+    public static byte[] Apply(byte[] original, IReadOnlyList<RegionPatch> patches)
     {
-        var original = layout.Original;
         if (patches.Count == 0)
         {
             return (byte[])original.Clone();
