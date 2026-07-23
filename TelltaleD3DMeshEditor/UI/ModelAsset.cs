@@ -44,24 +44,41 @@ public sealed class ModelAsset
             .ToDictionary(group => group.Key, group => group.ToList(), StringComparer.OrdinalIgnoreCase);
         var skeletonHashes = BuildSkeletonHashIndex(skeletonFiles);
 
-        var result = new List<ModelAsset>(meshFiles.Count);
+        // Skeleton resolution can fall back to a FULL mesh parse (palette matching) for every mesh
+        // that has no name-matched .skl, which dominates folder loading on big dumps. The per-mesh
+        // work is independent, so run it in parallel and keep the results in the original order.
+        var resolved = new string?[meshFiles.Count];
+        var done = 0;
         var lastPercent = -1;
+        var progressGate = new object();
+        Parallel.For(
+            0,
+            meshFiles.Count,
+            new ParallelOptions { MaxDegreeOfParallelism = Math.Max(2, Environment.ProcessorCount - 1) },
+            i =>
+            {
+                resolved[i] = ResolveSkeleton(meshFiles[i], skeletonsByStem, skeletonHashes);
+                if (progress is null)
+                {
+                    return;
+                }
+
+                var current = Interlocked.Increment(ref done);
+                var percent = (int)(current * 100L / meshFiles.Count);
+                lock (progressGate)
+                {
+                    if (percent != lastPercent)
+                    {
+                        lastPercent = percent;
+                        progress.Report(percent / 100.0);
+                    }
+                }
+            });
+
+        var result = new List<ModelAsset>(meshFiles.Count);
         for (var i = 0; i < meshFiles.Count; i++)
         {
-            var mesh = meshFiles[i];
-            result.Add(new ModelAsset(mesh, ResolveSkeleton(mesh, skeletonsByStem, skeletonHashes)));
-
-            if (progress is null)
-            {
-                continue;
-            }
-
-            var percent = (int)((i + 1) * 100L / meshFiles.Count);
-            if (percent != lastPercent)
-            {
-                lastPercent = percent;
-                progress.Report(percent / 100.0);
-            }
+            result.Add(new ModelAsset(meshFiles[i], resolved[i]));
         }
 
         return result;
@@ -107,20 +124,35 @@ public sealed class ModelAsset
 
     private static Dictionary<string, HashSet<ulong>> BuildSkeletonHashIndex(IReadOnlyList<string> skeletonFiles)
     {
+        // Each .skl parse is independent (and the modern toolkit path is not cheap), so index the
+        // skeletons in parallel — the same treatment Discover gives the meshes.
+        var entries = new HashSet<ulong>?[skeletonFiles.Count];
+        Parallel.For(
+            0,
+            skeletonFiles.Count,
+            new ParallelOptions { MaxDegreeOfParallelism = Math.Max(2, Environment.ProcessorCount - 1) },
+            i =>
+            {
+                try
+                {
+                    var skeleton = SkeletonLoader.LoadForHashIndex(skeletonFiles[i], GameConfig.Current.IsBackToTheFuture ? 1 : 13);
+                    entries[i] = skeleton.Bones
+                        .Select(bone => bone.Hash)
+                        .Where(hash => hash != 0)
+                        .ToHashSet();
+                }
+                catch
+                {
+                    // Keep discovery resilient: a bad SKL should not stop the folder from loading.
+                }
+            });
+
         var result = new Dictionary<string, HashSet<ulong>>(StringComparer.OrdinalIgnoreCase);
-        foreach (var skeletonPath in skeletonFiles)
+        for (var i = 0; i < skeletonFiles.Count; i++)
         {
-            try
+            if (entries[i] is { } hashes)
             {
-                var skeleton = SkeletonLoader.Load(skeletonPath, GameConfig.Current.IsBackToTheFuture ? 1 : 13);
-                result[skeletonPath] = skeleton.Bones
-                    .Select(bone => bone.Hash)
-                    .Where(hash => hash != 0)
-                    .ToHashSet();
-            }
-            catch
-            {
-                // Keep discovery resilient: a bad SKL should not stop the folder from loading.
+                result[skeletonFiles[i]] = hashes;
             }
         }
 

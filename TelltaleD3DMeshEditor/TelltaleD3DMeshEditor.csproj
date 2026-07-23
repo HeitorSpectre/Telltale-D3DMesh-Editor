@@ -41,6 +41,7 @@
        extract .ttarch / .ttarch2 game containers so users don't have to unpack them manually.
        Referenced from source so it stays linked to the upstream repo via the submodule. -->
   <ItemGroup>
+    <PackageReference Include="AstcSharp" Version="3.0.1" />
     <PackageReference Include="DiscordRichPresence" Version="1.6.1.70" />
     <PackageReference Include="SharpCompress" Version="0.49.1" />
     <ProjectReference Include="..\external\TelltaleToolKit\src\TelltaleToolKit\TelltaleToolKit.csproj" />
@@ -115,6 +116,9 @@
     </EmbeddedResource>
     <EmbeddedResource Include="Resources\Images\GOT.png">
       <LogicalName>TelltaleD3DMeshEditor.Resources.Images.GOT.png</LogicalName>
+    </EmbeddedResource>
+    <EmbeddedResource Include="Resources\Images\BAT.png">
+      <LogicalName>TelltaleD3DMeshEditor.Resources.Images.BAT.png</LogicalName>
     </EmbeddedResource>
     <EmbeddedResource Include="Resources\Images\TWAU.png">
       <LogicalName>TelltaleD3DMeshEditor.Resources.Images.TWAU.png</LogicalName>

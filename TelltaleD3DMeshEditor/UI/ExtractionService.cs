@@ -34,10 +34,15 @@ public static class ExtractionService
         return ExtractAssetToPath(asset, inputRoot, outputPath, format);
     }
 
-    public static string ExtractAssetToPath(ModelAsset asset, string inputRoot, string outputPath, ExportFormat format)
+    public static string ExtractAssetToPath(
+        ModelAsset asset,
+        string inputRoot,
+        string outputPath,
+        ExportFormat format,
+        IReadOnlyList<(string Name, List<AnimationExporter.BoneTrack> Tracks)>? animations = null)
     {
         Directory.CreateDirectory(Path.GetDirectoryName(outputPath) ?? ".");
-        WriteCompleteAsset(asset, inputRoot, outputPath, format);
+        WriteCompleteAsset(asset, inputRoot, outputPath, format, animations);
         return outputPath;
     }
 
@@ -49,10 +54,15 @@ public static class ExtractionService
         return ExtractAssetGroupToPath(group, inputRoot, outputPath, format);
     }
 
-    public static string ExtractAssetGroupToPath(ModelAssetGroup group, string inputRoot, string outputPath, ExportFormat format)
+    public static string ExtractAssetGroupToPath(
+        ModelAssetGroup group,
+        string inputRoot,
+        string outputPath,
+        ExportFormat format,
+        IReadOnlyList<(string Name, List<AnimationExporter.BoneTrack> Tracks)>? animations = null)
     {
         Directory.CreateDirectory(Path.GetDirectoryName(outputPath) ?? ".");
-        WriteCompleteAssetGroup(group, inputRoot, outputPath, format);
+        WriteCompleteAssetGroup(group, inputRoot, outputPath, format, animations);
         return outputPath;
     }
 
@@ -120,7 +130,12 @@ public static class ExtractionService
         return candidate;
     }
 
-    private static void WriteCompleteAsset(ModelAsset asset, string inputRoot, string outputPath, ExportFormat format)
+    private static void WriteCompleteAsset(
+        ModelAsset asset,
+        string inputRoot,
+        string outputPath,
+        ExportFormat format,
+        IReadOnlyList<(string Name, List<AnimationExporter.BoneTrack> Tracks)>? animations = null)
     {
         var mesh = WithSourceMetadata(D3DMeshParser.ParseFile(asset.MeshPath), inputRoot, asset.MeshPath);
         var textureSets = TextureResolver.ResolveForMesh(inputRoot, asset.MeshPath, mesh);
@@ -130,15 +145,31 @@ public static class ExtractionService
         var auxiliaryTextures = BuildAuxiliaryTexturePngsForExport(mesh, inputRoot, asset.MeshPath, baseColorByName.Keys);
 
         var skeleton = LoadOptionalSkeleton(asset.SkeletonPath, mesh.Version);
+        var remappedAnimations = RemapAnimationsForExport(animations, skeleton);
 
         if (format == ExportFormat.Glb)
         {
-            GltfWriter.WriteCompleteAssetGlb(mesh, skeleton, baseColorByName, outputPath, auxiliaryTextures);
+            GltfWriter.WriteCompleteAssetGlb(mesh, skeleton, baseColorByName, outputPath, auxiliaryTextures, remappedAnimations);
         }
         else
         {
             GltfSeparateWriter.WriteCompleteAssetGltf(mesh, skeleton, baseColorByName, outputPath, auxiliaryTextures);
         }
+    }
+
+    // Raw decoded tracks reference bones by CRC64; snap them to the skeleton actually exported
+    // (drops rigs whose bone count doesn't match, unmatched bones, and sub-2-frame tracks).
+    private static IReadOnlyList<(string Name, List<AnimationExporter.BoneTrack> Tracks)>? RemapAnimationsForExport(
+        IReadOnlyList<(string Name, List<AnimationExporter.BoneTrack> Tracks)>? animations,
+        SkeletonData? skeleton)
+    {
+        if (animations is null || animations.Count == 0 || skeleton is null || skeleton.Bones.Count == 0)
+        {
+            return null;
+        }
+
+        var remapped = AnimationCollector.RemapToSkeleton(animations, skeleton);
+        return remapped.Count > 0 ? remapped : null;
     }
 
     private static MeshData WithSourceMetadata(MeshData mesh, string inputRoot, string meshPath)
@@ -211,7 +242,12 @@ public static class ExtractionService
         submesh.TextureNames[slot] = Stem(texture.SourcePath);
     }
 
-    private static void WriteCompleteAssetGroup(ModelAssetGroup group, string inputRoot, string outputPath, ExportFormat format)
+    private static void WriteCompleteAssetGroup(
+        ModelAssetGroup group,
+        string inputRoot,
+        string outputPath,
+        ExportFormat format,
+        IReadOnlyList<(string Name, List<AnimationExporter.BoneTrack> Tracks)>? animations = null)
     {
         var combined = BuildCombinedAsset(group, inputRoot);
         AddResolvedMaterialTextureSlots(combined.Mesh, combined.Textures);
@@ -222,9 +258,11 @@ public static class ExtractionService
             group.Assets[0].MeshPath,
             baseColorByName.Keys);
 
+        var remappedAnimations = RemapAnimationsForExport(animations, combined.Skeleton);
+
         if (format == ExportFormat.Glb)
         {
-            GltfWriter.WriteCompleteAssetGlb(combined.Mesh, combined.Skeleton, baseColorByName, outputPath, auxiliaryTextures);
+            GltfWriter.WriteCompleteAssetGlb(combined.Mesh, combined.Skeleton, baseColorByName, outputPath, auxiliaryTextures, remappedAnimations);
         }
         else
         {
@@ -239,7 +277,12 @@ public static class ExtractionService
             throw new InvalidDataException("Combined group has no mesh parts.");
         }
 
+        // Parts are independent; parsing them in parallel (order preserved) keeps large combined
+        // groups (e.g. 45-part MCSM characters) responsive in the preview.
         var parsed = group.Assets
+            .AsParallel()
+            .AsOrdered()
+            .WithDegreeOfParallelism(Math.Max(2, Environment.ProcessorCount - 1))
             .Select(asset =>
             {
                 var mesh = D3DMeshParser.ParseFile(asset.MeshPath);

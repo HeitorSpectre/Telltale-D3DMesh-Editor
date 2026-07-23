@@ -270,6 +270,72 @@ public sealed class MeshPreviewControl : Control
         Invalidate();
     }
 
+    // The skeleton currently shown, so external tools (e.g. the animation player) can map
+    // animation bone CRC64s onto the same bones the preview deforms.
+    public SkeletonData? CurrentSkeleton => _skeleton;
+
+    // Applies one animation frame as a local pose per bone (keyed by bone CRC64).
+    // Absolute mode: translations are in Telltale animation space (unit-length, scaled here by the
+    // bone's rest-position length, mirroring the GLB exporter) and rotations REPLACE the rest pose.
+    // Additive mode (Telltale "_add" animations): values are DELTAS layered on top of the rest pose
+    // — applying them as absolutes would collapse the model onto its bone origins.
+    // Bones not present in the pose keep their rest transform.
+    public void ApplyAnimationLocalPose(
+        IReadOnlyDictionary<ulong, (Vector3? Translation, Quaternion? Rotation)> pose,
+        bool additive = false)
+    {
+        if (_skeleton is null)
+        {
+            return;
+        }
+
+        _boneOffsets.Clear();
+        _boneRotations.Clear();
+        for (var i = 0; i < _skeleton.Bones.Count; i++)
+        {
+            var bone = _skeleton.Bones[i];
+            if (!pose.TryGetValue(bone.Hash, out var local))
+            {
+                continue;
+            }
+
+            if (local.Translation is { } translation)
+            {
+                var restLength = MathF.Sqrt(bone.X * bone.X + bone.Y * bone.Y + bone.Z * bone.Z);
+                if (restLength < 1e-8f)
+                {
+                    restLength = 1f;
+                }
+
+                _boneOffsets[i] = additive
+                    ? new Vector3(translation.X * restLength, translation.Y * restLength, translation.Z * restLength)
+                    : new Vector3(
+                        translation.X * restLength - bone.X,
+                        translation.Y * restLength - bone.Y,
+                        translation.Z * restLength - bone.Z);
+            }
+
+            if (local.Rotation is { } rotation)
+            {
+                if (additive)
+                {
+                    // BuildBoneWorldMatrix composes extraRotation * rest, which is exactly how an
+                    // additive delta layers on top of the rest rotation.
+                    _boneRotations[i] = Quaternion.Normalize(rotation);
+                }
+                else
+                {
+                    var rest = new Quaternion(bone.Qx, bone.Qy, bone.Qz, bone.Qw);
+                    rest = rest.LengthSquared() < 0.000001f ? Quaternion.Identity : Quaternion.Normalize(rest);
+                    // Solve extra so extra * rest equals the animated local rotation.
+                    _boneRotations[i] = Quaternion.Normalize(rotation * Quaternion.Inverse(rest));
+                }
+            }
+        }
+
+        Invalidate();
+    }
+
     public void RotateBoneByHash(ulong hash, Quaternion delta)
     {
         if (_skeleton is null)
@@ -755,8 +821,9 @@ public sealed class MeshPreviewControl : Control
                     var useTextureAlpha = UsesTextureAlpha(_renderMode);
                     var forceOpaqueTextureAlpha = useTextureAlpha && ShouldForceOpaqueTextureAlpha(submesh, textures);
                     var forceDarkAlphaTexture = useTextureAlpha && ShouldForceDarkAlphaTexture(submesh, textures);
+                    var forceGlassAlpha = useTextureAlpha && transparentPass && IsBatmanGlassMaterial(submesh);
                     var alphaCutoutThreshold = useTextureAlpha ? GetAlphaCutoutThreshold(submesh, textures) : 0;
-                    RasterizeTriangle(renderVertices[a], renderVertices[b], renderVertices[c], textures, pixels, depth, probeHits, submeshIndex, width, height, writeDepth, forceOpaqueTextureAlpha, forceDarkAlphaTexture, alphaCutoutThreshold, _renderMode);
+                    RasterizeTriangle(renderVertices[a], renderVertices[b], renderVertices[c], textures, pixels, depth, probeHits, submeshIndex, width, height, writeDepth, forceOpaqueTextureAlpha, forceDarkAlphaTexture, forceGlassAlpha, alphaCutoutThreshold, _renderMode);
                 }
             }
         }
@@ -821,20 +888,54 @@ public sealed class MeshPreviewControl : Control
 
     private static bool IsTransparentPreviewMaterial(SubmeshData submesh, MaterialTextureSet? textures)
     {
-        if (ShouldForceOpaqueTextureAlpha(submesh, textures))
+        if (ShouldForceOpaqueTextureAlpha(submesh, textures) ||
+            ShouldUseAlphaCutoutDepth(submesh, textures))
         {
             return false;
         }
 
         var diffuse = textures?.Diffuse;
         return HasPreviewVertexAlpha(submesh) ||
+               IsBatmanGlassMaterial(submesh) ||
                (diffuse is not null &&
                 (diffuse.AverageAlpha < 0.95f || diffuse.NonOpaqueAlphaRatio > 0.08f));
     }
 
+    // Batman eyeglass lenses (and similar glass) ship an opaque diffuse but should read as transparent.
+    // Detected by the lens/glass naming on the submesh, material or diffuse texture.
+    private static bool IsBatmanGlassMaterial(SubmeshData submesh)
+    {
+        if (GameConfig.Current.Id != GameId.Batman)
+        {
+            return false;
+        }
+
+        // Match "lens" only (not "glasses"): the combined submesh name embeds the part stem, so matching
+        // "glasses" would also turn the opaque frame transparent. The lens diffuse/material carries "lens".
+        static bool Match(string? name) => !string.IsNullOrWhiteSpace(name) &&
+            name.Contains("lens", StringComparison.OrdinalIgnoreCase);
+
+        return Match(submesh.Name) || Match(submesh.MaterialName) ||
+               (submesh.TextureNames.TryGetValue("diffuse", out var d) && Match(d));
+    }
+
     private static bool ShouldForceOpaqueTextureAlpha(SubmeshData submesh, MaterialTextureSet? textures)
     {
-        if (GameConfig.Current.Id != GameId.GameOfThrones || textures?.Diffuse is null)
+        if (textures?.Diffuse is null)
+        {
+            return false;
+        }
+
+        // Batman's newer engine packs a shading term (gloss/scatter) into the diffuse alpha of skin
+        // materials instead of opacity: Bruce Wayne's face and hands average ~0.65 alpha with no fully
+        // opaque pixel anywhere. Treating that as coverage rendered faces and hands see-through. The
+        // check is on content, so genuinely masked materials (hair, lenses) keep their transparency.
+        if (GameConfig.Current.Id == GameId.Batman)
+        {
+            return textures.Diffuse.HasPackedDataAlpha;
+        }
+
+        if (GameConfig.Current.Id != GameId.GameOfThrones)
         {
             return false;
         }
@@ -909,12 +1010,38 @@ public sealed class MeshPreviewControl : Control
 
     private static int GetAlphaCutoutThreshold(SubmeshData submesh, MaterialTextureSet? textures)
     {
+        if (ShouldUseAlphaCutoutDepth(submesh, textures))
+        {
+            return 32;
+        }
+
         if (GameConfig.Current.Id != GameId.GameOfThrones || textures?.Diffuse is null)
         {
             return 0;
         }
 
         return IsGameOfThronesCharacterPreviewMaterial(submesh, textures) && IsHairPreviewMaterial(submesh, textures) ? 96 : 0;
+    }
+
+    private static bool ShouldUseAlphaCutoutDepth(SubmeshData submesh, MaterialTextureSet? textures)
+    {
+        return GameConfig.Current.Id == GameId.WalkingDeadMichonne &&
+               textures?.Diffuse is not null &&
+               IsMichonneCharacterPreviewMaterial(submesh, textures);
+    }
+
+    private static bool IsMichonneCharacterPreviewMaterial(SubmeshData submesh, MaterialTextureSet textures)
+    {
+        return IsMichonneCharacterPreviewName(submesh.Name) ||
+               IsMichonneCharacterPreviewName(submesh.MaterialName) ||
+               submesh.TextureNames.Values.Any(IsMichonneCharacterPreviewName) ||
+               IsMichonneCharacterPreviewName(Path.GetFileNameWithoutExtension(textures.Diffuse?.SourcePath));
+    }
+
+    private static bool IsMichonneCharacterPreviewName(string? name)
+    {
+        var normalized = NormalizeTextureName(name);
+        return normalized.StartsWith("sk", StringComparison.OrdinalIgnoreCase);
     }
 
     private static bool IsHairPreviewMaterial(SubmeshData submesh, MaterialTextureSet textures)
@@ -978,6 +1105,7 @@ public sealed class MeshPreviewControl : Control
         bool writeDepth,
         bool forceOpaqueTextureAlpha,
         bool forceDarkAlphaTexture,
+        bool forceGlassAlpha,
         int alphaCutoutThreshold,
         PreviewRenderMode renderMode)
     {
@@ -1058,7 +1186,8 @@ public sealed class MeshPreviewControl : Control
                     else
                     {
                         var normalBoost = SampleNormalBoost(textures.Normal, u, v);
-                        color = ShadeTexture(textures.Diffuse.Sample(u, v), shade * normalBoost);
+                        var detailBoost = SampleDetailNormalBoost(textures.Detail, detailU, detailV);
+                        color = ShadeTexture(textures.Diffuse.Sample(u, v), shade * normalBoost * detailBoost);
                         color = ApplyDetail(color, textures.Detail, detailU, detailV);
                         color = ApplyBake(color, textures.Bake, bakeU, bakeV);
                         color = ApplyOcclusion(color, textures.Occlusion, u, v);
@@ -1096,19 +1225,30 @@ public sealed class MeshPreviewControl : Control
                         Math.Clamp((int)MathF.Round(debugB * 255f), 0, 255)).ToArgb();
                 }
 
-                if (alphaCutoutThreshold > 0 && ((color >> 24) & 0xFF) < alphaCutoutThreshold)
-                {
-                    continue;
-                }
-
+                // Force-opaque has to win BEFORE the cutout: when the diffuse alpha carries packed data
+                // instead of coverage (Batman skin averages ~0.64 with no fully opaque pixel), the cutout
+                // discards every texel under the threshold and punches micro-holes through the face and
+                // neck. A material whose alpha is not coverage must not be alpha-tested at all.
                 if (forceOpaqueTextureAlpha)
                 {
                     color |= unchecked((int)0xFF000000);
+                }
+                else if (alphaCutoutThreshold > 0 && ((color >> 24) & 0xFF) < alphaCutoutThreshold)
+                {
+                    continue;
                 }
 
                 if (renderMode is PreviewRenderMode.Shaded or PreviewRenderMode.Unlit)
                 {
                     color = ApplyVertexColor(color, vertexColorR, vertexColorG, vertexColorB, vertexColorA);
+                }
+
+                // Glass/lens materials (e.g. Batman's eyeglasses) ship an opaque diffuse; the see-through
+                // look comes from the material, so force a semi-transparent alpha here so the lens blends
+                // over what is behind it instead of reading as a solid disc.
+                if (forceGlassAlpha)
+                {
+                    color = (color & 0x00FFFFFF) | (110 << 24);
                 }
 
                 var pixelAlpha = (color >> 24) & 0xFF;
@@ -3034,7 +3174,11 @@ public sealed class MeshPreviewControl : Control
 
     private static (float U, float V) SelectDetailUv(VertexData vertex)
     {
-        if (GameConfig.Current.Id == GameId.WalkingDeadMichonne)
+        // Batman's "_detail" is authored in the SAME UV layout as the diffuse (compare
+        // sk61_batman_bodyUpper with sk61_batman_bodyUpper_detail: identical islands). The generic path
+        // below prefers UV3, the TWAU-era channel for ink lines, which lands the relief on the wrong
+        // part of the body. Michonne already needs the same exception.
+        if (GameConfig.Current.Id is GameId.WalkingDeadMichonne or GameId.Batman)
         {
             return (vertex.U, vertex.V);
         }
@@ -3214,6 +3358,44 @@ public sealed class MeshPreviewControl : Control
         n = Vector3.Normalize(n);
         // High floor (0.88): the normal map adds subtle relief without darkening skin/clothes too much.
         return Math.Clamp(0.92f + n.Z * 0.18f + n.X * 0.04f + n.Y * 0.04f, 0.88f, 1.12f);
+    }
+
+    // Relief contributed by a two-channel derivative detail map (Batman/GotG "_detail", BC5). Unlike a
+    // normal map it is neutral at ZERO, not at 0.5: R/G store how much the surface tilts at that pixel,
+    // so seams, folds and panel lines sit where the channels rise. Feeding it through the shade term is
+    // what makes that relief visible — those maps carry no colour, so compositing them onto albedo (the
+    // old behaviour) could only paint black smudges.
+    private static float SampleDetailNormalBoost(TextureImage? detail, float u, float v)
+    {
+        // Only a genuine two-channel map carries relief. When the two channels are identical the map is
+        // a coverage mask, and any directional term cancels itself out (0.6d - 0.8d), which is what made
+        // the detail disappear entirely; DetailCompositor multiplies that kind into the albedo instead.
+        if (detail is null || !detail.IsTwoChannelDerivativeMap || detail.HasDuplicatedChannels)
+        {
+            return 1f;
+        }
+
+        var argb = detail.Sample(u, v);
+        // Neutral for these maps is ZERO, not 128: 93% of Bruce Wayne's head detail sits at exactly 0
+        // (flat skin) and only ~7% carries stubble/pores/seams. So the raw channels ARE the tangent-space
+        // gradient, read unsigned.
+        var dx = ((argb >> 16) & 0xFF) / 255f;
+        var dy = ((argb >> 8) & 0xFF) / 255f;
+        if (dx + dy < 0.02f)
+        {
+            return 1f;
+        }
+
+        // Light the gradient instead of just darkening by its magnitude. A surface tilted toward the
+        // light gets brighter and one tilted away gets darker, which is what makes a bump read as raised
+        // rather than as a hole — darkening by magnitude alone inverted every raised seam, and turned the
+        // sparse stubble pixels into hard black dots.
+        // Light arrives from the upper left in UV space, matching the preview's shading direction.
+        const float LightU = -0.6f;
+        const float LightV = 0.8f;
+        var response = -(dx * LightU + dy * LightV);
+
+        return Math.Clamp(1f + response * 0.45f, 0.82f, 1.18f);
     }
 
     // Toon-style line layer in the preview. GLB/GLTF keeps it separate from the diffuse texture.

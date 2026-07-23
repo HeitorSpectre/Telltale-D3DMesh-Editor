@@ -14,8 +14,16 @@ internal static class Program
         // closest match to the Windows UI culture on first run.
         Loc.Initialize(AppPreferences.Load().Language);
 
+        // "--open-archives <paths...>" is used by the elevated relaunch to resume an Open Archive
+        // action inside a protected game folder; consume it before the CLI dispatcher sees it.
+        var launchArchivePaths = GetLaunchArchivePaths(args);
+        if (launchArchivePaths is not null)
+        {
+            args = [];
+        }
+
         var launchMeshPath = GetLaunchMeshPath(args);
-        if (launchMeshPath is null && ReinsertCli.TryRun(args))
+        if (launchMeshPath is null && launchArchivePaths is null && ReinsertCli.TryRun(args))
         {
             return;
         }
@@ -39,7 +47,18 @@ internal static class Program
         };
 
         ApplicationConfiguration.Initialize();
-        Application.Run(new MainForm(launchMeshPath));
+        Application.Run(new MainForm(launchMeshPath) { PendingArchivePaths = launchArchivePaths });
+    }
+
+    private static string[]? GetLaunchArchivePaths(string[] args)
+    {
+        if (args.Length < 2 || !args[0].Equals("--open-archives", StringComparison.OrdinalIgnoreCase))
+        {
+            return null;
+        }
+
+        var paths = args.Skip(1).Where(File.Exists).Select(Path.GetFullPath).ToArray();
+        return paths.Length > 0 ? paths : null;
     }
 
     private static string? GetLaunchMeshPath(string[] args)

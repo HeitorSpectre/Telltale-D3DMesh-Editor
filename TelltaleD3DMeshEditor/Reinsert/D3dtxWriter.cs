@@ -53,6 +53,16 @@ public static class D3dtxWriter
             return BuildLegacyErtmFromTemplate(template, pixels, width, height);
         }
 
+        // MCSM Season 2 textures use a modern T3Texture layout the hand-rolled TtgTexture parser
+        // cannot read; rewrite them through the Telltale Toolkit (verified byte-identical roundtrip).
+        if (Core.GameConfig.Current.Id == Core.GameId.MinecraftStoryModeSeason2 &&
+            template.Length >= 4 &&
+            Encoding.ASCII.GetString(template, 0, 4) is "5VSM" or "6VSM" &&
+            TryBuildModernV45FromTemplate(template, pixels, width, height, forceUncompressed) is { } modernBytes)
+        {
+            return modernBytes;
+        }
+
         var tex = TtgTexture.Parse(template);
         var hasAlpha = HasMeaningfulAlpha(pixels);
         // When uncompressed output is requested, keep an already-uncompressed template format as-is
@@ -61,12 +71,17 @@ public static class D3dtxWriter
         var templateFormat = !allowA8TemplateFormat && tex.TextureFormat == A8Format
             ? (hasAlpha ? Dxt5Format : Dxt1Format)
             : tex.TextureFormat;
+        // MCSM Season 2 reads uncompressed textures as RGBA8; Season 1 (and every other game)
+        // keeps the original ARGB8 behaviour of the "Uncompressed textures" setting.
+        var uncompressedFormat = Core.GameConfig.Current.Id == Core.GameId.MinecraftStoryModeSeason2
+            ? Rgba8Format
+            : Argb8Format;
         var format = forceUncompressed
             ? templateFormat switch
             {
                 Argb8Format or Rgba8Format => templateFormat,
-                A8Format => Argb8Format,
-                _ => Argb8Format,
+                A8Format => uncompressedFormat,
+                _ => uncompressedFormat,
             }
             : templateFormat switch
             {
@@ -92,6 +107,121 @@ public static class D3dtxWriter
         tex.Mips = BuildTtgMipRecords(tex, mipPayloads);
 
         return tex.Write();
+    }
+
+    // ── MCSM Season 2 (modern T3Texture) template rewrite via the Telltale Toolkit ──
+    // The template is deserialized, the pixel payload and dimensions are replaced, and the file is
+    // re-serialized with its original MetaStream parameters. A control rewrite of the unmodified
+    // texture is byte-identical for these files, so no extra patching is needed; the region list
+    // size never changes (payloads live in the async tail).
+
+    private static readonly object ModernV45Gate = new();
+
+    private static byte[]? TryBuildModernV45FromTemplate(
+        byte[] template,
+        int[] pixels,
+        int width,
+        int height,
+        bool forceUncompressed)
+    {
+        try
+        {
+            lock (ModernV45Gate)
+            {
+                if (!TelltaleToolKit.Toolkit.IsInitialized)
+                {
+                    TelltaleToolKit.Toolkit.Initialize(new TelltaleToolKit.Toolkit.Configuration
+                    {
+                        DataFolder = Path.Combine(AppContext.BaseDirectory, "ttk-data"),
+                    });
+                }
+            }
+
+            TelltaleToolKit.Meta.Serialization.MetaStreamParams streamParams;
+            using (var paramStream = new MemoryStream(template))
+            {
+                streamParams = new TelltaleToolKit.Meta.Serialization.Binary.BinaryMetaStreamReader(paramStream).Params;
+            }
+
+            TelltaleToolKit.T3Types.Textures.T3Texture? texture;
+            using (var input = new MemoryStream(template))
+            {
+                texture = TelltaleToolKit.Toolkit.Instance.Deserialize<TelltaleToolKit.T3Types.Textures.T3Texture>(input);
+            }
+
+            if (texture is null || texture.RegionHeaders.Count == 0 ||
+                texture.RegionHeaders.Any(region => region.FaceIndex != 0))
+            {
+                return null; // cubemaps/exotics fall back to the legacy path (which will report clearly)
+            }
+
+            var hasAlpha = HasMeaningfulAlpha(pixels);
+            var templateFormat = texture.SurfaceFormat;
+            // MCSM2 "Uncompressed textures" writes RGBA8; otherwise keep the template codec when we
+            // can encode it, upgrading BC1→BC3 for new alpha; anything else (ASTC etc.) becomes RGBA8.
+            var (surfaceFormat, formatConst) = forceUncompressed
+                ? (TelltaleToolKit.T3Types.Textures.T3Types.T3SurfaceFormat.RGBA8, Rgba8Format)
+                : templateFormat switch
+                {
+                    TelltaleToolKit.T3Types.Textures.T3Types.T3SurfaceFormat.ARGB8 => (templateFormat, Argb8Format),
+                    TelltaleToolKit.T3Types.Textures.T3Types.T3SurfaceFormat.RGBA8 => (templateFormat, Rgba8Format),
+                    TelltaleToolKit.T3Types.Textures.T3Types.T3SurfaceFormat.BC1 when !hasAlpha => (templateFormat, Dxt1Format),
+                    TelltaleToolKit.T3Types.Textures.T3Types.T3SurfaceFormat.BC1 => (TelltaleToolKit.T3Types.Textures.T3Types.T3SurfaceFormat.BC3, Dxt5Format),
+                    TelltaleToolKit.T3Types.Textures.T3Types.T3SurfaceFormat.BC3 => (templateFormat, Dxt5Format),
+                    _ => (TelltaleToolKit.T3Types.Textures.T3Types.T3SurfaceFormat.RGBA8, Rgba8Format),
+                };
+
+            // One payload per region (regions are the mip chain; count must not change because the
+            // sync-section layout depends on the list size).
+            var mipCount = texture.RegionHeaders.Count;
+            var mipPayloads = BuildMipPayloads(pixels, width, height, mipCount, formatConst);
+            while (mipPayloads.Count < mipCount)
+            {
+                mipPayloads.Add(mipPayloads[^1]);
+            }
+
+            var ordered = texture.RegionHeaders.OrderBy(region => region.MipIndex).ToList();
+            for (var i = 0; i < ordered.Count; i++)
+            {
+                var mipWidth = Math.Max(1, width >> i);
+                var mipHeight = Math.Max(1, height >> i);
+                var region = ordered[i];
+                region.RegionData = mipPayloads[i];
+                region.DataSize = mipPayloads[i].Length;
+                region.Pitch = formatConst switch
+                {
+                    Argb8Format or Rgba8Format => mipWidth * 4,
+                    Dxt1Format => Math.Max(1, (mipWidth + 3) / 4) * 8,
+                    _ => Math.Max(1, (mipWidth + 3) / 4) * 16,
+                };
+                region.SlicePitch = mipPayloads[i].Length;
+                if (region.MipCount <= 0)
+                {
+                    region.MipCount = 1;
+                }
+            }
+
+            texture.Width = (uint)width;
+            texture.Height = (uint)height;
+            texture.SurfaceFormat = surfaceFormat;
+            var mainHeader = texture.RegionMainHeader;
+            mainHeader.TotalDataSize = mipPayloads.Take(mipCount).Sum(payload => payload.Length);
+            texture.RegionMainHeader = mainHeader;
+
+            using var output = new MemoryStream();
+            TelltaleToolKit.Toolkit.Instance.Serialize(texture, output, streamParams);
+            var result = output.ToArray();
+
+            // Sanity: the toolkit must be able to read its own output.
+            using var check = new MemoryStream(result);
+            return TelltaleToolKit.Toolkit.Instance.Deserialize<TelltaleToolKit.T3Types.Textures.T3Texture>(check) is null
+                ? null
+                : result;
+        }
+        catch
+        {
+            return null;
+        }
     }
 
     // Back to the Future ("ERTM") textures are a d3dtx header followed by a complete embedded DDS file

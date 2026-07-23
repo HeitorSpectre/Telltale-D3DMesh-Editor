@@ -2118,6 +2118,75 @@ public static class ReinsertTextureService
     public static int DistinctV25TextureCount(GltfModel model)
         => V25MaterialAssignment.DistinctTextureCount(model);
 
+    // MCSM Season 2 (v45): writes the textures the geometry mapping selected — each template
+    // diffuse name receives the image of the primitives assigned to its batch, so mesh and
+    // textures can never disagree. Names without an image keep a copy of the original .d3dtx
+    // (when it can be found) so the output folder previews complete.
+    public static List<string> WriteV45AssignedTextures(
+        IReadOnlyList<V45MeshReinserter.TextureAssignment> assignments,
+        string templateMeshPath,
+        string outputMeshPath,
+        bool forceUncompressed)
+    {
+        var written = new List<string>();
+        var outputFolder = Path.GetDirectoryName(Path.GetFullPath(outputMeshPath)) ?? ".";
+        Directory.CreateDirectory(outputFolder);
+        var meshFolder = Path.GetDirectoryName(Path.GetFullPath(templateMeshPath));
+
+        string? FindTemplateTexture(string diffuseName)
+        {
+            if (string.IsNullOrWhiteSpace(meshFolder))
+            {
+                return null;
+            }
+
+            var fileName = diffuseName.EndsWith(".d3dtx", StringComparison.OrdinalIgnoreCase)
+                ? diffuseName
+                : diffuseName + ".d3dtx";
+            var direct = Path.Combine(meshFolder, fileName);
+            if (File.Exists(direct))
+            {
+                return direct;
+            }
+
+            try
+            {
+                var scanRoot = Path.GetDirectoryName(meshFolder) ?? meshFolder;
+                return Directory.EnumerateFiles(scanRoot, fileName, SearchOption.AllDirectories).FirstOrDefault();
+            }
+            catch
+            {
+                return null;
+            }
+        }
+
+        foreach (var assignment in assignments)
+        {
+            var targetName = assignment.TemplateDiffuse.EndsWith(".d3dtx", StringComparison.OrdinalIgnoreCase)
+                ? Path.GetFileNameWithoutExtension(assignment.TemplateDiffuse)
+                : assignment.TemplateDiffuse;
+            var outputPath = Path.Combine(outputFolder, targetName + ".d3dtx");
+            var templateTexture = FindTemplateTexture(targetName);
+
+            if (assignment.Image is { } image && templateTexture is not null)
+            {
+                D3dtxWriter.WriteFromImageBytes(File.ReadAllBytes(templateTexture), image, outputPath, forceUncompressed);
+                written.Add(targetName);
+            }
+            else if (templateTexture is not null &&
+                     !File.Exists(outputPath) &&
+                     !Path.GetFullPath(templateTexture).Equals(Path.GetFullPath(outputPath), StringComparison.OrdinalIgnoreCase))
+            {
+                // Only seed a texture that nothing has written yet. Several parts can share one
+                // diffuse name (the Lukas head reuses "_hair"), and overwriting here would restore
+                // the template over the image another part already imported.
+                File.Copy(templateTexture, outputPath, overwrite: false);
+            }
+        }
+
+        return written;
+    }
+
     private static ReinsertedTextures ToReinsertedTextures(V25TextureReinserter.Result result)
         => new(result.PrimitiveSlots, result.Written);
 

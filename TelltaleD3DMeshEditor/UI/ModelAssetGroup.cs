@@ -52,6 +52,14 @@ public sealed class ModelAssetGroup
         "glasses",
         "hair",
         "hat",
+        // Batman's suit pieces. Without them sk61_batman_cowl/cape/belt/maskInterior were dropped from
+        // the combined character, which left the cowl off the head: the "head" part is Bruce's face
+        // under a visibility mask that hides all but the mouth, so the model rendered faceless.
+        // "cowl" also gives cowlOff a home, as the two are mutually exclusive variants of one slot.
+        "cowl",
+        "cape",
+        "belt",
+        "maskInterior",
         "holster",
         "revolver",
         "pistol",
@@ -346,6 +354,7 @@ public sealed class ModelAssetGroup
             return BuildWitherStormGroups(skeletonStem, skeletonPath, relativeDirectory, assets).ToList();
         }
 
+
         var parts = assets
             .Select(asset => ClassifyPart(asset, skeletonStem))
             .ToList();
@@ -544,6 +553,7 @@ public sealed class ModelAssetGroup
         // damage/state markers) instead of dropping the slot and leaving the body missing limbs.
         var defaultParts = recognized
             .Where(part => !IsHeadReplacementNeckPart(part))
+            .Where(part => !IsOptionalAccessoryPart(part))
             .GroupBy(part => part.Slot, StringComparer.OrdinalIgnoreCase)
             .Select(PickSlotDefault)
             .ToList();
@@ -1143,6 +1153,7 @@ public sealed class ModelAssetGroup
     {
         var defaultParts = recognized
             .Where(part => !IsHeadReplacementNeckPart(part))
+            .Where(part => !IsOptionalAccessoryPart(part))
             .GroupBy(part => part.Slot, StringComparer.OrdinalIgnoreCase)
             .Select(PickSlotDefault)
             .ToList();
@@ -1328,6 +1339,12 @@ public sealed class ModelAssetGroup
 
     private static bool IsHeadReplacementNeckPart(PartInfo part)
         => IsNeckStumpPart(part) || IsNeckChopPart(part) || IsNeckGoreCapPart(part);
+
+    // Optional accessories that overlay another slot's geometry (e.g. MCSM2 Jack's eyePatch covers
+    // the head's eye). Even when they are a slot's only member they must never become that slot's
+    // default — they surface only through their own exclusive variant group (skeletonStem_eyePatch).
+    private static bool IsOptionalAccessoryPart(PartInfo part)
+        => part.Tail.Equals("eyePatch", StringComparison.OrdinalIgnoreCase);
 
     private static void AddHeadReplacementOverriddenSlots(
         HashSet<string> overriddenSlots,

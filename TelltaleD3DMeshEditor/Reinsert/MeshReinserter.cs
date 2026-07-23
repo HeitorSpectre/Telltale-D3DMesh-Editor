@@ -2,6 +2,13 @@ using System.Buffers.Binary;
 using System.Numerics;
 using TelltaleD3DMeshEditor.Core;
 using TelltaleD3DMeshEditor.Formats.Skeleton;
+using TelltaleD3DMeshEditor.Formats.Mesh;
+using TelltaleToolKit;
+using TelltaleToolKit.Meta.Serialization;
+using TelltaleToolKit.Meta.Serialization.Binary;
+using TelltaleToolKit.T3Types.Mathematics;
+using TelltaleToolKit.T3Types.Meshes;
+using TelltaleToolKit.T3Types.Meshes.T3Types;
 
 namespace TelltaleD3DMeshEditor.Reinsert;
 
@@ -61,6 +68,20 @@ public static class MeshReinserter
 
     public static bool CanAddV25Materials(V25MeshLayout layout)
         => V25MeshReinserter.CanAddMaterials(layout);
+
+    // MCSM Season 2 (.d3dmesh v45): same call shape as the other games; the heavy lifting lives in
+    // V45MeshReinserter below in this file.
+    public static byte[] ReinsertV45Geometry(byte[] templateBytes, GltfModel model)
+        => V45MeshReinserter.Reinsert(templateBytes, model);
+
+    public static V45MeshReinserter.ReinsertResult ReinsertV45GeometryWithAssignments(
+        byte[] templateBytes,
+        GltfModel model,
+        IReadOnlyList<string?> batchTemplateDiffuse)
+        => V45MeshReinserter.ReinsertWithAssignments(templateBytes, model, batchTemplateDiffuse);
+
+    public static byte[] BuildInvisibleV45MeshBytes(string meshPath)
+        => V45MeshReinserter.BuildInvisible(File.ReadAllBytes(meshPath));
 
     public static V25MeshLayout? TryFindV25SourceMaterialLayout(
         GltfModel model,
@@ -3320,4 +3341,1175 @@ public static class V25MeshReinserter
 
         return binormals;
     }
+}
+
+// Minecraft: Story Mode Season 2 (.d3dmesh v45) reinserter.
+//
+// Strategy: the Telltale Toolkit re-serializes a v45 mesh byte-identical EXCEPT for a few
+// material metadata spans it recomputes (verified: same size, ~117 bytes per material differ).
+// So the writer is: deserialize the template, rebuild the LOD0 GFX vertex/index buffers from the
+// GLB (using the template's own attribute layout and formats), update counts and bounds, let the
+// toolkit serialize the result, then copy the template's bytes back over the serializer-noise
+// spans (their offsets are stable because no list sizes change — only fixed-size numeric fields
+// and the async buffer payload at the tail).
+public static class V45MeshReinserter
+{
+    public sealed record TextureAssignment(string TemplateDiffuse, GltfImage? Image);
+
+    public sealed record ReinsertResult(byte[] MeshBytes, IReadOnlyList<TextureAssignment> Textures);
+
+    public static byte[] Reinsert(byte[] templateBytes, GltfModel model)
+        => ReinsertWithAssignments(templateBytes, model, batchTemplateDiffuse: null).MeshBytes;
+
+    public static ReinsertResult ReinsertWithAssignments(
+        byte[] templateBytes,
+        GltfModel model,
+        IReadOnlyList<string?>? batchTemplateDiffuse)
+    {
+        var mesh = TelltaleToolkitMeshParser.ParseModernMeshRaw(
+            templateBytes, Core.GameConfig.MinecraftStoryModeSeason2.ModernTextureToolkitGameName)
+            ?? throw new InvalidDataException("The Telltale Toolkit could not read the v45 template mesh.");
+        var meshData = mesh.MeshData ?? throw new InvalidDataException("v45 template has no T3MeshData.");
+        if (meshData.LODs is not { Count: > 0 } || meshData.VertexStates is not { Count: > 0 })
+        {
+            throw new InvalidDataException("v45 template has no LODs/vertex states.");
+        }
+
+        MetaStreamParams streamParams;
+        using (var paramStream = new MemoryStream(templateBytes))
+        {
+            streamParams = new BinaryMetaStreamReader(paramStream).Params;
+        }
+
+        // Serializer-noise spans: re-serialize the UNMODIFIED mesh and diff against the template.
+        var noiseRegions = ComputeNoiseRegions(templateBytes, mesh, streamParams);
+
+        var lod = meshData.LODs[0];
+        var vertexState = meshData.VertexStates[(int)Math.Min(lod.VertexStateIndex, (uint)(meshData.VertexStates.Count - 1))];
+        var templateBatches = lod.Batches is { Count: > 0 } ? lod.Batches : lod.Batches1;
+        if (templateBatches is not { Count: > 0 })
+        {
+            throw new InvalidDataException("v45 template LOD0 has no batches.");
+        }
+
+        var (batchGroups, textureAssignments) =
+            GroupPrimitivesForBatches(model, templateBatches, meshData, batchTemplateDiffuse);
+
+        // ── Build the new global vertex pool (batches index a shared pool) ──
+        // Identical vertices are WELDED across primitives: the extractor duplicates the shared
+        // pool per batch on export (overlapping MinVert..MaxVert ranges), so concatenating without
+        // welding would inflate the count on every round-trip (and overflow 16-bit indices on
+        // large environment meshes).
+        var poolList = new List<PoolVertex>();
+        var weldMap = new Dictionary<PoolVertex, int>();
+        var globalIndices = new List<int>();
+        var boneIndexByCrc = BuildBoneIndexMap(meshData);
+        var totalTris = 0;
+
+        for (var b = 0; b < templateBatches.Count; b++)
+        {
+            var batchMin = int.MaxValue;
+            var batchMax = 0;
+            var batchPoolIndices = new List<int>();
+            var startIndex = globalIndices.Count;
+
+            // A batch can receive SEVERAL GLB primitives (e.g. arms + torso merged into a body
+            // part); they are concatenated into one draw range.
+            foreach (var primitive in batchGroups[b])
+            {
+                var tangents = primitive.Tangents ?? ComputeTangents(primitive);
+                var localToPool = new int[primitive.VertexCount];
+                for (var v = 0; v < primitive.VertexCount; v++)
+                {
+                    var vertex = BuildPoolVertex(primitive, tangents, v, model, boneIndexByCrc);
+                    if (!weldMap.TryGetValue(vertex, out var poolIndex))
+                    {
+                        poolIndex = poolList.Count;
+                        poolList.Add(vertex);
+                        weldMap[vertex] = poolIndex;
+                    }
+
+                    localToPool[v] = poolIndex;
+                    batchPoolIndices.Add(poolIndex);
+                    batchMin = Math.Min(batchMin, poolIndex);
+                    batchMax = Math.Max(batchMax, poolIndex);
+                }
+
+                for (var i = 0; i + 2 < primitive.Indices.Length; i += 3)
+                {
+                    globalIndices.Add(localToPool[primitive.Indices[i]]);
+                    globalIndices.Add(localToPool[primitive.Indices[i + 1]]);
+                    globalIndices.Add(localToPool[primitive.Indices[i + 2]]);
+                }
+            }
+
+            var triCount = (globalIndices.Count - startIndex) / 3;
+            totalTris += triCount;
+
+            var batch = templateBatches[b];
+            batch.MinVertIndex = (uint)(batchMin == int.MaxValue ? 0 : batchMin);
+            batch.MaxVertIndex = (uint)batchMax;
+            batch.BaseIndex = 0;
+            batch.StartIndex = (uint)startIndex;
+            batch.NumPrimitives = (uint)triCount;
+            batch.NumIndices = (uint)(triCount * 3);
+            var (box, sphere) = ComputeBoundsFromIndices(poolList, batchPoolIndices.ToArray());
+            batch.BoundingBox = box;
+            batch.BoundingSphere = sphere;
+        }
+
+        var pool = poolList.ToArray();
+
+        // Shadow batches (mBatches[1]): one covering batch is the common case; otherwise mirror the
+        // default batches one-to-one.
+        var shadowTris = 0;
+        if (lod.Batches2 is { Count: > 0 })
+        {
+            if (lod.Batches2.Count == 1)
+            {
+                var shadow = lod.Batches2[0];
+                shadow.MinVertIndex = 0;
+                shadow.MaxVertIndex = (uint)Math.Max(0, pool.Length - 1);
+                shadow.BaseIndex = 0;
+                shadow.StartIndex = 0;
+                shadow.NumPrimitives = (uint)totalTris;
+                shadow.NumIndices = (uint)(totalTris * 3);
+                var (box, sphere) = ComputeBounds(pool, 0, pool.Length);
+                shadow.BoundingBox = box;
+                shadow.BoundingSphere = sphere;
+                shadowTris = totalTris;
+            }
+            else
+            {
+                for (var b = 0; b < lod.Batches2.Count && b < templateBatches.Count; b++)
+                {
+                    CopyBatchGeometry(templateBatches[b], lod.Batches2[b]);
+                    shadowTris += (int)lod.Batches2[b].NumPrimitives;
+                }
+            }
+        }
+
+        // ── Encode the GFX buffers using the template's attribute layout ──
+        EncodeVertexBuffers(vertexState, meshData, pool);
+        EncodeIndexBuffers(vertexState, globalIndices, pool.Length);
+
+        // ── Counts and bounds ──
+        var (meshBox, meshSphere) = ComputeBounds(pool, 0, pool.Length);
+        meshData.VertexCount = (uint)pool.Length;
+        meshData.BoundingBox = meshBox;
+        meshData.BoundingSphere = meshSphere;
+        lod.BoundingBox = meshBox;
+        lod.BoundingSphere = meshSphere;
+        lod.NumPrimitives = (uint)(totalTris + shadowTris);
+        if (lod.VertexCount != 0)
+        {
+            lod.VertexCount = (uint)pool.Length;
+        }
+
+        // ── Serialize + noise patchback ──
+        byte[] output;
+        using (var outputStream = new MemoryStream())
+        {
+            Toolkit.Instance.Serialize(mesh, outputStream, streamParams);
+            output = outputStream.ToArray();
+        }
+
+        var syncLimit = Math.Min(AsyncSectionStart(templateBytes), AsyncSectionStart(output));
+        foreach (var (start, length) in noiseRegions)
+        {
+            if (start + length <= syncLimit && start + length <= output.Length)
+            {
+                Array.Copy(templateBytes, start, output, start, length);
+            }
+        }
+
+        // Sanity: the produced file must parse back.
+        var check = TelltaleToolkitMeshParser.ParseModernMeshRaw(
+            output, Core.GameConfig.MinecraftStoryModeSeason2.ModernTextureToolkitGameName);
+        if (check?.MeshData is null)
+        {
+            throw new InvalidDataException("v45 reinsertion produced a file the toolkit cannot read back.");
+        }
+
+        return new ReinsertResult(output, textureAssignments);
+    }
+
+    // Makes an unassigned combined part invisible: the template keeps its buffers untouched but
+    // every batch draws zero triangles. Empty GFX buffers break the toolkit's reader, so counts —
+    // not payloads — are what get zeroed.
+    public static byte[] BuildInvisible(byte[] templateBytes)
+    {
+        var mesh = TelltaleToolkitMeshParser.ParseModernMeshRaw(
+            templateBytes, Core.GameConfig.MinecraftStoryModeSeason2.ModernTextureToolkitGameName)
+            ?? throw new InvalidDataException("The Telltale Toolkit could not read the v45 template mesh.");
+        var meshData = mesh.MeshData ?? throw new InvalidDataException("v45 template has no T3MeshData.");
+
+        MetaStreamParams streamParams;
+        using (var paramStream = new MemoryStream(templateBytes))
+        {
+            streamParams = new BinaryMetaStreamReader(paramStream).Params;
+        }
+
+        var noiseRegions = ComputeNoiseRegions(templateBytes, mesh, streamParams);
+
+        foreach (var lod in meshData.LODs ?? [])
+        {
+            foreach (var batchList in new[] { lod.Batches, lod.Batches1, lod.Batches2 })
+            {
+                foreach (var batch in batchList ?? [])
+                {
+                    batch.NumPrimitives = 0;
+                    batch.NumIndices = 0;
+                }
+            }
+
+            lod.NumPrimitives = 0;
+        }
+
+        byte[] output;
+        using (var outputStream = new MemoryStream())
+        {
+            Toolkit.Instance.Serialize(mesh, outputStream, streamParams);
+            output = outputStream.ToArray();
+        }
+
+        var syncLimit = Math.Min(AsyncSectionStart(templateBytes), AsyncSectionStart(output));
+        foreach (var (start, length) in noiseRegions)
+        {
+            if (start + length <= syncLimit && start + length <= output.Length)
+            {
+                Array.Copy(templateBytes, start, output, start, length);
+            }
+        }
+
+        return output;
+    }
+
+    // ── Primitive mapping ──
+    // Distributes the GLB primitives over the template batches (a batch may receive several
+    // primitives, merged into one draw range) and derives the texture that each template diffuse
+    // name should carry — so geometry and texture always share the SAME mapping.
+    private static (List<List<GltfPrimitive>> Groups, List<TextureAssignment> Textures) GroupPrimitivesForBatches(
+        GltfModel model,
+        List<T3MeshBatch> templateBatches,
+        T3MeshData meshData,
+        IReadOnlyList<string?>? batchTemplateDiffuse)
+    {
+        var candidates = model.Primitives;
+        if (candidates.Count == 0)
+        {
+            throw new InvalidDataException("The GLB has no primitives.");
+        }
+
+        var batchCount = templateBatches.Count;
+        var groups = new List<List<GltfPrimitive>>(batchCount);
+        for (var b = 0; b < batchCount; b++)
+        {
+            groups.Add([]);
+        }
+
+        // Round-trip identity: every primitive carries the template submesh it came from and no two
+        // primitives claim the SAME submesh. Batches with no primitive simply end up empty (the
+        // extractor skips empty submeshes, so a scene mesh can legitimately return fewer).
+        // Repeated indices mean the value is not identity information (single-asset exports emit
+        // index 0 for every glTF mesh) — those fall through to the diffuse grouping below.
+        var sourceIndices = candidates
+            .Select(primitive => primitive.SourceSubmeshIndex)
+            .ToList();
+        var identityCovered = candidates.Count > 0 &&
+            sourceIndices.All(index => index is { } value && value >= 0 && value < batchCount) &&
+            sourceIndices.Select(index => index!.Value).Distinct().Count() == candidates.Count;
+        if (identityCovered)
+        {
+            foreach (var primitive in candidates)
+            {
+                groups[primitive.SourceSubmeshIndex!.Value].Add(primitive);
+            }
+
+            return (groups, BuildTextureAssignments(groups, batchTemplateDiffuse, batchCount));
+        }
+
+        // Foreign model: group primitives by their diffuse texture and pair each group with a
+        // template batch. Pairing prefers a shared name token (skin↔skinA, clothes↔clothesB,
+        // hair↔hairA...), then falls back to first-appearance order; leftover groups merge into
+        // the first (main) batch so no geometry is ever dropped.
+        static string PrimitiveDiffuseKey(GltfPrimitive primitive) =>
+            primitive.BaseColor?.Name ?? primitive.MaterialName ?? "";
+
+        var primitiveGroups = new List<(string Key, List<GltfPrimitive> Primitives)>();
+        var groupIndexByKey = new Dictionary<string, int>(StringComparer.OrdinalIgnoreCase);
+        foreach (var primitive in candidates)
+        {
+            var key = PrimitiveDiffuseKey(primitive);
+            if (!groupIndexByKey.TryGetValue(key, out var index))
+            {
+                index = primitiveGroups.Count;
+                groupIndexByKey[key] = index;
+                primitiveGroups.Add((key, []));
+            }
+
+            primitiveGroups[index].Primitives.Add(primitive);
+        }
+
+        // Distinct template diffuse identities in batch (first-appearance) order. When the caller
+        // supplied resolved names, use them; otherwise fall back to the material handle CRC so the
+        // order-based pairing still works.
+        var slotNames = new List<string>();
+        var batchSlotIndex = new int[batchCount];
+        var slotIndexByName = new Dictionary<string, int>(StringComparer.OrdinalIgnoreCase);
+        for (var b = 0; b < batchCount; b++)
+        {
+            var name = batchTemplateDiffuse is not null && b < batchTemplateDiffuse.Count
+                ? batchTemplateDiffuse[b]
+                : null;
+            name ??= meshData.Materials is { } materials &&
+                     templateBatches[b].MaterialIndex >= 0 && templateBatches[b].MaterialIndex < materials.Count
+                ? $"0x{materials[templateBatches[b].MaterialIndex].Material?.ObjectInfo?.ObjectName?.Crc64 ?? (ulong)b:X16}"
+                : $"slot_{b}";
+            if (!slotIndexByName.TryGetValue(name, out var slotIndex))
+            {
+                slotIndex = slotNames.Count;
+                slotIndexByName[name] = slotIndex;
+                slotNames.Add(name);
+            }
+
+            batchSlotIndex[b] = slotIndex;
+        }
+
+        // Pair GLB groups to slots: token similarity first, then order among the unpaired.
+        var groupForSlot = new int[slotNames.Count];
+        Array.Fill(groupForSlot, -1);
+        var groupTaken = new bool[primitiveGroups.Count];
+        for (var s = 0; s < slotNames.Count; s++)
+        {
+            var best = -1;
+            var bestScore = 0;
+            for (var g = 0; g < primitiveGroups.Count; g++)
+            {
+                if (groupTaken[g])
+                {
+                    continue;
+                }
+
+                var score = TextureNameTokenScore(slotNames[s], primitiveGroups[g].Key);
+                if (score > bestScore)
+                {
+                    bestScore = score;
+                    best = g;
+                }
+            }
+
+            if (best >= 0)
+            {
+                groupForSlot[s] = best;
+                groupTaken[best] = true;
+            }
+        }
+
+        for (var s = 0; s < slotNames.Count; s++)
+        {
+            if (groupForSlot[s] >= 0)
+            {
+                continue;
+            }
+
+            for (var g = 0; g < primitiveGroups.Count; g++)
+            {
+                if (!groupTaken[g])
+                {
+                    groupForSlot[s] = g;
+                    groupTaken[g] = true;
+                    break;
+                }
+            }
+        }
+
+        // First batch per slot receives the paired group; duplicate-slot batches stay empty.
+        var slotAssignedToBatch = new bool[slotNames.Count];
+        for (var b = 0; b < batchCount; b++)
+        {
+            var slot = batchSlotIndex[b];
+            if (slotAssignedToBatch[slot] || groupForSlot[slot] < 0)
+            {
+                continue;
+            }
+
+            slotAssignedToBatch[slot] = true;
+            groups[b].AddRange(primitiveGroups[groupForSlot[slot]].Primitives);
+        }
+
+        // Leftover groups (more textures than slots — should be rare with the auto-atlas) merge
+        // into the first non-empty batch so their geometry still renders.
+        var fallbackBatch = groups.FindIndex(group => group.Count > 0);
+        if (fallbackBatch < 0)
+        {
+            fallbackBatch = 0;
+        }
+
+        for (var g = 0; g < primitiveGroups.Count; g++)
+        {
+            if (!groupTaken[g])
+            {
+                groups[fallbackBatch].AddRange(primitiveGroups[g].Primitives);
+            }
+        }
+
+        return (groups, BuildTextureAssignments(groups, batchTemplateDiffuse, batchCount));
+    }
+
+    // Shared trailing-token similarity: "skM1_lukas100_clothes" vs "jesseFemale_clothesA" share the
+    // token "clothes". Compares the alphabetic tokens of both names and scores the longest match.
+    private static int TextureNameTokenScore(string templateName, string glbName)
+    {
+        static List<string> Tokens(string name) =>
+            name.Split(['_', '.', ' '], StringSplitOptions.RemoveEmptyEntries)
+                .Select(piece => new string(piece.TakeWhile(char.IsLetter).ToArray()))
+                .Where(token => token.Length >= 3)
+                .Select(token => token.ToLowerInvariant())
+                .ToList();
+
+        var templateTokens = Tokens(templateName);
+        var glbTokens = Tokens(glbName);
+        var best = 0;
+        foreach (var templateToken in templateTokens)
+        {
+            foreach (var glbToken in glbTokens)
+            {
+                if (templateToken == glbToken ||
+                    templateToken.StartsWith(glbToken, StringComparison.Ordinal) ||
+                    glbToken.StartsWith(templateToken, StringComparison.Ordinal))
+                {
+                    best = Math.Max(best, Math.Min(templateToken.Length, glbToken.Length));
+                }
+            }
+        }
+
+        return best;
+    }
+
+    // For each template diffuse name (when resolved), the texture image is the one carried by the
+    // first primitive assigned to a batch using that name.
+    private static List<TextureAssignment> BuildTextureAssignments(
+        List<List<GltfPrimitive>> groups,
+        IReadOnlyList<string?>? batchTemplateDiffuse,
+        int batchCount)
+    {
+        var result = new List<TextureAssignment>();
+        if (batchTemplateDiffuse is null)
+        {
+            return result;
+        }
+
+        var seen = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        for (var b = 0; b < batchCount && b < batchTemplateDiffuse.Count; b++)
+        {
+            var name = batchTemplateDiffuse[b];
+            if (string.IsNullOrWhiteSpace(name) || !seen.Add(name))
+            {
+                continue;
+            }
+
+            var image = groups[b]
+                .Select(primitive => primitive.BaseColor)
+                .FirstOrDefault(baseColor => baseColor is not null);
+            result.Add(new TextureAssignment(name, image));
+        }
+
+        return result;
+    }
+
+    // ── Vertex pool ──
+
+    private struct PoolVertex : IEquatable<PoolVertex>
+    {
+        public Vector3 Position;
+        public Vector3 Normal;
+        public Vector4 Tangent;
+        public Vector2 Uv0, Uv1, Uv2, Uv3, Uv4, Uv5;
+        public Vector4 Color;
+        public int B0, B1, B2, B3;
+        public float W0, W1, W2, W3;
+
+        // Tangents are DERIVED per-primitive data and drift between the duplicated copies of a
+        // shared vertex, so they are deliberately excluded from the weld identity (first one wins).
+        public readonly bool Equals(PoolVertex other) =>
+            Position == other.Position && Normal == other.Normal &&
+            Uv0 == other.Uv0 && Uv1 == other.Uv1 && Uv2 == other.Uv2 && Uv3 == other.Uv3 &&
+            Uv4 == other.Uv4 && Uv5 == other.Uv5 &&
+            Color == other.Color &&
+            B0 == other.B0 && B1 == other.B1 && B2 == other.B2 && B3 == other.B3 &&
+            W0 == other.W0 && W1 == other.W1 && W2 == other.W2 && W3 == other.W3;
+
+        public override readonly bool Equals(object? obj) => obj is PoolVertex other && Equals(other);
+
+        public override readonly int GetHashCode() =>
+            HashCode.Combine(Position, Normal, Uv0, HashCode.Combine(B0, B1, B2, B3, W0, W1));
+    }
+
+    private static (BoundingBox Box, Sphere Sphere) ComputeBoundsFromIndices(List<PoolVertex> pool, int[] poolIndices)
+    {
+        if (poolIndices.Length == 0)
+        {
+            return (new BoundingBox { Min = Vector3.Zero, Max = Vector3.Zero }, new Sphere { Center = Vector3.Zero, Radius = 0f });
+        }
+
+        var min = new Vector3(float.MaxValue);
+        var max = new Vector3(float.MinValue);
+        foreach (var index in poolIndices)
+        {
+            min = Vector3.Min(min, pool[index].Position);
+            max = Vector3.Max(max, pool[index].Position);
+        }
+
+        var center = (min + max) * 0.5f;
+        var radius = 0f;
+        foreach (var index in poolIndices)
+        {
+            radius = MathF.Max(radius, Vector3.Distance(center, pool[index].Position));
+        }
+
+        return (new BoundingBox { Min = min, Max = max }, new Sphere { Center = center, Radius = radius });
+    }
+
+    private static PoolVertex BuildPoolVertex(
+        GltfPrimitive primitive,
+        Vector4[] tangents,
+        int v,
+        GltfModel model,
+        IReadOnlyDictionary<ulong, int> boneIndexByCrc)
+    {
+        var vertex = new PoolVertex
+        {
+            Position = primitive.Positions[v],
+            Normal = primitive.Normals is { } normals && v < normals.Length ? SafeNormalize(normals[v]) : new Vector3(0, 1, 0),
+            Tangent = v < tangents.Length ? tangents[v] : new Vector4(1, 0, 0, 1),
+            Uv0 = UvOrDefault(primitive.Uv0, v),
+            Uv1 = UvOrDefault(primitive.Uv1, v),
+            Uv2 = UvOrDefault(primitive.Uv2, v),
+            Uv3 = UvOrDefault(primitive.Uv3, v),
+            Uv4 = UvOrDefault(primitive.Uv4, v),
+            Uv5 = UvOrDefault(primitive.Uv5, v),
+            Color = primitive.Color0 is { } colors && v < colors.Length ? colors[v] : new Vector4(1, 1, 1, 1),
+            W0 = 1f,
+        };
+
+        if (primitive.Joints0 is { } joints && primitive.Weights0 is { } weights &&
+            v * 4 + 3 < joints.Length && v < weights.Length)
+        {
+            int MapJoint(int skinJoint)
+            {
+                if (skinJoint < 0 || skinJoint >= model.Joints.Count)
+                {
+                    return 0;
+                }
+
+                var hash = model.Joints[skinJoint].Hash;
+                if (hash is not { } crc)
+                {
+                    return 0;
+                }
+
+                if (boneIndexByCrc.TryGetValue(crc, out var boneIndex))
+                {
+                    return boneIndex;
+                }
+
+                // The bone is absent from THIS part's bone list (e.g. brow_L on a hair part that
+                // only carries Head). Walk up the imported skeleton until an ancestor exists, so
+                // the geometry follows the nearest real parent instead of collapsing onto index 0.
+                var skeleton = model.Skeleton;
+                if (skeleton is not null)
+                {
+                    var current = skeleton.Bones.FindIndex(bone => bone.Hash == crc);
+                    var guard = 0;
+                    while (current >= 0 && current < skeleton.Bones.Count && guard++ < 64)
+                    {
+                        var parentIndex = skeleton.Bones[current].ParentIndex;
+                        if (parentIndex < 0 || parentIndex >= skeleton.Bones.Count)
+                        {
+                            break;
+                        }
+
+                        if (boneIndexByCrc.TryGetValue(skeleton.Bones[parentIndex].Hash, out var parentBone))
+                        {
+                            return parentBone;
+                        }
+
+                        current = parentIndex;
+                    }
+                }
+
+                return 0;
+            }
+
+            vertex.B0 = MapJoint(joints[v * 4]);
+            vertex.B1 = MapJoint(joints[v * 4 + 1]);
+            vertex.B2 = MapJoint(joints[v * 4 + 2]);
+            vertex.B3 = MapJoint(joints[v * 4 + 3]);
+            var w = weights[v];
+            var sum = w.X + w.Y + w.Z + w.W;
+            if (sum <= 0f)
+            {
+                w = new Vector4(1, 0, 0, 0);
+                sum = 1f;
+            }
+
+            vertex.W0 = w.X / sum;
+            vertex.W1 = w.Y / sum;
+            vertex.W2 = w.Z / sum;
+            vertex.W3 = w.W / sum;
+        }
+
+        return vertex;
+    }
+
+    private static Dictionary<ulong, int> BuildBoneIndexMap(T3MeshData meshData)
+    {
+        var map = new Dictionary<ulong, int>();
+        if (meshData.Bones is null)
+        {
+            return map;
+        }
+
+        for (var i = 0; i < meshData.Bones.Count; i++)
+        {
+            var symbol = meshData.Bones[i].BoneName;
+            if (symbol is not null && !symbol.IsEmpty)
+            {
+                map.TryAdd(symbol.Crc64, i);
+            }
+        }
+
+        return map;
+    }
+
+    private static Vector2 UvOrDefault(Vector2[]? uvs, int v)
+        => uvs is not null && v < uvs.Length ? uvs[v] : Vector2.Zero;
+
+    private static Vector3 SafeNormalize(Vector3 value)
+    {
+        var length = value.Length();
+        return length > 1e-8f ? value / length : new Vector3(0, 1, 0);
+    }
+
+    // Standard per-triangle tangent accumulation over uv0 (Blender usually strips tangents).
+    private static Vector4[] ComputeTangents(GltfPrimitive primitive)
+    {
+        var count = primitive.VertexCount;
+        var accumulated = new Vector3[count];
+        if (primitive.Uv0 is { } uvs && primitive.Normals is { } normals)
+        {
+            for (var i = 0; i + 2 < primitive.Indices.Length; i += 3)
+            {
+                int a = primitive.Indices[i], b = primitive.Indices[i + 1], c = primitive.Indices[i + 2];
+                if (a >= count || b >= count || c >= count ||
+                    a >= uvs.Length || b >= uvs.Length || c >= uvs.Length)
+                {
+                    continue;
+                }
+
+                var edge1 = primitive.Positions[b] - primitive.Positions[a];
+                var edge2 = primitive.Positions[c] - primitive.Positions[a];
+                var deltaUv1 = uvs[b] - uvs[a];
+                var deltaUv2 = uvs[c] - uvs[a];
+                var det = deltaUv1.X * deltaUv2.Y - deltaUv2.X * deltaUv1.Y;
+                if (MathF.Abs(det) < 1e-10f)
+                {
+                    continue;
+                }
+
+                var r = 1f / det;
+                var tangent = (edge1 * deltaUv2.Y - edge2 * deltaUv1.Y) * r;
+                accumulated[a] += tangent;
+                accumulated[b] += tangent;
+                accumulated[c] += tangent;
+            }
+        }
+
+        var result = new Vector4[count];
+        for (var v = 0; v < count; v++)
+        {
+            var tangent = accumulated[v];
+            if (tangent.LengthSquared() < 1e-10f)
+            {
+                result[v] = new Vector4(1, 0, 0, 1);
+                continue;
+            }
+
+            tangent = Vector3.Normalize(tangent);
+            if (primitive.Normals is { } normals2 && v < normals2.Length)
+            {
+                // Gram-Schmidt against the normal.
+                var normal = SafeNormalize(normals2[v]);
+                tangent -= normal * Vector3.Dot(normal, tangent);
+                if (tangent.LengthSquared() < 1e-10f)
+                {
+                    result[v] = new Vector4(1, 0, 0, 1);
+                    continue;
+                }
+
+                tangent = Vector3.Normalize(tangent);
+            }
+
+            result[v] = new Vector4(tangent, 1f);
+        }
+
+        return result;
+    }
+
+    // ── Buffer encoding ──
+
+    private static void EncodeVertexBuffers(T3GFXVertexState vertexState, T3MeshData meshData, PoolVertex[] pool)
+    {
+        if (vertexState.VertexBuffer is null || vertexState.Attributes is null)
+        {
+            throw new InvalidDataException("v45 template vertex state has no buffers/attributes.");
+        }
+
+        // Refit each used TexCoordTransform to the incoming UV range. Normalized UV formats
+        // (UN16x2/SN16x2) can only store raw values in [0,1]; foreign models (or edits) whose final
+        // UVs fall outside the template's scale/offset window would clamp and distort. The transform
+        // is plain per-channel scale/offset data, so it is rewritten to exactly cover the new range
+        // (a same-model round-trip reproduces the original window within float precision).
+        FitTexCoordTransforms(vertexState, meshData, pool);
+
+        // Fresh zeroed buffers with the template strides.
+        var newBuffers = new byte[vertexState.VertexBuffer.Count][];
+        for (var b = 0; b < vertexState.VertexBuffer.Count; b++)
+        {
+            newBuffers[b] = new byte[pool.Length * (int)vertexState.VertexBuffer[b].Stride];
+        }
+
+        foreach (var attr in vertexState.Attributes)
+        {
+            var bufferIndex = (int)attr.BufferIndex;
+            if (bufferIndex < 0 || bufferIndex >= newBuffers.Length)
+            {
+                continue;
+            }
+
+            var stride = (int)vertexState.VertexBuffer[bufferIndex].Stride;
+            var target = newBuffers[bufferIndex];
+            for (var v = 0; v < pool.Length; v++)
+            {
+                EncodeAttribute(target, v * stride + (int)attr.BufferOffset, attr, pool[v], meshData);
+            }
+        }
+
+        for (var b = 0; b < vertexState.VertexBuffer.Count; b++)
+        {
+            vertexState.VertexBuffer[b].Buffer = newBuffers[b];
+            vertexState.VertexBuffer[b].Count = (uint)pool.Length;
+        }
+    }
+
+    private static void EncodeAttribute(byte[] target, int offset, GFXPlatformAttributeParams attr, in PoolVertex vertex, T3MeshData meshData)
+    {
+        switch (attr.Attribute)
+        {
+            case GFXPlatformVertexAttribute.Position:
+                RequireFormat(attr, GFXPlatformFormat.F32x3);
+                WriteF32(target, offset, vertex.Position.X, vertex.Position.Y, vertex.Position.Z);
+                break;
+
+            case GFXPlatformVertexAttribute.Normal:
+                EncodeSnormVector(target, offset, attr, vertex.Normal, 0f);
+                break;
+
+            case GFXPlatformVertexAttribute.Tangent:
+                EncodeSnormVector(target, offset, attr,
+                    new Vector3(vertex.Tangent.X, vertex.Tangent.Y, vertex.Tangent.Z), vertex.Tangent.W);
+                break;
+
+            case GFXPlatformVertexAttribute.BlendWeight:
+                EncodeWeights(target, offset, attr, vertex);
+                break;
+
+            case GFXPlatformVertexAttribute.BlendIndex:
+                switch (attr.Format)
+                {
+                    case GFXPlatformFormat.U8x4:
+                        target[offset] = ClampByte(vertex.B0);
+                        target[offset + 1] = ClampByte(vertex.B1);
+                        target[offset + 2] = ClampByte(vertex.B2);
+                        target[offset + 3] = ClampByte(vertex.B3);
+                        break;
+                    // UN8x4 stores the bone index times 3 (the reader divides by 3); writing the
+                    // raw index would make every vertex resolve to a different bone.
+                    case GFXPlatformFormat.UN8x4:
+                        target[offset] = ClampByte(vertex.B0 * 3);
+                        target[offset + 1] = ClampByte(vertex.B1 * 3);
+                        target[offset + 2] = ClampByte(vertex.B2 * 3);
+                        target[offset + 3] = ClampByte(vertex.B3 * 3);
+                        break;
+                    case GFXPlatformFormat.U16x4:
+                        WriteU16(target, offset, (ushort)Math.Clamp(vertex.B0, 0, ushort.MaxValue));
+                        WriteU16(target, offset + 2, (ushort)Math.Clamp(vertex.B1, 0, ushort.MaxValue));
+                        WriteU16(target, offset + 4, (ushort)Math.Clamp(vertex.B2, 0, ushort.MaxValue));
+                        WriteU16(target, offset + 6, (ushort)Math.Clamp(vertex.B3, 0, ushort.MaxValue));
+                        break;
+                    default:
+                        throw Unsupported(attr);
+                }
+                break;
+
+            case GFXPlatformVertexAttribute.TexCoord:
+                EncodeUv(target, offset, attr, GetUvChannel(vertex, (int)attr.AttributeIndex), meshData);
+                break;
+
+            case GFXPlatformVertexAttribute.Color:
+                switch (attr.Format)
+                {
+                    case GFXPlatformFormat.UN8x4 or GFXPlatformFormat.D3DCOLOR:
+                        target[offset] = UnormByte(vertex.Color.X);
+                        target[offset + 1] = UnormByte(vertex.Color.Y);
+                        target[offset + 2] = UnormByte(vertex.Color.Z);
+                        target[offset + 3] = UnormByte(vertex.Color.W);
+                        break;
+                    case GFXPlatformFormat.F32x4:
+                        WriteF32(target, offset, vertex.Color.X, vertex.Color.Y, vertex.Color.Z);
+                        BinaryPrimitives.WriteSingleLittleEndian(target.AsSpan(offset + 12), vertex.Color.W);
+                        break;
+                    default:
+                        throw Unsupported(attr);
+                }
+                break;
+
+            default:
+                // Unknown semantics keep their zeroed bytes; the game treats them as defaults.
+                break;
+        }
+    }
+
+    private static Vector2 GetUvChannel(in PoolVertex vertex, int channel) => channel switch
+    {
+        0 => vertex.Uv0,
+        1 => vertex.Uv1,
+        2 => vertex.Uv2,
+        3 => vertex.Uv3,
+        4 => vertex.Uv4,
+        5 => vertex.Uv5,
+        // Higher TexCoord semantics exist on some scene meshes (wind/lightmap channels) but carry
+        // no glTF data; zero keeps them neutral instead of duplicating another channel's UVs.
+        _ => Vector2.Zero,
+    };
+
+    // Normalized UV formats can only store raw values inside their own range, so a model whose
+    // final UVs fall outside the template's scale/offset window would clamp and smear. The
+    // transform is plain per-channel scale/offset data, so it is refitted to exactly cover the
+    // incoming range — but ONLY when the template window cannot hold it (scene meshes with
+    // tiling/lightmap channels keep their authored transform untouched).
+    private static void FitTexCoordTransforms(T3GFXVertexState vertexState, T3MeshData meshData, PoolVertex[] pool)
+    {
+        if (pool.Length == 0 || vertexState.Attributes is null)
+        {
+            return;
+        }
+
+        foreach (var attr in vertexState.Attributes)
+        {
+            if (attr.Attribute != GFXPlatformVertexAttribute.TexCoord)
+            {
+                continue;
+            }
+
+            // Only channels 0..3 have a transform; F32x2 stores any value, so it never needs one.
+            var channel = (int)attr.AttributeIndex;
+            if (channel >= meshData.TexCoordTransform.Length || attr.Format == GFXPlatformFormat.F32x2)
+            {
+                continue;
+            }
+
+            var min = new Vector2(float.MaxValue);
+            var max = new Vector2(float.MinValue);
+            var hasData = false;
+            for (var v = 0; v < pool.Length; v++)
+            {
+                var uv = GetUvChannel(pool[v], channel);
+                min = Vector2.Min(min, uv);
+                max = Vector2.Max(max, uv);
+                hasData = true;
+            }
+
+            if (!hasData)
+            {
+                continue;
+            }
+
+            // Raw range this format can represent.
+            var signed = attr.Format is GFXPlatformFormat.SN16x2 or GFXPlatformFormat.F16x2;
+            var rawMin = signed ? -1f : 0f;
+            const float rawMax = 1f;
+
+            var current = meshData.TexCoordTransform[channel];
+            var currentScale = new Vector2(
+                MathF.Abs(current.Scale.X) > 1e-8f ? current.Scale.X : 1f,
+                MathF.Abs(current.Scale.Y) > 1e-8f ? current.Scale.Y : 1f);
+            var rawLow = (min - current.Offset) / currentScale;
+            var rawHigh = (max - current.Offset) / currentScale;
+            const float tolerance = 0.002f;
+            var fits =
+                MathF.Min(rawLow.X, rawHigh.X) >= rawMin - tolerance &&
+                MathF.Min(rawLow.Y, rawHigh.Y) >= rawMin - tolerance &&
+                MathF.Max(rawLow.X, rawHigh.X) <= rawMax + tolerance &&
+                MathF.Max(rawLow.Y, rawHigh.Y) <= rawMax + tolerance;
+            if (fits)
+            {
+                continue;
+            }
+
+            var span = Vector2.Max(max - min, new Vector2(1e-5f));
+            meshData.TexCoordTransform[channel] = signed
+                ? new T3MeshTexCoordTransform { Scale = span * 0.5f, Offset = (min + max) * 0.5f }
+                : new T3MeshTexCoordTransform { Scale = span, Offset = min };
+        }
+    }
+
+    private static void EncodeUv(byte[] target, int offset, GFXPlatformAttributeParams attr, Vector2 uv, T3MeshData meshData)
+    {
+        // Invert the export transform. The parser produces V' = 1-(raw.v*scale+off) and the GLB
+        // writer flips again (1-V'), so the glTF V that arrives here is raw.v*scale+off directly.
+        var channel = Math.Min((int)attr.AttributeIndex, meshData.TexCoordTransform.Length - 1);
+        var transform = meshData.TexCoordTransform[channel];
+        var scaleX = MathF.Abs(transform.Scale.X) > 1e-8f ? transform.Scale.X : 1f;
+        var scaleY = MathF.Abs(transform.Scale.Y) > 1e-8f ? transform.Scale.Y : 1f;
+        var rawU = (uv.X - transform.Offset.X) / scaleX;
+        var rawV = (uv.Y - transform.Offset.Y) / scaleY;
+
+        switch (attr.Format)
+        {
+            case GFXPlatformFormat.F32x2:
+                BinaryPrimitives.WriteSingleLittleEndian(target.AsSpan(offset), rawU);
+                BinaryPrimitives.WriteSingleLittleEndian(target.AsSpan(offset + 4), rawV);
+                break;
+            case GFXPlatformFormat.UN16x2:
+                WriteU16(target, offset, (ushort)Math.Clamp(MathF.Round(rawU * 65535f), 0f, 65535f));
+                WriteU16(target, offset + 2, (ushort)Math.Clamp(MathF.Round(rawV * 65535f), 0f, 65535f));
+                break;
+            case GFXPlatformFormat.SN16x2:
+                WriteU16(target, offset, unchecked((ushort)(short)Math.Clamp(MathF.Round(rawU * 32767f), -32767f, 32767f)));
+                WriteU16(target, offset + 2, unchecked((ushort)(short)Math.Clamp(MathF.Round(rawV * 32767f), -32767f, 32767f)));
+                break;
+            default:
+                throw Unsupported(attr);
+        }
+    }
+
+    private static void EncodeSnormVector(byte[] target, int offset, GFXPlatformAttributeParams attr, Vector3 value, float w)
+    {
+        switch (attr.Format)
+        {
+            case GFXPlatformFormat.F32x3:
+                WriteF32(target, offset, value.X, value.Y, value.Z);
+                break;
+            case GFXPlatformFormat.SN8x4:
+            case GFXPlatformFormat.UN8x4:
+                target[offset] = SnormByte(value.X);
+                target[offset + 1] = SnormByte(value.Y);
+                target[offset + 2] = SnormByte(value.Z);
+                target[offset + 3] = SnormByte(w);
+                break;
+            case GFXPlatformFormat.SN16x4:
+            case GFXPlatformFormat.UN16x4:
+                WriteU16(target, offset, unchecked((ushort)(short)Math.Clamp(MathF.Round(value.X * 32767f), -32767f, 32767f)));
+                WriteU16(target, offset + 2, unchecked((ushort)(short)Math.Clamp(MathF.Round(value.Y * 32767f), -32767f, 32767f)));
+                WriteU16(target, offset + 4, unchecked((ushort)(short)Math.Clamp(MathF.Round(value.Z * 32767f), -32767f, 32767f)));
+                WriteU16(target, offset + 6, unchecked((ushort)(short)Math.Clamp(MathF.Round(w * 32767f), -32767f, 32767f)));
+                break;
+            default:
+                throw Unsupported(attr);
+        }
+    }
+
+    private static void EncodeWeights(byte[] target, int offset, GFXPlatformAttributeParams attr, in PoolVertex vertex)
+    {
+        switch (attr.Format)
+        {
+            case GFXPlatformFormat.UN16x4:
+            {
+                // Round while keeping the sum exactly at 65535 (adjust the largest weight).
+                var w0 = (int)MathF.Round(vertex.W0 * 65535f);
+                var w1 = (int)MathF.Round(vertex.W1 * 65535f);
+                var w2 = (int)MathF.Round(vertex.W2 * 65535f);
+                var w3 = (int)MathF.Round(vertex.W3 * 65535f);
+                var drift = 65535 - (w0 + w1 + w2 + w3);
+                if (w0 >= w1 && w0 >= w2 && w0 >= w3) w0 += drift;
+                else if (w1 >= w2 && w1 >= w3) w1 += drift;
+                else if (w2 >= w3) w2 += drift;
+                else w3 += drift;
+                WriteU16(target, offset, (ushort)Math.Clamp(w0, 0, 65535));
+                WriteU16(target, offset + 2, (ushort)Math.Clamp(w1, 0, 65535));
+                WriteU16(target, offset + 4, (ushort)Math.Clamp(w2, 0, 65535));
+                WriteU16(target, offset + 6, (ushort)Math.Clamp(w3, 0, 65535));
+                break;
+            }
+            case GFXPlatformFormat.UN8x4:
+                target[offset] = UnormByte(vertex.W0);
+                target[offset + 1] = UnormByte(vertex.W1);
+                target[offset + 2] = UnormByte(vertex.W2);
+                target[offset + 3] = UnormByte(vertex.W3);
+                break;
+            case GFXPlatformFormat.F32x4:
+                WriteF32(target, offset, vertex.W0, vertex.W1, vertex.W2);
+                BinaryPrimitives.WriteSingleLittleEndian(target.AsSpan(offset + 12), vertex.W3);
+                break;
+            default:
+                throw Unsupported(attr);
+        }
+    }
+
+    private static void EncodeIndexBuffers(T3GFXVertexState vertexState, List<int> globalIndices, int vertexCount)
+    {
+        if (vertexState.IndexBuffer is not { Count: > 0 })
+        {
+            throw new InvalidDataException("v45 template has no index buffer.");
+        }
+
+        var stride = (int)vertexState.IndexBuffer[0].Stride;
+        if (stride == 2 && vertexCount > ushort.MaxValue)
+        {
+            throw new InvalidDataException(
+                $"The new model has {vertexCount} vertices, but this mesh uses 16-bit indices (max 65535).");
+        }
+
+        var bytes = new byte[globalIndices.Count * stride];
+        for (var i = 0; i < globalIndices.Count; i++)
+        {
+            if (stride == 2)
+            {
+                WriteU16(bytes, i * 2, (ushort)globalIndices[i]);
+            }
+            else
+            {
+                BinaryPrimitives.WriteUInt32LittleEndian(bytes.AsSpan(i * 4), (uint)globalIndices[i]);
+            }
+        }
+
+        // Every index buffer gets the same rebuilt content (buffer 1 is the shadow list; identical
+        // ordering keeps the shadow pass valid for the rebuilt geometry).
+        foreach (var indexBuffer in vertexState.IndexBuffer)
+        {
+            indexBuffer.Buffer = (byte[])bytes.Clone();
+            indexBuffer.Count = (uint)globalIndices.Count;
+        }
+    }
+
+    // ── Bounds / helpers ──
+
+    private static (BoundingBox Box, Sphere Sphere) ComputeBounds(PoolVertex[] pool, int start, int count)
+    {
+        if (count <= 0)
+        {
+            return (new BoundingBox { Min = Vector3.Zero, Max = Vector3.Zero }, new Sphere { Center = Vector3.Zero, Radius = 0f });
+        }
+
+        var min = new Vector3(float.MaxValue);
+        var max = new Vector3(float.MinValue);
+        for (var i = start; i < start + count; i++)
+        {
+            min = Vector3.Min(min, pool[i].Position);
+            max = Vector3.Max(max, pool[i].Position);
+        }
+
+        var center = (min + max) * 0.5f;
+        var radius = 0f;
+        for (var i = start; i < start + count; i++)
+        {
+            radius = MathF.Max(radius, Vector3.Distance(center, pool[i].Position));
+        }
+
+        return (new BoundingBox { Min = min, Max = max }, new Sphere { Center = center, Radius = radius });
+    }
+
+    private static void CopyBatchGeometry(T3MeshBatch source, T3MeshBatch target)
+    {
+        target.MinVertIndex = source.MinVertIndex;
+        target.MaxVertIndex = source.MaxVertIndex;
+        target.BaseIndex = source.BaseIndex;
+        target.StartIndex = source.StartIndex;
+        target.NumPrimitives = source.NumPrimitives;
+        target.NumIndices = source.NumIndices;
+        target.BoundingBox = source.BoundingBox;
+        target.BoundingSphere = source.BoundingSphere;
+    }
+
+    private static List<(int Start, int Length)> ComputeNoiseRegions(byte[] template, D3DMesh mesh, MetaStreamParams streamParams)
+    {
+        byte[] control;
+        using (var controlStream = new MemoryStream())
+        {
+            Toolkit.Instance.Serialize(mesh, controlStream, streamParams);
+            control = controlStream.ToArray();
+        }
+
+        if (control.Length != template.Length)
+        {
+            throw new InvalidDataException(
+                "The toolkit's rewrite of this v45 template changed the file size; reinsertion would corrupt it. " +
+                "Please report this mesh.");
+        }
+
+        var regions = new List<(int, int)>();
+        var i = 0;
+        while (i < template.Length)
+        {
+            if (template[i] == control[i])
+            {
+                i++;
+                continue;
+            }
+
+            var start = i;
+            while (i < template.Length && template[i] != control[i])
+            {
+                i++;
+            }
+
+            regions.Add((start, i - start));
+        }
+
+        return regions;
+    }
+
+    private static int AsyncSectionStart(byte[] data)
+    {
+        if (data.Length < 20)
+        {
+            return data.Length;
+        }
+
+        var metaSize = (int)BinaryPrimitives.ReadUInt32LittleEndian(data.AsSpan(4));
+        var versionCount = (int)BinaryPrimitives.ReadUInt32LittleEndian(data.AsSpan(16));
+        var metaStart = 20 + versionCount * 12;
+        var asyncStart = metaStart + metaSize;
+        return asyncStart > 0 && asyncStart <= data.Length ? asyncStart : data.Length;
+    }
+
+    private static NotSupportedException Unsupported(GFXPlatformAttributeParams attr)
+        => new($"v45 reinsertion does not support attribute {attr.Attribute}[{attr.AttributeIndex}] in format {attr.Format} yet.");
+
+    private static void RequireFormat(GFXPlatformAttributeParams attr, GFXPlatformFormat expected)
+    {
+        if (attr.Format != expected)
+        {
+            throw Unsupported(attr);
+        }
+    }
+
+    private static void WriteF32(byte[] target, int offset, float x, float y, float z)
+    {
+        BinaryPrimitives.WriteSingleLittleEndian(target.AsSpan(offset), x);
+        BinaryPrimitives.WriteSingleLittleEndian(target.AsSpan(offset + 4), y);
+        BinaryPrimitives.WriteSingleLittleEndian(target.AsSpan(offset + 8), z);
+    }
+
+    private static void WriteU16(byte[] target, int offset, ushort value)
+        => BinaryPrimitives.WriteUInt16LittleEndian(target.AsSpan(offset), value);
+
+    private static byte ClampByte(int value) => (byte)Math.Clamp(value, 0, 255);
+
+    private static byte UnormByte(float value) => (byte)Math.Clamp(MathF.Round(value * 255f), 0f, 255f);
+
+    private static byte SnormByte(float value)
+        => unchecked((byte)(sbyte)Math.Clamp(MathF.Round(value * 127f), -127f, 127f));
 }

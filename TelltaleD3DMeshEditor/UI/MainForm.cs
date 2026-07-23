@@ -31,6 +31,7 @@ public sealed class MainForm : Form
     private readonly ToolStripButton _btnOpenArchive = new(Loc.T("toolbar.open_archive"));
     private readonly ToolStripButton _btnExtractSelected = new(Loc.T("toolbar.extract_selected"));
     private readonly ToolStripButton _btnExtractAll = new(Loc.T("toolbar.extract_all"));
+    private readonly ToolStripButton _btnExtractAnimations = new(Loc.T("toolbar.extract_animations"));
     private readonly ToolStripButton _btnReimportSelected = new(Loc.T("toolbar.reimport_selected"));
     private readonly ToolStripButton _btnDiffuseAtlas = new(Loc.T("toolbar.texture_atlas"));
     private readonly ToolStripButton _btnCombineParts = new(Loc.T("toolbar.combine_parts"));
@@ -58,7 +59,9 @@ public sealed class MainForm : Form
     private readonly ToolStripMenuItem _miSkinWeights = new(Loc.T("view.skin_weights"));
     private readonly ToolStripMenuItem _miPolygons = new(Loc.T("view.polygons"));
     private readonly ToolStripMenuItem _miSkeleton = new(Loc.T("view.skeleton"));
+    private readonly ToolStripMenuItem _miAnimations = new(Loc.T("view.animations"));
     private readonly ToolStripMenuItem _miTextureProbe = new(Loc.T("view.texture_probe"));
+    private AnimationPlayerPanel? _animationPlayer;
     private readonly ToolStripButton _btnCheckUpdates = new(Loc.T("toolbar.check_updates"));
     private readonly ToolStripButton _btnReportIssue = new(Loc.T("toolbar.report_issue"));
     private readonly ToolStripButton _btnSettings = new(Loc.T("toolbar.settings"));
@@ -151,6 +154,13 @@ public sealed class MainForm : Form
                 await OpenMeshFileAsync(_initialMeshPath);
             }
 
+            // Elevated relaunch resumes the Open Archive action that hit a protected folder.
+            if (PendingArchivePaths is { Length: > 0 } pendingArchives)
+            {
+                PendingArchivePaths = null;
+                await ExtractArchivesAsync(pendingArchives);
+            }
+
             ShowDiscordInviteIfDue();
             await CheckForUpdatesAsync(silent: true);
         };
@@ -172,6 +182,7 @@ public sealed class MainForm : Form
             new ToolStripSeparator(),
             _btnExtractSelected,
             _btnExtractAll,
+            _btnExtractAnimations,
             _btnReimportSelected,
             new ToolStripSeparator(),
             _gameSelector,
@@ -248,6 +259,7 @@ public sealed class MainForm : Form
             new ToolStripSeparator(),
             _miPolygons,
             _miSkeleton,
+            _miAnimations,
             new ToolStripSeparator(),
             _miTextureProbe
         });
@@ -381,6 +393,11 @@ public sealed class MainForm : Form
         };
         _btnExtractSelected.Click += async (_, _) => await ExtractSelectedAsync();
         _btnExtractAll.Click += async (_, _) => await ExtractAllAsync();
+        _btnExtractAnimations.Click += async (_, _) => await ExtractWithAnimationsAsync();
+        // The animations button follows the extract-selected button's availability everywhere
+        // (selection changes, busy state); skeleton availability is checked on click.
+        _btnExtractAnimations.Enabled = _btnExtractSelected.Enabled;
+        _btnExtractSelected.EnabledChanged += (_, _) => _btnExtractAnimations.Enabled = _btnExtractSelected.Enabled;
         _btnReimportSelected.Click += async (_, _) => await ReimportSelectedAsync();
         _btnCredits.Click += (_, _) => ShowCreditsDialog();
         _btnCheckUpdates.Click += async (_, _) => await CheckForUpdatesAsync(silent: false);
@@ -430,6 +447,7 @@ public sealed class MainForm : Form
 
             _preview.SetSkeletonVisible(_miSkeleton.Checked);
         };
+        _miAnimations.Click += async (_, _) => await ShowAnimationPlayerAsync();
         _miTextureProbe.Click += (_, _) =>
         {
             _textureProbeMode = (_textureProbeMode + 1) % 3;
@@ -992,8 +1010,58 @@ public sealed class MainForm : Form
             return;
         }
 
-        var archivePaths = dialog.FileNames;
+        await ExtractArchivesAsync(dialog.FileNames);
+    }
+
+    // Set by Program.cs when the app was relaunched elevated to extract inside a protected folder.
+    [System.ComponentModel.Browsable(false)]
+    [System.ComponentModel.DesignerSerializationVisibility(System.ComponentModel.DesignerSerializationVisibility.Hidden)]
+    public string[]? PendingArchivePaths { get; set; }
+
+    private async Task ExtractArchivesAsync(string[] archivePaths)
+    {
         var baseDir = Path.GetDirectoryName(archivePaths[0]) ?? Environment.CurrentDirectory;
+        // Game installs often live under protected folders (C:\Program Files (x86)\Telltale Games\...),
+        // where creating the "<archive>_extracted" folder throws Access Denied unless elevated. Ask the
+        // user whether to restart elevated (extract next to the game) or use a writable fallback folder.
+        if (!IsDirectoryWritable(baseDir))
+        {
+            var fallbackDir = ResolveWritableExtractionBaseDir(baseDir);
+            var choice = MessageBox.Show(
+                this,
+                Loc.T("msg.archive.protected_folder", baseDir, fallbackDir),
+                Text,
+                MessageBoxButtons.YesNoCancel,
+                MessageBoxIcon.Question);
+            if (choice == DialogResult.Cancel)
+            {
+                return;
+            }
+
+            if (choice == DialogResult.Yes)
+            {
+                // Relaunch elevated and let the new instance resume this exact action.
+                var arguments = "--open-archives " + string.Join(" ", archivePaths.Select(p => $"\"{p}\""));
+                try
+                {
+                    System.Diagnostics.Process.Start(new System.Diagnostics.ProcessStartInfo
+                    {
+                        FileName = Application.ExecutablePath,
+                        Arguments = arguments,
+                        UseShellExecute = true,
+                        Verb = "runas",
+                    });
+                    Application.Exit();
+                    return;
+                }
+                catch
+                {
+                    // The UAC prompt was declined; fall back to the writable folder.
+                }
+            }
+
+            baseDir = fallbackDir;
+        }
 
         // Group archives by their scene/episode "section" (Boot, Fables101, Menu...) instead of by raw
         // file name. Every archive of the same section extracts into one section-named subfolder, and
@@ -1068,6 +1136,133 @@ public sealed class MainForm : Form
         });
     }
 
+    // Template diffuse names per v45 batch (submesh order == batch order). Characters with
+    // EXTERNAL materials need their sk*.prop next to the meshes; when the props are missing the
+    // parse yields no names, so fall back to the sibling .d3dtx stems (reserving stems that
+    // clearly belong to another part, e.g. "_hair" for the hair mesh) and flag it so the report
+    // can tell the user to extract with the .prop files included.
+    private static (List<string?> Diffuse, bool MissingProps) ResolveV45TemplateDiffuse(string meshPath)
+    {
+        var names = D3DMeshParser.ParseFile(meshPath).Submeshes
+            .Select(sub => sub.TextureNames.TryGetValue("diffuse", out var diffuseName) ? diffuseName : null)
+            .ToList();
+        if (names.Count > 0 && names.All(name => !string.IsNullOrWhiteSpace(name)))
+        {
+            return (names, false);
+        }
+
+        var folder = Path.GetDirectoryName(Path.GetFullPath(meshPath));
+        if (string.IsNullOrWhiteSpace(folder))
+        {
+            return (names, true);
+        }
+
+        var meshStem = Path.GetFileNameWithoutExtension(meshPath);
+        var otherPartStems = Directory.EnumerateFiles(folder, "*.d3dmesh")
+            .Select(Path.GetFileNameWithoutExtension)
+            .Where(stem => stem is not null && !stem.Equals(meshStem, StringComparison.OrdinalIgnoreCase))
+            .Select(stem => stem!)
+            .ToList();
+
+        static int SharedPrefixLength(string a, string b)
+        {
+            var max = Math.Min(a.Length, b.Length);
+            var i = 0;
+            while (i < max && char.ToLowerInvariant(a[i]) == char.ToLowerInvariant(b[i]))
+            {
+                i++;
+            }
+
+            return i;
+        }
+
+        var candidates = Directory.EnumerateFiles(folder, "*.d3dtx")
+            .Select(Path.GetFileNameWithoutExtension)
+            .Where(stem => stem is not null)
+            .Select(stem => stem!)
+            .Where(stem => !stem.StartsWith("color_", StringComparison.OrdinalIgnoreCase) &&
+                           !stem.EndsWith("_nm", StringComparison.OrdinalIgnoreCase) &&
+                           SharedPrefixLength(stem, meshStem) >= 6)
+            // A texture whose stem matches ANOTHER part's stem (skM1_lukas100_hair.d3dtx vs the
+            // hair mesh) belongs to that part — unless it also matches this one.
+            .Where(stem => SharedPrefixLength(stem, meshStem) >= stem.Length ||
+                           !otherPartStems.Any(other =>
+                               other.EndsWith(stem[SharedPrefixLength(stem, meshStem)..], StringComparison.OrdinalIgnoreCase) &&
+                               SharedPrefixLength(stem, other) > SharedPrefixLength(stem, meshStem)))
+            .OrderByDescending(stem => SharedPrefixLength(stem, meshStem))
+            .ThenBy(stem => stem, StringComparer.OrdinalIgnoreCase)
+            .ToList();
+
+        var used = new HashSet<string>(names.Where(name => !string.IsNullOrWhiteSpace(name))!, StringComparer.OrdinalIgnoreCase);
+        for (var i = 0; i < names.Count; i++)
+        {
+            if (!string.IsNullOrWhiteSpace(names[i]))
+            {
+                continue;
+            }
+
+            names[i] = candidates.FirstOrDefault(candidate => used.Add(candidate));
+        }
+
+        return (names, true);
+    }
+
+    // Returns the folder itself when writable; otherwise a stable per-game folder under
+    // %LOCALAPPDATA%\TelltaleD3DMeshEditor\extracted, named after the last two path segments
+    // (e.g. "Minecraft Story Mode - Season Two_Archives") plus a short hash of the full path so
+    // two installs with the same folder names never collide. Stable naming means re-opening
+    // archives from the same game keeps merging into the same extraction folder.
+    private static string ResolveWritableExtractionBaseDir(string baseDir)
+    {
+        if (IsDirectoryWritable(baseDir))
+        {
+            return baseDir;
+        }
+
+        static string Sanitize(string name)
+        {
+            foreach (var invalid in Path.GetInvalidFileNameChars())
+            {
+                name = name.Replace(invalid, '_');
+            }
+
+            return name.Trim();
+        }
+
+        var segments = baseDir
+            .Split([Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar], StringSplitOptions.RemoveEmptyEntries)
+            .TakeLast(2)
+            .Select(Sanitize)
+            .Where(segment => segment.Length > 0)
+            .ToArray();
+        var label = segments.Length > 0 ? string.Join("_", segments) : "archives";
+        var hash = Crc64Ecma.Compute(baseDir.ToLowerInvariant()) & 0xFFFFFFFF;
+
+        return Path.Combine(
+            Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
+            "TelltaleD3DMeshEditor",
+            "extracted",
+            $"{label}_{hash:X8}");
+    }
+
+    private static bool IsDirectoryWritable(string directory)
+    {
+        try
+        {
+            Directory.CreateDirectory(directory);
+            var probePath = Path.Combine(directory, ".write_probe_" + Guid.NewGuid().ToString("N")[..8]);
+            using (File.Create(probePath, 1, FileOptions.DeleteOnClose))
+            {
+            }
+
+            return true;
+        }
+        catch
+        {
+            return false;
+        }
+    }
+
     private void UpdateGameSelector()
     {
         _gameSelector.Text = Loc.T("game_selector.text", GameConfig.Current.DisplayName);
@@ -1098,6 +1293,7 @@ public sealed class MainForm : Form
                 GameId.WalkingDeadSeason2 or
                 GameId.WalkingDeadMichonne or
                 GameId.MinecraftStoryMode or
+                GameId.MinecraftStoryModeSeason2 or
                 GameId.TalesFromTheBorderlands2014 or
                 GameId.TalesFromTheBorderlandsE3 or
                 GameId.TalesFromTheBorderlandsOld)
@@ -1132,7 +1328,7 @@ public sealed class MainForm : Form
             if (game.Id == GameId.MinecraftStoryModeGroup)
             {
                 item.DropDownItems.Add(CreateGameMenuItem(GameConfig.MinecraftStoryMode));
-                item.DropDownItems.Add(CreateGameMenuItem(GameConfig.MinecraftStoryModeSeason2, enabled: false));
+                item.DropDownItems.Add(CreateGameMenuItem(GameConfig.MinecraftStoryModeSeason2));
             }
 
             _gameSelector.DropDownItems.Add(item);
@@ -1176,6 +1372,7 @@ public sealed class MainForm : Form
             GameId.TalesFromTheBorderlandsOld => "TFTBOLD",
             GameId.TalesFromTheBorderlands2021 => "TFTB2021",
             GameId.GameOfThrones => "GOT",
+            GameId.Batman => "BAT",
             GameId.BackToTheFuture => "BTTF",
             GameId.BackToTheFutureEpisode1 => "BTTF101",
             GameId.BackToTheFutureEpisode2 => "BTTF102",
@@ -1448,6 +1645,18 @@ public sealed class MainForm : Form
             return GameConfig.WalkingDeadMichonne;
         }
 
+        // Batman: The Telltale Series ships MSV6 v46 meshes (the Telltale "GotG" family container).
+        if (metaStreamVersion == "MSV6" && meshVersion == 46)
+        {
+            return GameConfig.Batman;
+        }
+
+        // Minecraft: Story Mode - Season 2 ships MSV5 v45 meshes (parsed via the Telltale Toolkit).
+        if (metaStreamVersion == "MSV5" && meshVersion == 45)
+        {
+            return GameConfig.MinecraftStoryModeSeason2;
+        }
+
         // Versions 13/14 are shared by nearby Telltale generations, and MTRE v12 appears in both
         // supported and unsupported games. Keep Auto / Generic unless the folder/archive name supplied
         // a stronger hint.
@@ -1484,6 +1693,17 @@ public sealed class MainForm : Form
             return GameConfig.WolfAmongUs;
         }
 
+        // Season 2 hints must be checked before the generic MCSM hint below ("MCSM2" contains "MCSM").
+        if (text.Contains("MCSM2", StringComparison.OrdinalIgnoreCase) ||
+            text.Contains("MCSMS2", StringComparison.OrdinalIgnoreCase) ||
+            text.Contains("MC2_", StringComparison.OrdinalIgnoreCase) ||
+            text.Contains("Minecraft Story Mode Season 2", StringComparison.OrdinalIgnoreCase) ||
+            text.Contains("Minecraft: Story Mode - Season 2", StringComparison.OrdinalIgnoreCase) ||
+            text.Contains("MCSM Season 2", StringComparison.OrdinalIgnoreCase))
+        {
+            return GameConfig.MinecraftStoryModeSeason2;
+        }
+
         if (text.Contains("MCSM", StringComparison.OrdinalIgnoreCase) ||
             text.Contains("Minecraft Story Mode", StringComparison.OrdinalIgnoreCase) ||
             text.Contains("Minecraft: Story Mode", StringComparison.OrdinalIgnoreCase))
@@ -1494,6 +1714,13 @@ public sealed class MainForm : Form
         if (IsGameOfThronesHint(text))
         {
             return GameConfig.GameOfThrones;
+        }
+
+        if (text.Contains("Batman", StringComparison.OrdinalIgnoreCase) ||
+            text.Contains("BAT _", StringComparison.OrdinalIgnoreCase) ||
+            text.Contains("BAT_", StringComparison.OrdinalIgnoreCase))
+        {
+            return GameConfig.Batman;
         }
 
         if (IsTalesFromTheBorderlandsOldHint(text))
@@ -2305,6 +2532,12 @@ public sealed class MainForm : Form
 
     private void PreviewAsset(ModelAsset asset)
     {
+        // A different model invalidates the playing animation's skeleton mapping.
+        if (_animationPlayer is { Visible: true })
+        {
+            _animationPlayer.ClosePanel();
+        }
+
         try
         {
             var mesh = D3DMeshParser.ParseFile(asset.MeshPath);
@@ -2341,6 +2574,12 @@ public sealed class MainForm : Form
 
     private void PreviewAssetGroup(ModelAssetGroup group)
     {
+        // A different model invalidates the playing animation's skeleton mapping.
+        if (_animationPlayer is { Visible: true })
+        {
+            _animationPlayer.ClosePanel();
+        }
+
         try
         {
             if (_rootFolder is null)
@@ -2359,6 +2598,218 @@ public sealed class MainForm : Form
             SetStatusText(Loc.T("status.preview_error", group));
             SetDetailText(ex.Message);
         }
+    }
+
+    // Selection context for animation discovery: the animations reference the rig, not the mesh
+    // part, so matching uses the skeleton stem, the model name, and their digit-trimmed bases
+    // (e.g. skM1_jesse201 → skM1_jesse).
+    private (string ModelName, string SkeletonPath, HashSet<string> SearchTerms)? GetAnimationSearchContext()
+    {
+        var group = _selectedGroup;
+        var asset = _selectedAsset;
+        if (group is null && asset is null)
+        {
+            return null;
+        }
+
+        var skeletonPath = group?.SkeletonPath ?? asset?.SkeletonPath;
+        if (string.IsNullOrWhiteSpace(skeletonPath))
+        {
+            return null;
+        }
+
+        var modelName = group?.Name ?? Path.GetFileNameWithoutExtension(asset!.MeshPath);
+        var searchTerms = new HashSet<string>(StringComparer.OrdinalIgnoreCase)
+        {
+            Path.GetFileNameWithoutExtension(skeletonPath),
+            modelName,
+        };
+        if (asset is not null)
+        {
+            searchTerms.Add(Path.GetFileNameWithoutExtension(asset.MeshPath));
+        }
+        foreach (var term in searchTerms.ToList())
+        {
+            var baseStem = term.TrimEnd('0', '1', '2', '3', '4', '5', '6', '7', '8', '9', '_');
+            if (baseStem.Length > 2 && baseStem.Length < term.Length)
+            {
+                searchTerms.Add(baseStem);
+            }
+        }
+
+        return (modelName, skeletonPath, searchTerms);
+    }
+
+    // Discovers .anm candidates for the current selection (busy cursor while scanning); returns
+    // null after showing the appropriate message when there is nothing to offer.
+    private async Task<List<Export.AnimationCollector.Candidate>?> DiscoverAnimationCandidatesAsync(
+        HashSet<string> searchTerms)
+    {
+        var root = _rootFolder!;
+        SetBusy(true);
+        List<Export.AnimationCollector.Candidate> candidates;
+        try
+        {
+            candidates = await Task.Run(() =>
+            {
+                var strict = Export.AnimationCollector.FindCandidates(root, searchTerms.ToList());
+                if (strict.Count > 0)
+                {
+                    return strict;
+                }
+
+                // Protagonist rigs are named differently from their meshes (JesseMale meshes animate
+                // through skM1_jesse201_* rigs), so a strict full-name match finds nothing. Retry with
+                // the distinctive name tokens (camelCase/underscore split), e.g. "Jesse".
+                var looseTerms = BuildLooseAnimationTokens(searchTerms);
+                return looseTerms.Count > 0
+                    ? Export.AnimationCollector.FindCandidates(root, looseTerms)
+                    : strict;
+            });
+        }
+        finally
+        {
+            SetBusy(false);
+        }
+
+        if (candidates.Count == 0)
+        {
+            MessageBox.Show(this, Loc.T("anim.none_found", string.Join(", ", searchTerms)), Text,
+                MessageBoxButtons.OK, MessageBoxIcon.Information);
+            return null;
+        }
+
+        return candidates;
+    }
+
+    // Splits the strict search terms into name tokens and keeps only the distinctive ones:
+    // "JesseMale_mouthAA" → Jesse (Male/mouth/AA are generic or too short to be identifying).
+    private static List<string> BuildLooseAnimationTokens(IEnumerable<string> searchTerms)
+    {
+        var generic = new HashSet<string>(StringComparer.OrdinalIgnoreCase)
+        {
+            "male", "female", "mouth", "default", "combined", "head", "body", "hair",
+            "arm", "arms", "leg", "legs", "hand", "hands", "none", "eyes", "brows",
+        };
+
+        var tokens = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        foreach (var term in searchTerms)
+        {
+            foreach (var piece in term.Split('_', StringSplitOptions.RemoveEmptyEntries))
+            {
+                // Split camelCase: a new token starts at each lower→Upper boundary.
+                var start = 0;
+                for (var i = 1; i <= piece.Length; i++)
+                {
+                    if (i == piece.Length || (char.IsUpper(piece[i]) && char.IsLower(piece[i - 1])))
+                    {
+                        var token = piece[start..i];
+                        start = i;
+                        // Distinctive = purely alphabetic and reasonably long.
+                        if (token.Length >= 4 && token.All(char.IsLetter) && !generic.Contains(token))
+                        {
+                            tokens.Add(token);
+                        }
+                    }
+                }
+            }
+        }
+
+        return tokens.ToList();
+    }
+
+    // Opens the in-viewer animation player (View > Animations) for the current selection.
+    private async Task ShowAnimationPlayerAsync()
+    {
+        if (_rootFolder is null)
+        {
+            return;
+        }
+
+        var context = GetAnimationSearchContext();
+        if (context is null)
+        {
+            MessageBox.Show(this, Loc.T("anim.need_skinned"), Text, MessageBoxButtons.OK, MessageBoxIcon.Information);
+            return;
+        }
+
+        var candidates = await DiscoverAnimationCandidatesAsync(context.Value.SearchTerms);
+        if (candidates is null)
+        {
+            return;
+        }
+
+        if (_animationPlayer is null)
+        {
+            _animationPlayer = new AnimationPlayerPanel(_preview);
+            _split.Panel2.Controls.Add(_animationPlayer);
+            _preview.BringToFront();
+        }
+
+        _animationPlayer.Open(candidates);
+    }
+
+    // Exports the selected model (group or single skinned mesh) to GLB with the .anm animations
+    // the user picks from the opened folder. Discovery is name-based; decoding + CRC64 bone
+    // remapping happen during export, against the same skeleton the GLB carries.
+    private async Task ExtractWithAnimationsAsync()
+    {
+        if (_rootFolder is null)
+        {
+            return;
+        }
+
+        var context = GetAnimationSearchContext();
+        if (context is null)
+        {
+            MessageBox.Show(this, Loc.T("anim.need_skinned"), Text, MessageBoxButtons.OK, MessageBoxIcon.Information);
+            return;
+        }
+
+        var group = _selectedGroup;
+        var asset = _selectedAsset;
+        var modelName = context.Value.ModelName;
+
+        var root = _rootFolder;
+        var candidates = await DiscoverAnimationCandidatesAsync(context.Value.SearchTerms);
+        if (candidates is null)
+        {
+            return;
+        }
+
+        List<Export.AnimationCollector.Candidate> chosen;
+        using (var dialog = new AnimationPickerDialog(modelName, candidates))
+        {
+            if (dialog.ShowDialog(this) != DialogResult.OK)
+            {
+                return;
+            }
+
+            chosen = dialog.SelectedCandidates;
+        }
+
+        if (chosen.Count == 0)
+        {
+            return;
+        }
+
+        var output = ChooseOutputFolder();
+        if (output is null)
+        {
+            return;
+        }
+
+        await RunWithUiLockAsync(() => Task.Run(() =>
+        {
+            var decoded = Export.AnimationCollector.Decode(chosen);
+            var path = group is not null
+                ? ExtractionService.ExtractAssetGroupToPath(
+                    group, root, Path.Combine(output, group.OutputStem + ".glb"), ExportFormat.Glb, decoded)
+                : ExtractionService.ExtractAssetToPath(
+                    asset!, root, Path.Combine(output, Path.GetFileNameWithoutExtension(asset!.MeshPath) + ".glb"),
+                    ExportFormat.Glb, decoded);
+            return Loc.T("anim.export_done", Path.GetFileName(path), decoded.Count, chosen.Count);
+        }));
     }
 
     private async Task ExtractSelectedAsync()
@@ -2658,6 +3109,29 @@ public sealed class MainForm : Form
             return Loc.T("report.v25.reimported", v25Kind, Path.GetFileName(asset.MeshPath), input, output, v25TextureLine, v25WarnLine, v25CollapseLine, v25SkeletonLine);
         }
 
+        if (D3DMeshParser.Parse(templateBytes).Version == 45)
+        {
+            // MCSM Season 2: same user flow as the other games. The v45 writer distributes the GLB
+            // primitives over the template batches (semantic diffuse pairing) and reports which
+            // image each template diffuse name should carry — textures are then written from that
+            // SAME mapping, so geometry and textures can never disagree.
+            var (v45TemplateDiffuse, v45MissingProps) = ResolveV45TemplateDiffuse(asset.MeshPath);
+            var v45Result = MeshReinserter.ReinsertV45GeometryWithAssignments(templateBytes, model, v45TemplateDiffuse);
+            File.WriteAllBytes(output, v45Result.MeshBytes);
+            var v45Written = ReinsertTextureService.WriteV45AssignedTextures(v45Result.Textures, asset.MeshPath, output, uncompressedTextures);
+            var v45TextureLine = v45Written.Count > 0
+                ? Loc.T("report.texture_line", v45Written.Count)
+                : "";
+            if (v45MissingProps)
+            {
+                v45TextureLine += Loc.T("report.v45.no_prop_warning");
+            }
+            var v45Kind = model.Primitives.Any(p => p.IsSkinned)
+                ? Loc.T("report.v45.kind_character")
+                : Loc.T("report.v45.kind_static");
+            return Loc.T("report.v45.reimported", v45Kind, Path.GetFileName(asset.MeshPath), input, output, v45TextureLine);
+        }
+
         var layout = D3DMeshLayout.Build(templateBytes);
         var skeletonPath = ResolveReimportSkeletonPath(asset);
         var skeleton = LoadSkeletonOrNull(skeletonPath, layout.Version);
@@ -2948,6 +3422,17 @@ public sealed class MainForm : Form
                     continue;
                 }
 
+                if (D3DMeshParser.Parse(invisibleTemplateBytes).Version == 45)
+                {
+                    // Unassigned MCSM Season 2 part: blank its triangles so the receiver's old part
+                    // does not show through the replacement.
+                    var invisibleV45 = MeshReinserter.BuildInvisibleV45MeshBytes(asset.MeshPath);
+                    File.WriteAllBytes(invisibleOutput, invisibleV45);
+                    invisible++;
+                    lines.Add(Loc.T("report.invisible.v45_placeholder", Path.GetFileName(asset.MeshPath)));
+                    continue;
+                }
+
                 var invisibleBytes = BuildInvisibleMeshBytes(asset.MeshPath);
                 File.WriteAllBytes(invisibleOutput, invisibleBytes);
 
@@ -3017,6 +3502,26 @@ public sealed class MainForm : Form
                 ok++;
                 var v25Kind = v25Layout.IsSkinned ? Loc.T("report.v25.kind_character") : Loc.T("report.v25.kind_static");
                 lines.Add(Loc.T("report.ok_part_v25", Path.GetFileName(asset.MeshPath), primitives.Count, v25Tex.Written.Count, v25Kind));
+                continue;
+            }
+
+            if (D3DMeshParser.Parse(partTemplateBytes).Version == 45)
+            {
+                // MCSM Season 2 part: primitives are distributed over the template batches with
+                // semantic diffuse pairing, and textures are written from that SAME mapping (each
+                // template diffuse name gets its batch's image). The combined skin's joints resolve
+                // per part against the template's own bone list by CRC64.
+                var (v45TemplateDiffuse, v45MissingProps) = ResolveV45TemplateDiffuse(asset.MeshPath);
+                var v45Result = MeshReinserter.ReinsertV45GeometryWithAssignments(partTemplateBytes, partModel, v45TemplateDiffuse);
+                File.WriteAllBytes(output, v45Result.MeshBytes);
+                var v45Written = ReinsertTextureService.WriteV45AssignedTextures(v45Result.Textures, asset.MeshPath, output, uncompressedTextures);
+                totalTextures += v45Written.Count;
+                ok++;
+                var v45Kind = partModel.Primitives.Any(p => p.IsSkinned)
+                    ? Loc.T("report.v45.kind_character")
+                    : Loc.T("report.v45.kind_static");
+                lines.Add(Loc.T("report.ok_part_v45", Path.GetFileName(asset.MeshPath), primitives.Count, v45Written.Count, v45Kind) +
+                          (v45MissingProps ? Loc.T("report.v45.no_prop_warning") : ""));
                 continue;
             }
 
@@ -3176,6 +3681,29 @@ public sealed class MainForm : Form
                     continue;
                 }
 
+                if (D3DMeshParser.Parse(candidateBytes).Version == 45)
+                {
+                    var donorMeshV45 = D3DMeshParser.ParseFile(donor);
+                    var primitivesV45 = DonorPartPrimitiveBuilder.Build(donorMeshV45, referenceSkeleton);
+                    if (primitivesV45.Count == 0)
+                    {
+                        continue;
+                    }
+
+                    var partModelV45 = new GltfModel
+                    {
+                        Primitives = primitivesV45,
+                        Joints = referenceSkeleton.Bones.Select(b => new GltfJoint { Name = b.Name, Hash = b.Hash }).ToList(),
+                        Skeleton = referenceSkeleton,
+                    };
+                    var outputV45 = Path.Combine(outputFolder, candidateName);
+                    var bytesV45 = MeshReinserter.ReinsertV45Geometry(candidateBytes, partModelV45);
+                    File.WriteAllBytes(outputV45, bytesV45);
+                    ported++;
+                    lines.Add(Loc.T("report.companion.ok_v45", candidateName, Path.GetFileName(donor)));
+                    continue;
+                }
+
                 var layout = D3DMeshLayout.Build(candidateBytes);
                 var donorMesh = D3DMeshParser.ParseFile(donor);
                 var primitives = DonorPartPrimitiveBuilder.Build(donorMesh, referenceSkeleton);
@@ -3330,6 +3858,7 @@ public sealed class MainForm : Form
     {
         statusLine = Loc.T("report.skeleton.skipped");
         var skeletonVersion = ResolveCombinedSkeletonVersion(group);
+
         if (string.IsNullOrWhiteSpace(group.SkeletonPath) || !File.Exists(group.SkeletonPath))
         {
             if (model.Skeleton is { Bones.Count: > 0 } foreignSkeleton)
@@ -3376,9 +3905,13 @@ public sealed class MainForm : Form
             }
 
             var scaleDonor = LoadDonorSkeletonForScales(model, inputRoot, gameConfig);
-            var skeletonBytes = gameConfig.IsOriginalTalesFromTheBorderlandsPc || gameConfig.Id == GameId.GameOfThrones
-                ? RebuildSkeletonBytesForGame(group.SkeletonPath, model.Skeleton, gameConfig)
-                : SkeletonRebuilder.RebuildWithEdits(group.SkeletonPath, model.Skeleton, scaleDonor);
+            var skeletonBytes = gameConfig.Id == GameId.MinecraftStoryModeSeason2
+                // v45 rigs store the pose twice (raw + RestXform); the delta rebuild keeps both in
+                // sync with what the GLB actually carries.
+                ? SkeletonRebuilder.RebuildV45WithEdits(group.SkeletonPath, model.Skeleton)
+                : gameConfig.IsOriginalTalesFromTheBorderlandsPc || gameConfig.Id == GameId.GameOfThrones
+                    ? RebuildSkeletonBytesForGame(group.SkeletonPath, model.Skeleton, gameConfig)
+                    : SkeletonRebuilder.RebuildWithEdits(group.SkeletonPath, model.Skeleton, scaleDonor);
             File.WriteAllBytes(outputPath, skeletonBytes);
             var rebuiltSkeleton = LoadSkeletonOrNull(outputPath, skeletonVersion);
             var scalesNote = scaleDonor is not null ? Loc.T("report.skeleton.scales_note") : "";
@@ -3679,11 +4212,33 @@ public sealed class MainForm : Form
         GltfModel model,
         string templateMeshPath)
     {
+        // TWAU pioneered the auto-atlas; MCSM Season 2 needs it for the same reason (foreign models
+        // carry more diffuse textures than a v45 part's material slots can reference).
         if (useDiffuseAtlas ||
-            gameConfig.Id != GameId.WolfAmongUs ||
+            gameConfig.Id is not (GameId.WolfAmongUs or GameId.MinecraftStoryModeSeason2) ||
             !externalSplit)
         {
             return false;
+        }
+
+        // v45 materials cannot gain texture slots (external .prop / fixed internal sets), so any
+        // foreign part carrying more distinct diffuse textures than the template references must be
+        // atlased into one — regardless of how the textures are named.
+        if (gameConfig.Id == GameId.MinecraftStoryModeSeason2)
+        {
+            try
+            {
+                var v45TemplatePool = D3DMeshParser.ParseFile(templateMeshPath).Submeshes
+                    .Select(sub => sub.TextureNames.TryGetValue("diffuse", out var name) ? name : null)
+                    .Where(name => !string.IsNullOrWhiteSpace(name))
+                    .Distinct(StringComparer.OrdinalIgnoreCase)
+                    .Count();
+                return ReinsertTextureService.DistinctV25TextureCount(model) > Math.Max(1, v45TemplatePool);
+            }
+            catch
+            {
+                return false;
+            }
         }
 
         var templateSemantics = BuildTemplateTextureSemantics(templateMeshPath);
@@ -4298,15 +4853,28 @@ public sealed class MainForm : Form
         if (Has(token, "eyelash") || Has(token, "eyelashes")) tokens.Add("eyelashes");
         if (Has(token, "hat")) tokens.Add("hat");
         if (Has(token, "hand")) tokens.Add("hand");
-        if (Has(token, "arm")) tokens.Add("arm");
+        // "armor" must not register as "arm": a part named shoulderArmor would otherwise score as
+        // an arm slot and swallow the imported model's arms/hands (MCSM S2 Lukas). Armour and
+        // shoulder get their own tokens so armour parts still match armour parts.
+        if (Has(token, "armor") || Has(token, "armour")) tokens.Add("armor");
+        if (Has(token, "shoulder")) tokens.Add("shoulder");
+        if (token.Replace("armour", string.Empty).Replace("armor", string.Empty).Contains("arm", StringComparison.OrdinalIgnoreCase))
+        {
+            tokens.Add("arm");
+        }
         if (Has(token, "leg")) tokens.Add("leg");
         if (Has(token, "foot") || Has(token, "feet")) tokens.Add("foot");
+        if (Has(token, "beard")) tokens.Add("beard");
         if (Has(token, "eye")) tokens.Add("eye");
         if (Has(token, "mouth")) tokens.Add("mouth");
         if (Has(token, "teeth")) tokens.Add("teeth");
         if (Has(token, "tongue")) tokens.Add("tongue");
         if (Has(token, "brow")) tokens.Add("brow");
-        if (Has(token, "ear")) tokens.Add("ear");
+        // Same containment trap as arm/armor: "beard" ends with "ear".
+        if (token.Replace("beard", string.Empty).Contains("ear", StringComparison.OrdinalIgnoreCase))
+        {
+            tokens.Add("ear");
+        }
         if (Has(token, "neck")) tokens.Add("neck");
         if (Has(token, "nose")) tokens.Add("nose");
         if (Has(token, "cloth") || Has(token, "shirt") || Has(token, "coat") || Has(token, "jacket")) tokens.Add("body");
