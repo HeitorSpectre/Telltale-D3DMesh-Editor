@@ -2,6 +2,8 @@ using System.Buffers.Binary;
 using System.Drawing;
 using System.Drawing.Imaging;
 using System.Runtime.InteropServices;
+using AstcSharp;
+using AstcSharp.Core;
 using TelltaleD3DMeshEditor.Core;
 using TelltaleToolKit;
 using TelltaleToolKit.T3Types.Textures;
@@ -210,11 +212,13 @@ public static class TextureLoader
             return new TextureImage(1, 1, [0], path, info.AlphaMode);
         }
 
-        // Uncompressed formats are sized per pixel (A8=1 byte, ARGB8/RGBA8=4 bytes); DXT is block-based.
+        // Uncompressed formats are sized per pixel (A8=1 byte, ARGB8/RGBA8=4 bytes);
+        // DXT is 4x4 block-based; ASTC 4x4 is also 4x4 blocks (16 bytes each).
         var mip0Size = info.Format switch
         {
             0x10 => info.Width * info.Height,
             0x0 or 0xA => info.Width * info.Height * 4,
+            0x80 => Astc4x4MipSize(info.Width, info.Height),
             _ => MipSizeOf(info.Width, info.Height, info.BlockBytes),
         };
         if (info.PixelLength < mip0Size)
@@ -228,15 +232,20 @@ public static class TextureLoader
         {
             0x40 => DecodeDxt1(data, largestMipOffset, info.Width, info.Height),
             0x42 => DecodeDxt5(data, largestMipOffset, info.Width, info.Height),
+            // BC4/BC5: single- and two-channel block compression (detail/normal maps in Batman, etc.).
+            0x43 => DecodeBc4(data, largestMipOffset, info.Width, info.Height),
+            0x44 => DecodeBc5(data, largestMipOffset, info.Width, info.Height),
             // A8: alpha only. Used as a cutout mask (for example eyelashes) -> black + alpha,
             // so eyelashes render black with the correct cutout instead of defaulting to gray/white.
             0x10 => DecodeA8Mask(data, largestMipOffset, info.Width, info.Height),
             // 0x0 = ARGB8 (BGRA byte order), 0xA = RGBA8. Used by the solid-colour "color_*" swatches.
             0x0 => DecodeBgra8(data, largestMipOffset, info.Width, info.Height, forceOpaque: false),
             0xA => DecodeRgba8(data, largestMipOffset, info.Width, info.Height),
+            // 0x80 = ASTC RGBA 4x4 (mobile / MCSM Season 2 texture path).
+            0x80 => DecodeAstc4x4(data, largestMipOffset, info.Width, info.Height),
             _ => throw new NotSupportedException($"Unsupported D3DTX texture format 0x{info.Format:X}."),
         };
-        return new TextureImage(info.Width, info.Height, pixels, path, info.AlphaMode);
+        return new TextureImage(info.Width, info.Height, pixels, path, info.AlphaMode, info.Format);
     }
 
     private static TextureFormatInfo InspectD3dtx(string path)
@@ -293,17 +302,32 @@ public static class TextureLoader
                 return null;
             }
 
+            // Prefer regions whose pixel payload the serializer actually filled (the original
+            // behaviour); regions carrying only a DataSize are considered when nothing else exists,
+            // with the payload recovered from the raw file (MCSM Season 2 workspaces).
             var region = texture.RegionHeaders
-                .Where(region => region.FaceIndex == 0 && region.RegionData.Length > 0)
+                .Where(region => region.FaceIndex == 0 &&
+                                 (region.RegionData.Length > 0 || region.DataSize > 0))
                 .Select(region => new
                 {
                     Header = region,
                     Dimensions = GetModernRegionDimensions(texture, region),
                 })
-                .OrderByDescending(region => region.Dimensions.Width * region.Dimensions.Height)
-                .ThenByDescending(region => region.Header.DataSize)
+                .OrderByDescending(region => region.Header.RegionData.Length > 0 ? 1 : 0)
+                .ThenByDescending(region => region.Dimensions.Width * region.Dimensions.Height)
+                .ThenByDescending(region => Math.Max(region.Header.RegionData.Length, region.Header.DataSize))
                 .FirstOrDefault();
-            if (region is null || region.Header.RegionData.Length == 0)
+            if (region is null)
+            {
+                return null;
+            }
+
+            // Prefer serializer-filled RegionData; if empty, fall back to the raw async payload in the
+            // file (some MCSM Season 2 workspaces leave RegionData unpopulated).
+            var pixelBytes = region.Header.RegionData is { Length: > 0 }
+                ? region.Header.RegionData
+                : TryReadModernRegionBytesFromFile(path, texture, region.Header);
+            if (pixelBytes is null || pixelBytes.Length == 0)
             {
                 return null;
             }
@@ -312,11 +336,12 @@ public static class TextureLoader
             var height = region.Dimensions.Height;
             var pixels = texture.SurfaceFormat switch
             {
-                T3SurfaceFormat.ARGB8 => DecodeBgra32(region.Header.RegionData, 0, width, height),
-                T3SurfaceFormat.RGBA8 => DecodeRgba32(region.Header.RegionData, 0, width, height),
-                T3SurfaceFormat.BC1 => DecodeDxt1(region.Header.RegionData, 0, width, height),
-                T3SurfaceFormat.BC3 => DecodeDxt5(region.Header.RegionData, 0, width, height),
-                T3SurfaceFormat.A8 => DecodeA8Mask(region.Header.RegionData, 0, width, height),
+                T3SurfaceFormat.ARGB8 => DecodeBgra32(pixelBytes, 0, width, height),
+                T3SurfaceFormat.RGBA8 => DecodeRgba32(pixelBytes, 0, width, height),
+                T3SurfaceFormat.BC1 => DecodeDxt1(pixelBytes, 0, width, height),
+                T3SurfaceFormat.BC3 => DecodeDxt5(pixelBytes, 0, width, height),
+                T3SurfaceFormat.A8 => DecodeA8Mask(pixelBytes, 0, width, height),
+                T3SurfaceFormat.ASTC_RGBA_4x4 => DecodeAstc4x4(pixelBytes, 0, width, height),
                 _ => null,
             };
 
@@ -406,6 +431,8 @@ public static class TextureLoader
             0x40 => DecodeDxt1(data, info.PixelStart, info.Width, info.Height),
             0x41 => DecodeDxt3(data, info.PixelStart, info.Width, info.Height),
             0x42 => DecodeDxt5(data, info.PixelStart, info.Width, info.Height),
+            0x43 => DecodeBc4(data, info.PixelStart, info.Width, info.Height),
+            0x44 => DecodeBc5(data, info.PixelStart, info.Width, info.Height),
             0x15 => DecodeBgra8(data, info.PixelStart, info.Width, info.Height, forceOpaque: false),
             0x16 => DecodeBgra8(data, info.PixelStart, info.Width, info.Height, forceOpaque: true),
             0x17 => DecodeRgba8(data, info.PixelStart, info.Width, info.Height),
@@ -735,8 +762,72 @@ public static class TextureLoader
             T3SurfaceFormat.A8 => checked(width * height),
             T3SurfaceFormat.BC1 => checked(Math.Max(1, (width + 3) / 4) * Math.Max(1, (height + 3) / 4) * 8),
             T3SurfaceFormat.BC3 => checked(Math.Max(1, (width + 3) / 4) * Math.Max(1, (height + 3) / 4) * 16),
+            T3SurfaceFormat.ASTC_RGBA_4x4 => Astc4x4MipSize(width, height),
             _ => -1,
         };
+    }
+
+    // When toolkit RegionData is empty (async section not populated for some workspaces),
+    // recover the pixel payload from the end of the 5VSM/6VSM file using region DataSize values.
+    private static byte[]? TryReadModernRegionBytesFromFile(
+        string path,
+        T3Texture texture,
+        T3Texture.RegionStreamHeader target)
+    {
+        try
+        {
+            var data = File.ReadAllBytes(path);
+            if (data.Length < 20)
+                return null;
+
+            var magic = System.Text.Encoding.ASCII.GetString(data, 0, 4);
+            if (magic is not ("5VSM" or "6VSM"))
+                return null;
+
+            // 5VSM/6VSM: meta size @4, async size @12, version count @16, meta starts at 20+count*12
+            var metaSize = (int)BinaryPrimitives.ReadUInt32LittleEndian(data.AsSpan(4));
+            var asyncSize = (int)BinaryPrimitives.ReadUInt32LittleEndian(data.AsSpan(12));
+            var versionCount = (int)BinaryPrimitives.ReadUInt32LittleEndian(data.AsSpan(16));
+            var metaStart = 20 + versionCount * 12;
+            var asyncStart = metaStart + metaSize;
+            if (metaStart < 20 || asyncStart < metaStart || asyncStart > data.Length)
+                return null;
+
+            // Async section is concatenated region payloads in RegionHeaders order.
+            var offset = asyncStart;
+            foreach (var region in texture.RegionHeaders)
+            {
+                var size = region.DataSize > 0 ? region.DataSize : region.RegionData.Length;
+                if (size <= 0)
+                    continue;
+                if (offset + size > data.Length)
+                    return null;
+
+                if (ReferenceEquals(region, target) ||
+                    (region.FaceIndex == target.FaceIndex &&
+                     region.MipIndex == target.MipIndex &&
+                     region.DataSize == target.DataSize))
+                {
+                    return data.AsSpan(offset, size).ToArray();
+                }
+
+                offset += size;
+            }
+
+            // Fallback: largest region by DataSize from the end of the async section.
+            if (asyncSize > 0 && asyncStart + asyncSize <= data.Length && target.DataSize > 0)
+            {
+                var largestOffset = asyncStart + asyncSize - target.DataSize;
+                if (largestOffset >= asyncStart)
+                    return data.AsSpan(largestOffset, target.DataSize).ToArray();
+            }
+
+            return null;
+        }
+        catch
+        {
+            return null;
+        }
     }
 
     private static Workspace GetModernTextureWorkspace(string toolkitGameName)
@@ -893,7 +984,7 @@ public static class TextureLoader
             0x10 => 1, // A8: not block-compressed; mip calculated separately (1 byte/pixel).
             0x0 or 0xA => 4, // ARGB8 / RGBA8: uncompressed 4 bytes/pixel (solid-colour "color_*" swatches).
             0x40 or 0x43 => 8,
-            0x41 or 0x42 or 0x44 or 0x45 or 0x46 => 16,
+            0x41 or 0x42 or 0x44 or 0x45 or 0x46 or 0x80 => 16, // DXT3/5/BC4+/ASTC4x4
             _ => throw new NotSupportedException($"Unsupported D3DTX format 0x{format:X}."),
         };
 
@@ -997,6 +1088,83 @@ public static class TextureLoader
             }
         }
         return pixels;
+    }
+
+    // BC4 (0x43): a single-channel block-compressed format (same block layout as the DXT5 alpha block).
+    // Telltale uses it for grayscale detail/mask maps, so the decoded value fills RGB with opaque alpha.
+    private static int[] DecodeBc4(byte[] data, int offset, int width, int height)
+    {
+        var channel = DecodeBc4Channel(data, offset, width, height, blockStride: 8, blockOffset: 0);
+        var pixels = new int[width * height];
+        for (var i = 0; i < pixels.Length; i++)
+        {
+            var v = channel[i];
+            pixels[i] = Color.FromArgb(255, v, v, v).ToArgb();
+        }
+
+        return pixels;
+    }
+
+    // BC5 (0x44): two BC4 channels per 16-byte block (red then green). Telltale uses it for normal/detail
+    // maps, so red->R, green->G and the Z component is reconstructed into B.
+    private static int[] DecodeBc5(byte[] data, int offset, int width, int height)
+    {
+        var red = DecodeBc4Channel(data, offset, width, height, blockStride: 16, blockOffset: 0);
+        var green = DecodeBc4Channel(data, offset, width, height, blockStride: 16, blockOffset: 8);
+        var pixels = new int[width * height];
+        for (var i = 0; i < pixels.Length; i++)
+        {
+            var nx = red[i] / 255f * 2f - 1f;
+            var ny = green[i] / 255f * 2f - 1f;
+            var nz = MathF.Sqrt(Math.Clamp(1f - nx * nx - ny * ny, 0f, 1f));
+            var b = (int)Math.Clamp((nz * 0.5f + 0.5f) * 255f, 0f, 255f);
+            pixels[i] = Color.FromArgb(255, red[i], green[i], b).ToArgb();
+        }
+
+        return pixels;
+    }
+
+    // Decodes one BC4 channel (the DXT5-style interpolated 3-bit block) into a width*height byte map.
+    private static byte[] DecodeBc4Channel(byte[] data, int offset, int width, int height, int blockStride, int blockOffset)
+    {
+        var values = new byte[width * height];
+        var pos = offset;
+        for (var by = 0; by < height; by += 4)
+        {
+            for (var bx = 0; bx < width; bx += 4)
+            {
+                var blockPos = pos + blockOffset;
+                var e0 = data[blockPos];
+                var e1 = data[blockPos + 1];
+                ulong indices = 0;
+                for (var i = 0; i < 6; i++)
+                {
+                    indices |= (ulong)data[blockPos + 2 + i] << (8 * i);
+                }
+
+                var palette = BuildDxt5Alphas(e0, e1);
+                for (var y = 0; y < 4; y++)
+                {
+                    for (var x = 0; x < 4; x++)
+                    {
+                        var tx = bx + x;
+                        var ty = by + y;
+                        if (tx >= width || ty >= height)
+                        {
+                            continue;
+                        }
+
+                        var pixel = y * 4 + x;
+                        var index = (int)((indices >> (3 * pixel)) & 0x7);
+                        values[ty * width + tx] = palette[index];
+                    }
+                }
+
+                pos += blockStride;
+            }
+        }
+
+        return values;
     }
 
     private static int[] DecodeDxt3(byte[] data, int offset, int width, int height)
@@ -1282,8 +1450,42 @@ public static class TextureLoader
         0x45 => "CTX1",
         0x46 => "BC6",
         0x47 => "BC7",
+        0x80 => "ASTC_RGBA_4x4",
         _ => $"0x{format:X}",
     };
+
+    private static int Astc4x4MipSize(int width, int height)
+        => checked(Math.Max(1, (width + 3) / 4) * Math.Max(1, (height + 3) / 4) * 16);
+
+    // Decode ASTC 4x4 blocks to the ARGB ints used by the rest of the editor.
+    private static int[] DecodeAstc4x4(byte[] data, int offset, int width, int height)
+    {
+        if (width <= 0 || height <= 0)
+            throw new ArgumentOutOfRangeException(nameof(width), "Invalid ASTC dimensions.");
+
+        var mipSize = Astc4x4MipSize(width, height);
+        if (offset < 0 || offset + mipSize > data.Length)
+            throw new InvalidDataException("ASTC payload is truncated.");
+
+        var footprint = Footprint.FromFootprintType(FootprintType.Footprint4x4);
+        using var source = new MemoryStream(data, offset, mipSize, writable: false);
+        using var destination = new MemoryStream(width * height * 4);
+        AstcDecoder.DecompressImage(source, destination, width, height, footprint);
+
+        var rgba = destination.ToArray();
+        if (rgba.Length < width * height * 4)
+            throw new InvalidDataException("ASTC decoder returned fewer pixels than expected.");
+
+        var pixels = new int[width * height];
+        for (var i = 0; i < pixels.Length; i++)
+        {
+            var o = i * 4;
+            // AstcSharp outputs RGBA8; editor pixels are ARGB packed ints (same as Color.ToArgb).
+            pixels[i] = (rgba[o + 3] << 24) | (rgba[o] << 16) | (rgba[o + 1] << 8) | rgba[o + 2];
+        }
+
+        return pixels;
+    }
 
     private readonly record struct D3dtxInfo(
         int Width,

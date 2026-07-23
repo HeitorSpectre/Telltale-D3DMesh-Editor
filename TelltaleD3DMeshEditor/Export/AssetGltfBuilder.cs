@@ -4,6 +4,7 @@ using System.Numerics;
 using TelltaleD3DMeshEditor.Core;
 using TelltaleD3DMeshEditor.Formats.Mesh;
 using TelltaleD3DMeshEditor.Formats.Skeleton;
+using TelltaleToolKit.T3Types.Animations;
 
 namespace TelltaleD3DMeshEditor.Export;
 
@@ -30,12 +31,15 @@ internal static class AssetGltfBuilder
         MeshData mesh,
         SkeletonData? skeleton,
         IReadOnlyDictionary<string, (byte[] Png, float AvgAlpha)> baseColorPngByName,
-        IReadOnlyDictionary<string, byte[]>? auxiliaryPngByName)
+        IReadOnlyDictionary<string, byte[]>? auxiliaryPngByName,
+        IReadOnlyList<(string Name, List<AnimationExporter.BoneTrack> Tracks)>? animations = null)
     {
         var bin = new List<byte>();
         var bufferViews = new List<Dictionary<string, object>>();
         var accessors = new List<Dictionary<string, object>>();
-        var primitives = new List<Dictionary<string, object>>();
+        // One glTF mesh per submesh so DCC tools (Blender) can hide/show parts independently
+        // (e.g. mouth visemes) while still sharing the same skin/armature.
+        var gltfMeshes = new List<Dictionary<string, object>>();
         var materials = new List<Dictionary<string, object>>();
         var images = new List<(string Name, byte[] Png)>();
         var textures = new List<Dictionary<string, object>>();
@@ -46,6 +50,24 @@ internal static class AssetGltfBuilder
             for (var i = 0; i < skeleton.Bones.Count; i++)
             {
                 boneIndexByHash.TryAdd(skeleton.Bones[i].Hash, i);
+            }
+        }
+
+        // Pre-compute CRC64→skinJointIndex from the mesh's combined palettes.
+        // RemapJoint returns skeleton bone indices, but JOINT_0 expects skin joint indices
+        // (0..skinJointCount-1). These differ because the skin only includes bones referenced
+        // by mesh palettes, in palette order, not the full skeleton order.
+        var crcToSkinJoint = new Dictionary<ulong, int>();
+        if (skeleton is not null)
+        {
+            var seenCrcs = new HashSet<ulong>();
+            foreach (var pal in mesh.BonePalettes)
+            {
+                foreach (var crc in pal)
+                {
+                    if (crc != 0 && boneIndexByHash.ContainsKey(crc) && seenCrcs.Add(crc))
+                        crcToSkinJoint[crc] = crcToSkinJoint.Count;
+                }
             }
         }
 
@@ -87,8 +109,10 @@ internal static class AssetGltfBuilder
         var materialMap = new Dictionary<string, int>(StringComparer.OrdinalIgnoreCase);
         var exportSkinning = skeleton is { Bones.Count: > 0 };
         var usesLineOverlayMaterials = false;
+        var usedMeshNames = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
         foreach (var submesh in mesh.Submeshes)
         {
+            var submeshPrimitives = new List<Dictionary<string, object>>();
             var vertexCount = submesh.Vertices.Count;
             var positions = new List<byte>();
             var linePositions = new List<byte>();
@@ -170,10 +194,21 @@ internal static class AssetGltfBuilder
                 }
                 if (exportSkinning)
                 {
-                    AddWeightedJoint(joints, v.Weight0, GltfCommon.RemapJoint(v.Bone0, mesh.Version, palette, boneIndexByHash));
-                    AddWeightedJoint(joints, v.Weight1, GltfCommon.RemapJoint(v.Bone1, mesh.Version, palette, boneIndexByHash));
-                    AddWeightedJoint(joints, v.Weight2, GltfCommon.RemapJoint(v.Bone2, mesh.Version, palette, boneIndexByHash));
-                    AddWeightedJoint(joints, v.Weight3, GltfCommon.RemapJoint(v.Bone3, mesh.Version, palette, boneIndexByHash));
+                    // RemapJoint returns skeleton bone index. Map to skin joint index via CRC64.
+                    int SkinJoint(int rawBone) {
+                        var skelIdx = GltfCommon.RemapJoint(rawBone, mesh.Version, palette, boneIndexByHash);
+                        if (skelIdx >= 0 && skelIdx < (skeleton?.Bones.Count ?? 0))
+                        {
+                            var crc = skeleton!.Bones[skelIdx].Hash;
+                            if (crcToSkinJoint.TryGetValue(crc, out var sj))
+                                return sj;
+                        }
+                        return skelIdx;
+                    }
+                    AddWeightedJoint(joints, v.Weight0, SkinJoint(v.Bone0));
+                    AddWeightedJoint(joints, v.Weight1, SkinJoint(v.Bone1));
+                    AddWeightedJoint(joints, v.Weight2, SkinJoint(v.Bone2));
+                    AddWeightedJoint(joints, v.Weight3, SkinJoint(v.Bone3));
                     GltfCommon.AddFloat(weights, v.Weight0); GltfCommon.AddFloat(weights, v.Weight1);
                     GltfCommon.AddFloat(weights, v.Weight2); GltfCommon.AddFloat(weights, v.Weight3);
                 }
@@ -305,6 +340,20 @@ internal static class AssetGltfBuilder
                         ["texCoord"] = TexCoordForSlot("occlusion"),
                     };
                 }
+                else if (GameConfig.Current.Id == GameId.Batman &&
+                         TryGetSlotTexture(submesh.TextureNames, textureIndexByName, "detail_diffuse", out var batDetailName, out var batDetailTexIndex) &&
+                         !batDetailName.StartsWith("packdetail", StringComparison.OrdinalIgnoreCase))
+                {
+                    // Batman's detail is a coverage map that darkens the surface, so occlusionTexture is
+                    // the closest standard slot — it makes the detail actually visible in GLB viewers
+                    // instead of being exported as an inert lines-overlay material. extras.telltaleTextures
+                    // still records the original "detail_diffuse" slot for reimport.
+                    materialDict["occlusionTexture"] = new Dictionary<string, object>
+                    {
+                        ["index"] = batDetailTexIndex,
+                        ["texCoord"] = TexCoordForSlot("diffuse"),
+                    };
+                }
                 else if (TryGetLightmapSlotTexture(submesh.TextureNames, textureIndexByName, out _, out var bakeTexIndex))
                 {
                     // glTF has no official Telltale-style baked lightmap slot. Bind the bake as the
@@ -404,7 +453,7 @@ internal static class AssetGltfBuilder
                     .ToDictionary(pair => pair.Key, pair => pair.Value, StringComparer.OrdinalIgnoreCase);
             }
 
-            primitives.Add(new Dictionary<string, object>
+            submeshPrimitives.Add(new Dictionary<string, object>
             {
                 ["attributes"] = attributes,
                 ["indices"] = indexAccessor,
@@ -420,7 +469,7 @@ internal static class AssetGltfBuilder
                 linePosAccessor ??= GltfCommon.AddAccessor(bin, bufferViews, accessors, linePositions.ToArray(), 34962, 5126, vertexCount, "VEC3",
                     new[] { lineXs.Min(), lineYs.Min(), lineZs.Min() }, new[] { lineXs.Max(), lineYs.Max(), lineZs.Max() });
                 var lineAttributes = BuildLineOverlayAttributes(attributes, linePosAccessor.Value, uvAccessor, uv2Accessor, uv3Accessor, uv4Accessor, TexCoordForSlot(lineOverlaySlot));
-                primitives.Add(new Dictionary<string, object>
+                submeshPrimitives.Add(new Dictionary<string, object>
                 {
                     ["attributes"] = lineAttributes,
                     ["indices"] = indexAccessor,
@@ -432,13 +481,46 @@ internal static class AssetGltfBuilder
                     },
                 });
             }
+
+            var meshName = BuildUniqueMeshName(submesh, usedMeshNames);
+            gltfMeshes.Add(new Dictionary<string, object>
+            {
+                ["name"] = meshName,
+                ["primitives"] = submeshPrimitives,
+            });
         }
 
-        // Nodes: 0 = mesh node. Then one node per bone when a skeleton is present.
+        // Nodes: one skinned mesh node per submesh, then bone nodes when a skeleton is present.
+        // Separate mesh nodes keep mouths/visemes hideable as individual objects in Blender while
+        // still sharing one skin (armature).
         var nodes = new List<Dictionary<string, object>>();
-        var meshNode = new Dictionary<string, object> { ["mesh"] = 0, ["name"] = mesh.Name };
-        nodes.Add(meshNode);
-        var rootNodes = new List<int> { 0 };
+        var rootNodes = new List<int>();
+        var meshNodeIndices = new List<int>();
+        for (var meshIndex = 0; meshIndex < gltfMeshes.Count; meshIndex++)
+        {
+            var meshName = gltfMeshes[meshIndex].TryGetValue("name", out var n) ? n?.ToString() ?? mesh.Name : mesh.Name;
+            var meshNode = new Dictionary<string, object>
+            {
+                ["mesh"] = meshIndex,
+                ["name"] = meshName,
+            };
+            meshNodeIndices.Add(nodes.Count);
+            nodes.Add(meshNode);
+            rootNodes.Add(meshNodeIndices[^1]);
+        }
+
+        // If there are no submeshes, keep a single empty placeholder so writers still produce a valid asset.
+        if (meshNodeIndices.Count == 0)
+        {
+            gltfMeshes.Add(new Dictionary<string, object>
+            {
+                ["name"] = mesh.Name,
+                ["primitives"] = new List<Dictionary<string, object>>(),
+            });
+            nodes.Add(new Dictionary<string, object> { ["mesh"] = 0, ["name"] = mesh.Name });
+            rootNodes.Add(0);
+            meshNodeIndices.Add(0);
+        }
 
         Dictionary<string, object>? skin = null;
         if (skeleton is not null && skeleton.Bones.Count > 0)
@@ -454,16 +536,55 @@ internal static class AssetGltfBuilder
 
             var world = BuildBoneWorldMatrices(skeleton);
 
-            var ibmBytes = new List<byte>();
+            // Build skin joints from the MESH'S BONE PALETTES, not the full skeleton.
+            // Vertex blend indices reference palette entries, which map to specific bone CRC64s.
+            // Merging submeshes appends palettes sequentially, so palette index 0 of submesh 0
+            // and palette index 0 of submesh 1 are different entries.
+            // Build CRC64→node index map first.
+            var crcToNode = new Dictionary<ulong, int>();
             for (var i = 0; i < skeleton.Bones.Count; i++)
-            {
-                Matrix4x4.Invert(world[i], out var inv);
-                inv = NormalizeInverseBindMatrix(inv);
-                foreach (var f in GltfCommon.MatrixColumnMajor(inv)) GltfCommon.AddFloat(ibmBytes, f);
-            }
-            var ibmAccessor = GltfCommon.AddAccessor(bin, bufferViews, accessors, ibmBytes.ToArray(), 0, 5126, skeleton.Bones.Count, "MAT4", null, null);
+                crcToNode.TryAdd(skeleton.Bones[i].Hash, boneNodeBase + i);
 
             var joints = new List<int>();
+            var seenJoints = new HashSet<int>();
+            foreach (var pal in mesh.BonePalettes)
+            {
+                foreach (var crc in pal)
+                {
+                    if (crcToNode.TryGetValue(crc, out var nodeIdx) && seenJoints.Add(nodeIdx))
+                        joints.Add(nodeIdx);
+                }
+            }
+            // Fill the CRC64→skinJointIndex map built earlier with the actual joint order.
+            crcToSkinJoint.Clear();
+            for (var ji = 0; ji < joints.Count; ji++)
+            {
+                var nodeIdx = joints[ji];
+                var boneIdx = nodeIdx - boneNodeBase;
+                if (boneIdx >= 0 && boneIdx < skeleton.Bones.Count)
+                    crcToSkinJoint.TryAdd(skeleton.Bones[boneIdx].Hash, ji);
+            }
+            // IMPORTANT: IBM and bone nodes must be in the SAME order as joints.
+            // Rebuild IBM in joint order.
+            var ibmBytes = new List<byte>();
+            foreach (var jointNodeIdx in joints)
+            {
+                var boneIdx = jointNodeIdx - boneNodeBase;
+                if (boneIdx >= 0 && boneIdx < skeleton.Bones.Count)
+                {
+                    Matrix4x4.Invert(world[boneIdx], out var inv);
+                    inv = NormalizeInverseBindMatrix(inv);
+                    foreach (var f in GltfCommon.MatrixColumnMajor(inv)) GltfCommon.AddFloat(ibmBytes, f);
+                }
+                else
+                {
+                    // Fill with identity
+                    for (var k = 0; k < 16; k++) ibmBytes.Add(k % 5 == 0 ? (byte)1 : (byte)0);
+                }
+            }
+            var ibmAccessor = GltfCommon.AddAccessor(bin, bufferViews, accessors, ibmBytes.ToArray(), 0, 5126, joints.Count, "MAT4", null, null);
+
+            // Create bone nodes (one per skeleton bone) and build animation hash→node map.
             for (var i = 0; i < skeleton.Bones.Count; i++)
             {
                 var b = skeleton.Bones[i];
@@ -488,12 +609,131 @@ internal static class AssetGltfBuilder
                 };
                 if (childrenByBone[i].Count > 0) node["children"] = childrenByBone[i];
                 nodes.Add(node);
-                joints.Add(boneNodeBase + i);
                 if (b.ParentIndex < 0 || b.ParentIndex >= skeleton.Bones.Count) rootNodes.Add(boneNodeBase + i);
             }
 
             skin = new Dictionary<string, object> { ["joints"] = joints, ["inverseBindMatrices"] = ibmAccessor };
-            meshNode["skin"] = 0;
+            foreach (var meshNodeIndex in meshNodeIndices)
+            {
+                nodes[meshNodeIndex]["skin"] = 0;
+            }
+        }
+
+        // Build glTF animations from decompressed Telltale animation data.
+        var gltfAnimations = new List<Dictionary<string, object>>();
+        if (animations is not null && skeleton is not null && skeleton.Bones.Count > 0)
+        {
+            // Build bone hash → glTF node index map (bone nodes start after mesh nodes)
+            var hashToNode = new Dictionary<ulong, int>();
+            var boneNodeOffset = meshNodeIndices.Count > 0 ? meshNodeIndices[^1] + 1 : nodes.Count;
+            for (var i = 0; i < skeleton.Bones.Count; i++)
+            {
+                hashToNode[skeleton.Bones[i].Hash] = boneNodeOffset + i;
+            }
+
+            // Build bone hash → rest-pose translation length (Hydra asset.cpp line 109 scaling)
+            var hashToTransLen = new Dictionary<ulong, float>();
+            for (var i = 0; i < skeleton.Bones.Count; i++)
+            {
+                var b = skeleton.Bones[i];
+                var len = MathF.Sqrt(b.X * b.X + b.Y * b.Y + b.Z * b.Z);
+                if (len < 1e-8f) len = 1.0f;
+                hashToTransLen[b.Hash] = len;
+            }
+
+            foreach (var (animName, tracks) in animations)
+            {
+                if (tracks.Count == 0) continue;
+
+                var samplers = new List<Dictionary<string, object>>();
+                var channels = new List<Dictionary<string, object>>();
+
+                foreach (var track in tracks)
+                {
+                    if (!hashToNode.TryGetValue(track.BoneHash, out var nodeIdx))
+                        continue;
+                    if (track.Times.Count < 2) continue;
+
+                    // Build time accessor (shared for both trans + rot channels)
+                    var timeFloats = track.Times.ToArray();
+                    var timeAccessor = GltfCommon.AddAccessor(
+                        bin, bufferViews, accessors,
+                        timeFloats.SelectMany(GltfCommon.SerializeFloat).ToArray(),
+                        0, 5126, timeFloats.Length, "SCALAR",
+                        new[] { timeFloats.Min() }, new[] { timeFloats.Max() });
+
+                    var timeIdx = accessors.Count - 1;
+
+                    // Translation channel — apply Hydra vec.Length() scaling (asset.cpp:109)
+                    if (track.Translations.Count == track.Times.Count)
+                    {
+                        var scale = hashToTransLen.TryGetValue(track.BoneHash, out var s) ? s : 1.0f;
+                        var transBytes = track.Translations
+                            .SelectMany(t => new[] { t.X * scale, t.Y * scale, t.Z * scale })
+                            .SelectMany(GltfCommon.SerializeFloat)
+                            .ToArray();
+                        var transAccessor = GltfCommon.AddAccessor(
+                            bin, bufferViews, accessors,
+                            transBytes, 0, 5126, track.Translations.Count, "VEC3",
+                            null, null);
+
+                        samplers.Add(new Dictionary<string, object>
+                        {
+                            ["input"] = timeIdx,
+                            ["output"] = accessors.Count - 1,
+                            ["interpolation"] = "LINEAR",
+                        });
+                        channels.Add(new Dictionary<string, object>
+                        {
+                            ["sampler"] = samplers.Count - 1,
+                            ["target"] = new Dictionary<string, object>
+                            {
+                                ["node"] = nodeIdx,
+                                ["path"] = "translation",
+                            },
+                        });
+                    }
+
+                    // Rotation channel
+                    if (track.Rotations.Count == track.Times.Count)
+                    {
+                        var rotBytes = track.Rotations
+                            .SelectMany(r => new[] { r.X, r.Y, r.Z, r.W })
+                            .SelectMany(GltfCommon.SerializeFloat)
+                            .ToArray();
+                        var rotAccessor = GltfCommon.AddAccessor(
+                            bin, bufferViews, accessors,
+                            rotBytes, 0, 5126, track.Rotations.Count, "VEC4",
+                            null, null);
+
+                        samplers.Add(new Dictionary<string, object>
+                        {
+                            ["input"] = timeIdx,
+                            ["output"] = accessors.Count - 1,
+                            ["interpolation"] = "LINEAR",
+                        });
+                        channels.Add(new Dictionary<string, object>
+                        {
+                            ["sampler"] = samplers.Count - 1,
+                            ["target"] = new Dictionary<string, object>
+                            {
+                                ["node"] = nodeIdx,
+                                ["path"] = "rotation",
+                            },
+                        });
+                    }
+                }
+
+                if (channels.Count > 0 && samplers.Count > 0)
+                {
+                    gltfAnimations.Add(new Dictionary<string, object>
+                    {
+                        ["name"] = animName,
+                        ["channels"] = channels,
+                        ["samplers"] = samplers,
+                    });
+                }
+            }
         }
 
         var gltf = new Dictionary<string, object>
@@ -509,13 +749,14 @@ internal static class AssetGltfBuilder
                         ["kind"] = "asset",
                         ["meshVersion"] = mesh.Version,
                         ["hasSkeleton"] = skeleton is not null,
+                        ["separateSubmeshNodes"] = true,
                     },
                 },
             },
             ["scene"] = 0,
             ["scenes"] = new[] { new Dictionary<string, object> { ["nodes"] = rootNodes } },
             ["nodes"] = nodes,
-            ["meshes"] = new[] { new Dictionary<string, object> { ["name"] = mesh.Name, ["primitives"] = primitives } },
+            ["meshes"] = gltfMeshes,
             ["materials"] = materials,
             ["accessors"] = accessors,
             ["bufferViews"] = bufferViews,
@@ -530,8 +771,103 @@ internal static class AssetGltfBuilder
             gltf["extensionsUsed"] = new[] { "KHR_materials_unlit" };
         }
         if (skin is not null) gltf["skins"] = new[] { skin };
+        if (gltfAnimations.Count > 0) gltf["animations"] = gltfAnimations;
 
         return new BuiltAsset { Gltf = gltf, Bin = bin, Images = images };
+    }
+
+    private static string BuildUniqueMeshName(SubmeshData submesh, HashSet<string> usedNames)
+    {
+        // Prefer the source part stem (before '/') so mouths show as mouthDefault / mouthAA, etc.
+        var raw = submesh.Name;
+        if (string.IsNullOrWhiteSpace(raw))
+        {
+            raw = submesh.MaterialName;
+        }
+        if (string.IsNullOrWhiteSpace(raw))
+        {
+            raw = "part";
+        }
+
+        // Combined exports use "partStem/materialName" — keep the part stem for object names.
+        var slash = raw.LastIndexOf('/');
+        if (slash >= 0 && slash + 1 < raw.Length)
+        {
+            // Prefer the left side (source mesh stem) when it looks like a part name.
+            var left = raw[..slash];
+            var right = raw[(slash + 1)..];
+            raw = left.Contains("mouth", StringComparison.OrdinalIgnoreCase) ||
+                  left.Contains("eye", StringComparison.OrdinalIgnoreCase) ||
+                  left.Contains("arm", StringComparison.OrdinalIgnoreCase) ||
+                  left.Contains("leg", StringComparison.OrdinalIgnoreCase) ||
+                  left.Contains("head", StringComparison.OrdinalIgnoreCase) ||
+                  left.Contains("body", StringComparison.OrdinalIgnoreCase) ||
+                  left.Contains("tentacle", StringComparison.OrdinalIgnoreCase) ||
+                  left.Contains("shoulder", StringComparison.OrdinalIgnoreCase) ||
+                  left.Contains("brow", StringComparison.OrdinalIgnoreCase)
+                ? left
+                : (right.Length > 0 ? right : left);
+        }
+
+        // Strip common character prefixes so Blender outliner stays readable.
+        var name = Path.GetFileNameWithoutExtension(raw);
+        var underscore = name.IndexOf('_');
+        // Keep short unique tails like mouthDefault when the full stem is skM1_..._mouthDefault
+        if (name.Contains("mouth", StringComparison.OrdinalIgnoreCase) ||
+            name.Contains("eye", StringComparison.OrdinalIgnoreCase) ||
+            name.Contains("tentacle", StringComparison.OrdinalIgnoreCase))
+        {
+            var last = name.LastIndexOf('_');
+            if (last > 0 && last + 1 < name.Length)
+            {
+                // Prefer the meaningful suffix after the character prefix when present.
+                // e.g. skM1_prismarineColossi_mouthDefault -> mouthDefault
+                var maybe = name[(last + 1)..];
+                if (maybe.StartsWith("mouth", StringComparison.OrdinalIgnoreCase) ||
+                    maybe.StartsWith("eye", StringComparison.OrdinalIgnoreCase) ||
+                    maybe.StartsWith("tentacle", StringComparison.OrdinalIgnoreCase) ||
+                    maybe.StartsWith("arm", StringComparison.OrdinalIgnoreCase) ||
+                    maybe.StartsWith("leg", StringComparison.OrdinalIgnoreCase) ||
+                    maybe.StartsWith("head", StringComparison.OrdinalIgnoreCase) ||
+                    maybe.StartsWith("body", StringComparison.OrdinalIgnoreCase) ||
+                    maybe.StartsWith("brow", StringComparison.OrdinalIgnoreCase) ||
+                    maybe.StartsWith("shoulder", StringComparison.OrdinalIgnoreCase))
+                {
+                    name = maybe;
+                }
+                else
+                {
+                    // For multi-word tails like backBackTentacleLeft keep from first meaningful token.
+                    var idx = name.IndexOf("_mouth", StringComparison.OrdinalIgnoreCase);
+                    if (idx < 0) idx = name.IndexOf("_eye", StringComparison.OrdinalIgnoreCase);
+                    if (idx < 0) idx = name.IndexOf("_tentacle", StringComparison.OrdinalIgnoreCase);
+                    if (idx < 0) idx = name.IndexOf("Tentacle", StringComparison.OrdinalIgnoreCase);
+                    if (idx >= 0)
+                    {
+                        name = name[(idx + (name[idx] == '_' ? 1 : 0))..];
+                    }
+                }
+            }
+        }
+        else if (underscore > 0)
+        {
+            // Generic: use full stem (unique enough for body/head/arms)
+            // keep name as-is
+        }
+
+        if (string.IsNullOrWhiteSpace(name))
+        {
+            name = "part";
+        }
+
+        var unique = name;
+        var suffix = 2;
+        while (!usedNames.Add(unique))
+        {
+            unique = $"{name}_{suffix++}";
+        }
+
+        return unique;
     }
 
     private static Dictionary<string, object> BuildRichSkeletonExtras(BoneData bone)
@@ -931,6 +1267,18 @@ internal static class AssetGltfBuilder
         out string textureName,
         out int textureIndex)
     {
+        // Batman's "_detail" is not the alpha-keyed ink layer this overlay was built for: it is a
+        // coverage/relief map with no ink alpha at all. Building a lines-overlay material for it exports
+        // a second material that renders as nothing, which is why the detail never showed up in the GLB.
+        // The detail image is still exported and referenced by the base material below.
+        if (GameConfig.Current.Id == GameId.Batman)
+        {
+            slot = "";
+            textureName = "";
+            textureIndex = -1;
+            return false;
+        }
+
         foreach (var candidateSlot in new[] { "detail_diffuse", "tex7", "tex8" })
         {
             if (TryGetSlotTexture(textureNames, textureIndexByName, candidateSlot, out textureName, out textureIndex) &&

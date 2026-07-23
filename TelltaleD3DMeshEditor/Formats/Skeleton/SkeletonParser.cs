@@ -70,6 +70,15 @@ public static class SkeletonParser
             }
 
             var parentIndex = reader.ReadInt32();
+
+            // Batman: The Telltale Series and the rest of the Telltale "GotG" family (mesh versions
+            // 42/45/46) repeat the bone's name symbol as an 8-byte hash right after the parent index,
+            // which the older (v13-v25) skeleton layout does not carry.
+            if (version >= 42)
+            {
+                reader.Skip(8);
+            }
+
             var x = reader.ReadFloat();
             var y = reader.ReadFloat();
             var z = reader.ReadFloat();
@@ -78,11 +87,23 @@ public static class SkeletonParser
             var qz = reader.ReadFloat();
             var qw = reader.ReadFloat();
 
+            // Note: the GotG family (Batman, .skl v46) stores its real bind pose in the rich
+            // RestXform/translation-scale fields skipped below, so this lightweight local pose alone does
+            // not reproduce the mesh's pose. SkeletonLoader routes those skeletons through the Telltale
+            // Toolkit instead; this reader stays a structural fallback (keeps the v46 walk aligned).
+
             reader.ReadUInt32();
             reader.Skip(3 * 4);
             reader.ReadFloat();
             reader.Skip(3 * 4);
             reader.Skip(9 * 4);
+
+            // The GotG-family rich transform carries one extra 4-byte field before the IK/animation
+            // group table.
+            if (version >= 42)
+            {
+                reader.Skip(4);
+            }
 
             reader.ReadUInt32();
             var ikCount = checked((int)reader.ReadUInt32());

@@ -108,6 +108,10 @@ public static class TextureHashDatabase
         return $"0x{combined:X16}";
     }
 
+    // The ambient texture folder set by UseTextureFolder (the folder of the mesh being parsed),
+    // exposed so v45 external-material resolution can scan for sibling .prop files.
+    public static string? CurrentFolder => CurrentTextureFolder.Value;
+
     public static IDisposable UseTextureFolder(string? folder)
     {
         var previous = CurrentTextureFolder.Value;

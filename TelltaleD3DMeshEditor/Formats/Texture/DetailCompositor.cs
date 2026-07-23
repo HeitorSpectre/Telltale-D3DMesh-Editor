@@ -28,6 +28,58 @@ public static class DetailCompositor
         var dg = (detailArgb >> 8) & 0xFF;
         var db = detailArgb & 0xFF;
 
+        // Batman and the rest of the GotG family do not use the alpha-keyed ink-line layer this
+        // compositor was built for, so the treatment is chosen by the SOURCE FORMAT:
+        //  - BC5 is a two-channel DERIVATIVE NORMAL map. Its "yellow lines on a blue field" look is the
+        //    reconstructed Z, not ink; multiplying it into albedo painted black creases and blotches.
+        //    It belongs to shading, never to albedo.
+        //  - BC4 is a single-channel grime/wear map: real colour detail that multiplies albedo, and the
+        //    layer that makes clothing and environment surfaces stop looking flat.
+        if (Core.GameConfig.Current.Id == Core.GameId.Batman)
+        {
+            var ba = (baseArgb >> 24) & 0xFF;
+            var bbr = (baseArgb >> 16) & 0xFF;
+            var bbg = (baseArgb >> 8) & 0xFF;
+            var bbb = baseArgb & 0xFF;
+
+            // BC5 whose two channels are identical is a duplicated single channel: a coverage mask for
+            // stubble, pores, seams and grime. It darkens the albedo where the detail sits. The strength
+            // stays moderate on purpose — these masks are sparse and high-frequency, so a harsh factor
+            // stamps isolated pixels as black dots instead of reading as surface texture.
+            if (detail.IsTwoChannelDerivativeMap && detail.HasDuplicatedChannels)
+            {
+                var coverage = ((detail.Sample(u, v) >> 16) & 0xFF) / 255f;
+                if (coverage < 0.01f)
+                {
+                    return baseArgb;
+                }
+
+                var shade = Math.Clamp(1f - coverage * 0.45f, 0.55f, 1f);
+                return Color.FromArgb(ba, (int)(bbr * shade), (int)(bbg * shade), (int)(bbb * shade)).ToArgb();
+            }
+
+            // A genuine two-channel map describes relief, which the shading path handles.
+            if (detail.IsTwoChannelDerivativeMap)
+            {
+                return baseArgb;
+            }
+
+            if (detail.IsSingleChannelMap)
+            {
+                // Single-channel grime/cavity follows the ambient-occlusion convention: white leaves the
+                // albedo untouched and darker values occlude. Centring on mid-grey instead (the previous
+                // behaviour) BRIGHTENED every pixel above 0.5, which reads as an inverted detail layer.
+                var lum = (0.299f * dr + 0.587f * dg + 0.114f * db) / 255f;
+                var factor = Math.Clamp(0.5f + lum * 0.5f, 0.5f, 1f);
+                return Color.FromArgb(ba, Math.Clamp((int)(bbr * factor), 0, 255),
+                    Math.Clamp((int)(bbg * factor), 0, 255), Math.Clamp((int)(bbb * factor), 0, 255)).ToArgb();
+            }
+
+            // Any other format: leave albedo alone rather than guess. Guessing is what produced the
+            // black blotches and the inverted-looking coverage.
+            return baseArgb;
+        }
+
         var a = (baseArgb >> 24) & 0xFF;
         var br = (baseArgb >> 16) & 0xFF;
         var bg = (baseArgb >> 8) & 0xFF;

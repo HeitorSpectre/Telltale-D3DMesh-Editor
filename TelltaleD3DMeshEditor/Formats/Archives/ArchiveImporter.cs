@@ -9,8 +9,15 @@ namespace TelltaleD3DMeshEditor.Formats.Archives;
 // Everything else (preview, edit, reimport) is still handled by this project's own parsers.
 public static class ArchiveImporter
 {
-    // Asset extensions the editor can load from the extracted folder.
-    private static readonly string[] AssetExtensions = [".d3dmesh", ".d3dtx", ".skl"];
+    // Asset extensions the editor can load from the extracted folder. Animations (.anm) come along
+    // so "Extract with Animations..." can find them next to the meshes.
+    private static readonly string[] AssetExtensions = [".d3dmesh", ".d3dtx", ".skl", ".anm"];
+
+    // Character material property sets live outside the mesh on some games (e.g. MCSM S2
+    // skM1_radar/axel): pull sk*.prop alongside so external materials can be resolved later.
+    private static bool IsWantedProp(string entryName)
+        => entryName.EndsWith(".prop", StringComparison.OrdinalIgnoreCase) &&
+           Path.GetFileName(entryName).StartsWith("sk", StringComparison.OrdinalIgnoreCase);
 
     // Archive extensions we can open. Used to build the open-file dialog filter.
     public static readonly string[] ArchiveExtensions = [".ttarch", ".ttarch2"];
@@ -58,7 +65,8 @@ public static class ArchiveImporter
         // walking forward by offset keeps reads sequential and speeds up extraction (suggested by the
         // TelltaleToolKit author).
         var entries = archive.GetAllEntries()
-            .Where(e => AssetExtensions.Contains(Path.GetExtension(e.Name), StringComparer.OrdinalIgnoreCase))
+            .Where(e => AssetExtensions.Contains(Path.GetExtension(e.Name), StringComparer.OrdinalIgnoreCase) ||
+                        IsWantedProp(e.Name))
             .OrderBy(e => e.Offset)
             .ToList();
 

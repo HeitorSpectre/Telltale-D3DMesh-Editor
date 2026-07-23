@@ -31,6 +31,67 @@ public static class SkeletonRebuilder
     // skeleton comes out byte-identical to the game's file; moved/added joints are applied faithfully.
     // <paramref name="translationScaleDonor"/> (optional) supplies per-bone translation scales from
     // the imported model's own skeleton, replacing the target's retarget scales bone-by-bone.
+    // MCSM Season 2 (.skl v45+) rebuild. These skeletons carry BOTH a raw local pose and the rich
+    // RestXform pose, and the reader (Telltale Toolkit) reports the rich one — which is what the
+    // exported GLB carries. Merging the GLB's pose straight onto the raw fields therefore mixes two
+    // different spaces and tilts the rig. Instead the edit is applied as a DELTA against the
+    // template read through the SAME reader, and that delta is added to every pose field. An
+    // unedited rig yields a delta of zero, so the file comes out byte-identical.
+    public static byte[] RebuildV45WithEdits(string originalSklPath, SkeletonData edited)
+    {
+        var (skeleton, config, _) = Read(originalSklPath);
+        var reference = SkeletonLoader.Load(originalSklPath, 45);
+        var referenceByHash = new Dictionary<ulong, BoneData>();
+        foreach (var bone in reference.Bones)
+        {
+            referenceByHash.TryAdd(bone.Hash, bone);
+        }
+
+        var editedByHash = new Dictionary<ulong, BoneData>();
+        foreach (var bone in edited.Bones)
+        {
+            editedByHash.TryAdd(bone.Hash, bone);
+        }
+
+        const float epsilon = 1e-5f;
+        foreach (var entry in skeleton.Entries)
+        {
+            var hash = entry.JointName?.Crc64 ?? 0;
+            if (hash == 0 ||
+                !editedByHash.TryGetValue(hash, out var imported) ||
+                !referenceByHash.TryGetValue(hash, out var original))
+            {
+                continue;
+            }
+
+            var deltaPosition = new Vector3(imported.X - original.X, imported.Y - original.Y, imported.Z - original.Z);
+            var originalRotation = NormalizeQuaternion(new Quaternion(original.Qx, original.Qy, original.Qz, original.Qw));
+            var importedRotation = NormalizeQuaternion(new Quaternion(imported.Qx, imported.Qy, imported.Qz, imported.Qw));
+            var deltaRotation = NormalizeQuaternion(importedRotation * Quaternion.Inverse(originalRotation));
+
+            var rotated = MathF.Abs(deltaRotation.W) < 1f - epsilon;
+            if (deltaPosition.Length() < epsilon && !rotated)
+            {
+                continue; // bone unchanged: keep every original field untouched
+            }
+
+            entry.LocalPosition += deltaPosition;
+            entry.LocalQuat = NormalizeQuaternion(deltaRotation * NormalizeQuaternion(entry.LocalQuat));
+            if (entry.RestXform is not null)
+            {
+                entry.RestXform.Translation += deltaPosition;
+                entry.RestXform.Rotation = NormalizeQuaternion(deltaRotation * NormalizeQuaternion(entry.RestXform.Rotation));
+            }
+        }
+
+        using var output = new MemoryStream();
+        Toolkit.Instance.Serialize(skeleton, output, config);
+        return output.ToArray();
+    }
+
+    private static Quaternion NormalizeQuaternion(Quaternion value)
+        => value.LengthSquared() < 1e-8f ? Quaternion.Identity : Quaternion.Normalize(value);
+
     public static byte[] RebuildWithEdits(string originalSklPath, SkeletonData edited, SkeletonData? translationScaleDonor = null)
     {
         var (skeleton, config, _) = Read(originalSklPath);

@@ -22,6 +22,7 @@ public enum GameId
     MinecraftStoryModeSeason2 = 17,
     GameOfThrones = 18,
     WalkingDeadMichonne = 19,
+    Batman = 20,
 }
 
 // Per-game settings, so behaviour specific to one game stays isolated and never affects another. The
@@ -301,6 +302,23 @@ public sealed class GameConfig
     {
         Id = GameId.MinecraftStoryModeSeason2,
         DisplayName = "Minecraft: Story Mode - Season 2",
+        ModernTextureToolkitGameName = "Minecraft: Story Mode - Season 2",
+        UsesCompanionAlphaTextures = false,
+        ClearInheritedBakeOnReimport = false,
+        ClearInheritedSecondaryTexturesOnReimport = false,
+        PreferGltfTextureNamesOnReimport = false,
+        PreferSemanticTemplateTextureNamesOnReimport = false,
+        RemoveEyeHelperPrimitivesOnReimport = false,
+        SplitBodyLineAlphaOnReimport = false,
+        InvertBodyLineAlphaOnReimport = false,
+        InvertHeadLineAlphaOnReimport = false,
+        InvertHandLineAlphaOnReimport = false,
+        TreatAdvObj000TexturesAsBake = false,
+        PixelatedGltfTextures = true,
+        PreserveSkeletonDerivedFieldsOnMerge = true,
+        PortTranslationScalesOnSkeletonMerge = true,
+        PortCompanionVariantPartsOnReimport = true,
+        DisableCharacterSpecificFacialRetargetOnReimport = true,
     };
 
     public static readonly GameConfig TalesFromTheBorderlands2014 = new()
@@ -397,6 +415,30 @@ public sealed class GameConfig
         DisableCharacterSpecificFacialRetargetOnReimport = true,
     };
 
+    public static readonly GameConfig Batman = new()
+    {
+        Id = GameId.Batman,
+        DisplayName = "Batman - The Telltale Series",
+        ModernTextureToolkitGameName = "Batman: The Telltale Series",
+        UsesCompanionAlphaTextures = false,
+        ClearInheritedBakeOnReimport = false,
+        ClearInheritedSecondaryTexturesOnReimport = true,
+        PreferGltfTextureNamesOnReimport = false,
+        PreserveSecondaryTextureNamesOnReimport = true,
+        PreferSemanticTemplateTextureNamesOnReimport = false,
+        RemoveEyeHelperPrimitivesOnReimport = false,
+        SplitBodyLineAlphaOnReimport = false,
+        InvertBodyLineAlphaOnReimport = false,
+        InvertHeadLineAlphaOnReimport = false,
+        InvertHandLineAlphaOnReimport = false,
+        TreatAdvObj000TexturesAsBake = false,
+        PixelatedGltfTextures = false,
+        PreserveSkeletonDerivedFieldsOnMerge = false,
+        PortTranslationScalesOnSkeletonMerge = false,
+        PortCompanionVariantPartsOnReimport = false,
+        DisableCharacterSpecificFacialRetargetOnReimport = true,
+    };
+
     public static readonly GameConfig BackToTheFuture = CreateBackToTheFuture(GameId.BackToTheFuture, "Back to the Future: The Game");
     public static readonly GameConfig BackToTheFutureEpisode1 = CreateBackToTheFuture(GameId.BackToTheFutureEpisode1, "Back to the Future: Episode 1 - It's About Time");
     public static readonly GameConfig BackToTheFutureEpisode2 = CreateBackToTheFuture(GameId.BackToTheFutureEpisode2, "Back to the Future: Episode 2 - Get Tannen!");
@@ -413,11 +455,13 @@ public sealed class GameConfig
         WalkingDeadMichonne,
         MinecraftStoryModeGroup,
         MinecraftStoryMode,
+        MinecraftStoryModeSeason2,
         TalesFromTheBorderlands,
         TalesFromTheBorderlands2014,
         TalesFromTheBorderlandsE3,
         TalesFromTheBorderlandsOld,
         GameOfThrones,
+        Batman,
         BackToTheFuture,
         BackToTheFutureEpisode1,
         BackToTheFutureEpisode2,

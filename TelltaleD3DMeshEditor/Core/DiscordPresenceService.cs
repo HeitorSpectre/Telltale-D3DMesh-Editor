@@ -129,6 +129,7 @@ public sealed class DiscordPresenceService : IDisposable
             GameId.TalesFromTheBorderlandsOld => "tftbold",
             GameId.TalesFromTheBorderlands2021 => "tftb2021",
             GameId.GameOfThrones => "got",
+            GameId.Batman => "bat",
             GameId.BackToTheFuture => "bttf",
             GameId.BackToTheFutureEpisode1 => "bttf101",
             GameId.BackToTheFutureEpisode2 => "bttf102",

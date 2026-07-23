@@ -101,6 +101,19 @@ public static class D3DMeshParser
         {
             return ParseV25(reader, name, version);
         }
+        // Batman: The Telltale Series (and the rest of the Telltale "GotG" family, v42/45/46) use a
+        // close cousin of the v25 layout with several concrete differences; it has its own reader.
+        if (version == 46)
+        {
+            return ParseV46(reader, name, version);
+        }
+        // Minecraft: Story Mode - Season 2 (v45) is parsed through the Telltale Toolkit's modern
+        // T3MeshData path (GFX vertex states + per-channel TexCoordTransform).
+        if (version == 45)
+        {
+            return TelltaleToolkitMeshParser.ParseModernMesh(data, name,
+                GameConfig.MinecraftStoryModeSeason2.ModernTextureToolkitGameName);
+        }
 
         reader.Skip(version == 1 ? 1 : version >= 13 ? 4 : 5);
         reader.ReadVec3();
@@ -767,6 +780,685 @@ public static class D3DMeshParser
         return mesh;
     }
 
+    // Batman: The Telltale Series (.d3dmesh version 46), the Telltale "GotG" family container shared by
+    // versions 42/45/46. It is a close cousin of the v25 (TWD: Michonne) T3MeshData layout, with several
+    // concrete differences that require their own walk: the post-name header skips 0x19 bytes (v25 skips
+    // 1), each LOD submesh entry carries two extra fields (vertex start and face-point count), the
+    // material-group entries are 76 bytes, the 3H transform block is 104 bytes, bones are raw bytes (v25
+    // divides by 3), UVs use the snorm short2 formats 24/25, and a secondary index buffer (faceB) sits
+    // between the face buffer and the vertex buffers.
+    private static MeshData ParseV46(DataReader reader, string name, int version)
+    {
+        // The caller has already read the name and version field; the Batman header carries 0x19 (25)
+        // bytes of bounds/toon data before the material instance table.
+        reader.Skip(0x19);
+
+        // Placeholder meshes carry no material instances and no geometry block at all.
+        if (reader.PeekUInt32() == 0)
+        {
+            return new MeshData { Name = name, Version = version };
+        }
+
+        var materialsByHash = ReadV46Materials(reader);
+
+        // The geometry block (T3MeshData) is a sized block whose index/face buffer begins exactly at its
+        // end: blockEnd = sizeFieldOffset + size. After reading the leading u32 and the size u32,
+        // reader.Position is sizeFieldOffset + 4, hence faceDataStart = reader.Position + size - 4.
+        reader.ReadUInt32();
+        var geometryBlockSize = checked((int)reader.ReadUInt32());
+        var faceDataStart = reader.Position + geometryBlockSize - 4;
+
+        var infos = ReadV46LodSubmeshes(reader);
+
+        // Header 3B (per-batch info, 76 bytes each).
+        SkipV25SizedBlock(reader, static (r, count) => r.Skip(count * 76));
+
+        // Header 3C (material groups, 76 bytes each). The group's material hash maps a submesh's material
+        // index back to the textures resolved from the material instance table.
+        var groupHashes = ReadV46MaterialGroups(reader);
+
+        // Header 3D (16-byte entries).
+        SkipV25SizedBlock(reader, static (r, count) => r.Skip(count * 16));
+
+        // Header 3E: the single bone palette for this mesh file (56-byte entries).
+        var (bonePalette, bonePaletteEntries) = ReadV46BonePalette(reader);
+
+        // Header 3F / 3G: opaque sized blocks.
+        reader.Skip(checked((int)reader.ReadUInt32() - 4));
+        reader.Skip(checked((int)reader.ReadUInt32() - 4));
+
+        // Header 3H: a 104-byte transform/bounds block, then the UV clamp scales.
+        reader.Skip(104);
+        var vertexCountHint = checked((int)reader.ReadUInt32());
+        reader.ReadUInt32();
+        var uvLayerCount = checked((int)reader.ReadUInt32());
+        var uvScales = new V25UvScale[7];
+        for (var i = 0; i < uvScales.Length; i++)
+        {
+            uvScales[i] = new V25UvScale(1f, 1f, 0f, 0f);
+        }
+        for (var i = 0; i < uvLayerCount; i++)
+        {
+            var layer = checked((int)reader.ReadUInt32() + 1);
+            var scale = new V25UvScale(reader.ReadFloat(), reader.ReadFloat(), reader.ReadFloat(), reader.ReadFloat());
+            if (layer >= 1 && layer < uvScales.Length)
+            {
+                uvScales[layer] = scale;
+            }
+        }
+
+        // Vertex buffer descriptor (3H-3): how each attribute maps to a buffer/format/offset.
+        reader.Skip(16);
+        var bufferCount = checked((int)reader.ReadUInt32());
+        var elements = new List<V46VertexElement>(bufferCount);
+        for (var i = 0; i < bufferCount; i++)
+        {
+            var type = checked((int)reader.ReadUInt32() + 1);
+            var format = checked((int)reader.ReadUInt32() + 1);
+            var layer = checked((int)reader.ReadUInt32() + 1);
+            var buffer = checked((int)reader.ReadUInt32() + 1);
+            var offset = checked((int)reader.ReadUInt32()); // 0-based byte offset within its buffer
+            elements.Add(new V46VertexElement(type, format, layer, buffer, offset));
+        }
+
+        // 3I-1 face buffer A.
+        reader.Skip(12);
+        var facePointCount = checked((int)reader.ReadUInt32());
+        reader.ReadUInt32();
+
+        // 3I-2 face buffer B (a secondary index buffer; present only when its element length is 2).
+        reader.Skip(12);
+        var facePointCountB = checked((int)reader.ReadUInt32());
+        var faceLengthB = reader.ReadUInt32();
+        if (faceLengthB != 0x02)
+        {
+            reader.Seek(reader.Position - 0x14);
+            facePointCountB = 0;
+        }
+
+        // 3I-3 vertex buffer info, 3I-4 UV buffer info.
+        reader.Skip(12);
+        var vertexCount = checked((int)reader.ReadUInt32());
+        reader.ReadUInt32();
+        reader.Skip(12);
+        var uvVertexCount = checked((int)reader.ReadUInt32());
+        var uvLength = reader.ReadUInt32();
+        if (uvLength >= 0x40)
+        {
+            reader.Seek(reader.Position - 0x14);
+            uvVertexCount = 0;
+        }
+
+        var totalVertices = Math.Max(vertexCount, Math.Max(uvVertexCount, vertexCountHint));
+
+        // Faces (buffer A), then skip the secondary index buffer to reach the vertex buffers.
+        reader.Seek(faceDataStart);
+        var rawFaces = new List<(int A, int B, int C)>(facePointCount / 3);
+        for (var i = 0; i < facePointCount / 3; i++)
+        {
+            rawFaces.Add((reader.ReadUInt16() + 1, reader.ReadUInt16() + 1, reader.ReadUInt16() + 1));
+        }
+        reader.Skip(facePointCountB / 3 * 6);
+
+        var vertices = ReadV46Vertices(reader, totalVertices, elements, uvScales);
+
+        var mesh = new MeshData { Name = name, Version = version };
+        mesh.BonePalettes.Add(bonePalette);
+        mesh.BonePaletteEntries.Add(bonePaletteEntries);
+
+        foreach (var info in infos)
+        {
+            var materialTextures = info.MaterialIndex > 0 && info.MaterialIndex <= groupHashes.Count &&
+                                   materialsByHash.TryGetValue(groupHashes[info.MaterialIndex - 1], out var textures)
+                ? textures
+                : new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+            var materialName = materialTextures.TryGetValue("diffuse", out var diffuse) &&
+                               !string.IsNullOrWhiteSpace(diffuse) &&
+                               !diffuse.Equals("undefined", StringComparison.OrdinalIgnoreCase)
+                ? diffuse
+                : $"material_{info.Index + 1}";
+            var submesh = new SubmeshData
+            {
+                Name = materialName,
+                MaterialName = materialName,
+                BonePaletteIndex = NormalizePaletteIndex(info.BoneSetIndex, bonePalette.Length > 0 ? 1 : 0),
+                SourceSubmeshIndex = info.Index,
+            };
+            foreach (var (slot, value) in materialTextures)
+            {
+                if (!string.IsNullOrWhiteSpace(value) && !value.Equals("undefined", StringComparison.OrdinalIgnoreCase))
+                {
+                    submesh.TextureNames[slot] = value;
+                }
+            }
+
+            // v46 stores faces with global vertex indices and the per-submesh vertex ranges overlap, so
+            // gather exactly the vertices each submesh's faces reference (the RTB importer does the same).
+            AppendSubmeshGeometry(submesh, info, vertices, rawFaces, multiStream: true);
+            if (submesh.Vertices.Count > 0 && submesh.Faces.Count > 0)
+            {
+                mesh.Submeshes.Add(submesh);
+            }
+        }
+
+        if (mesh.Submeshes.Count == 0)
+        {
+            if (IsIntentionallyEmptyMesh(facePointCount, infos))
+            {
+                return mesh;
+            }
+
+            throw new InvalidDataException("No submesh with valid triangles was found.");
+        }
+
+        return mesh;
+    }
+
+    private static Dictionary<ulong, Dictionary<string, string>> ReadV46Materials(DataReader reader)
+    {
+        var materialCount = checked((int)reader.ReadUInt32());
+        var result = new Dictionary<ulong, Dictionary<string, string>>();
+        for (var i = 0; i < materialCount; i++)
+        {
+            var matLow = reader.ReadUInt32();
+            var matHigh = reader.ReadUInt32();
+            reader.Skip(8); // unknown hash
+            var materialEnd = reader.Position + checked((int)reader.ReadUInt32());
+            reader.Skip(12); // MatUnk1, MatUnk2, MatHeaderSizeB
+            var unkHashCount = checked((int)reader.ReadUInt32());
+            reader.Skip(unkHashCount * 8);
+            var parameterCount = checked((int)reader.ReadUInt32());
+
+            var textures = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+            for (var p = 0; p < parameterCount && reader.Position < materialEnd; p++)
+            {
+                var sectionLow = reader.ReadUInt32();
+                var sectionHigh = reader.ReadUInt32();
+                var sectionCount = checked((int)reader.ReadUInt32());
+                if (sectionHigh == 0x52A09151 && sectionLow == 0xF1C3F2C7)
+                {
+                    for (var t = 0; t < sectionCount; t++)
+                    {
+                        var typeLow = reader.ReadUInt32();
+                        var typeHigh = reader.ReadUInt32();
+                        var texLow = reader.ReadUInt32();
+                        var texHigh = reader.ReadUInt32();
+                        var slot = GetV46TextureSlot(typeHigh, typeLow);
+                        if (slot is null || textures.ContainsKey(slot))
+                        {
+                            continue;
+                        }
+
+                        var textureName = TextureHashDatabase.Resolve(texLow, texHigh);
+
+                        // The engine parks an unused slot on a solid "color_*" swatch. Recording those
+                        // would hand the pipeline a black overlay for every slot a material does not
+                        // actually use. Diffuse is the exception: a flat colour there is a real material.
+                        if (!slot.Equals("diffuse", StringComparison.OrdinalIgnoreCase) &&
+                            textureName.StartsWith("color_", StringComparison.OrdinalIgnoreCase))
+                        {
+                            continue;
+                        }
+
+                        textures[slot] = textureName;
+                    }
+
+                    break;
+                }
+
+                // Non-texture parameter section: skip its body so the texture section (which may come
+                // after it) is reached. Shares the v25 parameter-size table.
+                SkipV25MaterialParameter(reader, sectionHigh, sectionLow, sectionCount, materialEnd);
+            }
+
+            // A few materials bind only the secondary layer and no canonical diffuse. Promoting it keeps
+            // those surfaces textured instead of falling back to an untextured material.
+            if (!textures.ContainsKey("diffuse") && textures.TryGetValue("diffuse_b", out var diffuseB))
+            {
+                textures["diffuse"] = diffuseB;
+            }
+
+            result[((ulong)matHigh << 32) | matLow] = textures;
+            reader.Seek(materialEnd);
+        }
+
+        return result;
+    }
+
+    private static List<SubmeshInfo> ReadV46LodSubmeshes(DataReader reader)
+    {
+        // The LOD block size is authoritative, so only the first (full-detail) LOD's submesh table is
+        // read; the rest of the block (lower LODs and their per-batch sub-blocks) is skipped wholesale.
+        var lodBlockEnd = reader.Position + checked((int)reader.ReadUInt32());
+        reader.ReadUInt32(); // LOD count
+        reader.ReadUInt32(); // first LOD sub-block size
+        var submeshCount = checked((int)reader.ReadUInt32());
+        var infos = new List<SubmeshInfo>();
+        for (var i = 0; i < submeshCount; i++)
+        {
+            reader.Skip(24); // bounding box
+            reader.ReadUInt32(); // header length
+            reader.Skip(16); // 4 floats
+            reader.ReadUInt32(); // unknown
+            var vertexMin = checked((int)reader.ReadUInt32() + 1);
+            var vertexMax = checked((int)reader.ReadUInt32() + 1);
+            reader.ReadUInt32(); // vertex start (unused for extraction)
+            var facePointStart = checked((int)reader.ReadUInt32());
+            var polygonCount = checked((int)reader.ReadUInt32());
+            reader.ReadUInt32(); // face point count
+            var headerLength2 = reader.ReadUInt32();
+            if (headerLength2 == 0x10)
+            {
+                reader.Skip(8);
+            }
+            reader.ReadUInt32(); // unknown
+            var materialIndex = ReadOptionalIndexPlusOne(reader);
+            reader.ReadUInt32(); // unknown
+
+            infos.Add(new SubmeshInfo(
+                Index: infos.Count,
+                BoneSetIndex: 0,
+                VertexMin: vertexMin,
+                VertexMax: vertexMax,
+                PolygonStart: facePointStart / 3 + 1,
+                PolygonCount: polygonCount,
+                MaterialIndex: materialIndex,
+                MaterialTint: MaterialTint.White,
+                TextureNames: new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase)));
+        }
+
+        reader.Seek(lodBlockEnd);
+        return infos;
+    }
+
+    private static List<ulong> ReadV46MaterialGroups(DataReader reader)
+    {
+        var end = reader.Position + checked((int)reader.ReadUInt32() - 4);
+        var count = checked((int)reader.ReadUInt32());
+        var hashes = new List<ulong>(count);
+        for (var i = 0; i < count; i++)
+        {
+            var entryStart = reader.Position;
+            reader.ReadUInt32(); // entry length
+            var low = reader.ReadUInt32();
+            var high = reader.ReadUInt32();
+            hashes.Add(((ulong)high << 32) | low);
+            reader.Seek(entryStart + 76);
+        }
+
+        if (reader.Position < end)
+        {
+            reader.Seek(end);
+        }
+
+        return hashes;
+    }
+
+    private static (ulong[] Palette, List<BonePaletteEntryData> Entries) ReadV46BonePalette(DataReader reader)
+    {
+        reader.ReadUInt32(); // block size
+        var boneCount = checked((int)reader.ReadUInt32());
+        var hashes = new ulong[boneCount];
+        var entries = new List<BonePaletteEntryData>(boneCount);
+        for (var i = 0; i < boneCount; i++)
+        {
+            var low = reader.ReadUInt32();
+            var high = reader.ReadUInt32();
+            var hash = ((ulong)high << 32) | low;
+            hashes[i] = hash;
+            var minX = reader.ReadFloat();
+            var minY = reader.ReadFloat();
+            var minZ = reader.ReadFloat();
+            var maxX = reader.ReadFloat();
+            var maxY = reader.ReadFloat();
+            var maxZ = reader.ReadFloat();
+            reader.ReadUInt32();
+            var centerX = reader.ReadFloat();
+            var centerY = reader.ReadFloat();
+            var centerZ = reader.ReadFloat();
+            var radius = reader.ReadFloat();
+            reader.ReadUInt32();
+            entries.Add(new BonePaletteEntryData(hash, minX, minY, minZ, maxX, maxY, maxZ, centerX, centerY, centerZ, radius));
+        }
+
+        return (hashes, entries);
+    }
+
+    private static List<VertexData> ReadV46Vertices(
+        DataReader reader,
+        int vertexCount,
+        IReadOnlyList<V46VertexElement> elements,
+        IReadOnlyList<V25UvScale> uvScales)
+    {
+        // Attributes are grouped into separate contiguous buffers; each buffer holds vertexCount records
+        // of a fixed stride, with every attribute at its declared byte offset inside that record.
+        var buffers = elements.Select(e => e.Buffer).Distinct().OrderBy(b => b).ToList();
+        var bufferBase = new Dictionary<int, int>();
+        var bufferStride = new Dictionary<int, int>();
+        var cursor = reader.Position;
+        foreach (var buffer in buffers)
+        {
+            var stride = 0;
+            foreach (var element in elements.Where(e => e.Buffer == buffer))
+            {
+                stride = Math.Max(stride, element.Offset + V46FormatSize(element.Format));
+            }
+
+            bufferBase[buffer] = cursor;
+            bufferStride[buffer] = stride;
+            cursor += stride * vertexCount;
+        }
+
+        var positions = new (float X, float Y, float Z)[vertexCount];
+        var normals = new (float X, float Y, float Z)[vertexCount];
+        var bones = new (int, int, int, int)[vertexCount];
+        var weights = new (float, float, float, float)[vertexCount];
+        var colors = new (float, float, float, float)[vertexCount];
+        var uv1 = new (float U, float V)[vertexCount];
+        var uv2 = new (float U, float V)[vertexCount];
+        var uv3 = new (float U, float V)[vertexCount];
+        var uv4 = new (float U, float V)[vertexCount];
+        for (var i = 0; i < vertexCount; i++)
+        {
+            normals[i] = (0f, 1f, 0f);
+            weights[i] = (1f, 0f, 0f, 0f);
+            colors[i] = (1f, 1f, 1f, 1f);
+        }
+
+        foreach (var element in elements)
+        {
+            var stride = bufferStride[element.Buffer];
+            var baseOffset = bufferBase[element.Buffer] + element.Offset;
+            for (var i = 0; i < vertexCount; i++)
+            {
+                reader.Seek(baseOffset + i * stride);
+                switch (element.Type)
+                {
+                    case 1: // position
+                        positions[i] = (reader.ReadFloat(), reader.ReadFloat(), reader.ReadFloat());
+                        break;
+                    case 2 when element.Layer == 1: // normal
+                        normals[i] = ReadV46Vector3Packed(reader, element.Format);
+                        break;
+                    case 4: // weights
+                        weights[i] = ReadV46Weights(reader, element.Format);
+                        break;
+                    case 5: // bones
+                        bones[i] = ReadV46Bones(reader, element.Format);
+                        break;
+                    case 6 when element.Layer == 1: // color
+                        colors[i] = ReadV46Color(reader, element.Format);
+                        break;
+                    case 7: // uv
+                    {
+                        var scale = uvScales[Math.Clamp(element.Layer, 0, uvScales.Count - 1)];
+                        var uv = ReadV46Uv(reader, element.Format, scale);
+                        switch (element.Layer)
+                        {
+                            case 1: uv1[i] = uv; break;
+                            case 2: uv2[i] = uv; break;
+                            case 3: uv3[i] = uv; break;
+                            case 4: uv4[i] = uv; break;
+                        }
+                        break;
+                    }
+                }
+            }
+        }
+
+        reader.Seek(cursor);
+
+        var vertices = new List<VertexData>(vertexCount);
+        for (var i = 0; i < vertexCount; i++)
+        {
+            if (uv2[i] == default) uv2[i] = uv1[i];
+            if (uv3[i] == default) uv3[i] = uv2[i];
+            if (uv4[i] == default) uv4[i] = uv3[i];
+            vertices.Add(new VertexData(
+                positions[i].X, positions[i].Y, positions[i].Z,
+                normals[i].X, normals[i].Y, normals[i].Z,
+                uv1[i].U, uv1[i].V,
+                uv2[i].U, uv2[i].V,
+                uv3[i].U, uv3[i].V,
+                uv4[i].U, uv4[i].V,
+                bones[i].Item1, bones[i].Item2, bones[i].Item3, bones[i].Item4,
+                weights[i].Item1, weights[i].Item2, weights[i].Item3, weights[i].Item4,
+                colors[i].Item1, colors[i].Item2, colors[i].Item3, colors[i].Item4));
+        }
+
+        return vertices;
+    }
+
+    private static (float X, float Y, float Z) ReadV46Vector3Packed(DataReader reader, int format)
+        => format switch
+        {
+            38 => (reader.ReadSByte() / 127f, reader.ReadSByte() / 127f, reader.ReadSByte() / 127f),
+            26 => (reader.ReadInt16() / 32767f, reader.ReadInt16() / 32767f, reader.ReadInt16() / 32767f),
+            _ => (0f, 1f, 0f),
+        };
+
+    private static (float, float, float, float) ReadV46Weights(DataReader reader, int format)
+    {
+        if (format != 27)
+        {
+            return (1f, 0f, 0f, 0f);
+        }
+
+        var w0 = reader.ReadUInt16() / 65535f;
+        var w1 = reader.ReadUInt16() / 65535f;
+        var w2 = reader.ReadUInt16() / 65535f;
+        var w3 = reader.ReadUInt16() / 65535f;
+        var sum = w0 + w1 + w2 + w3;
+        return sum > 0.0001f ? (w0 / sum, w1 / sum, w2 / sum, w3 / sum) : (w0, w1, w2, w3);
+    }
+
+    private static (int, int, int, int) ReadV46Bones(DataReader reader, int format)
+        => format == 33
+            ? (reader.ReadByte(), reader.ReadByte(), reader.ReadByte(), reader.ReadByte())
+            : (0, 0, 0, 0);
+
+    private static (float, float, float, float) ReadV46Color(DataReader reader, int format)
+        => (reader.ReadByte() / 255f, reader.ReadByte() / 255f, reader.ReadByte() / 255f, reader.ReadByte() / 255f);
+
+    private static (float U, float V) ReadV46Uv(DataReader reader, int format, V25UvScale scale)
+        => format switch
+        {
+            // Full float2 UV (no clamp scale).
+            2 or 3 => (reader.ReadFloat(), 1f - reader.ReadFloat()),
+            // Signed snorm short2 (range [-1,1]) scaled by the per-layer clamp.
+            19 or 24 => (
+                reader.ReadInt16() / 32767f * scale.XMult + scale.XStart,
+                1f - (reader.ReadInt16() / 32767f * scale.YMult + scale.YStart)),
+            // Unsigned unorm ushort2 (range [0,1]) scaled by the per-layer clamp.
+            25 => (
+                reader.ReadUInt16() / 65535f * scale.XMult + scale.XStart,
+                1f - (reader.ReadUInt16() / 65535f * scale.YMult + scale.YStart)),
+            _ => (0f, 0f),
+        };
+
+    private static int V46FormatSize(int format)
+        => format switch
+        {
+            4 => 12,        // float3 position
+            2 or 3 => 8,    // float2 uv
+            27 => 8,        // 4x u16 weights
+            26 => 8,        // 4x i16 packed normal
+            33 => 4,        // 4x byte bones
+            38 => 4,        // 4x sbyte normal/tangent/binormal
+            39 => 4,        // 4x byte unorm color
+            19 or 24 or 25 => 4, // 2x i16 snorm uv
+            _ => throw new InvalidDataException($"Unknown Batman vertex format: {format}"),
+        };
+
+    // ── v46 material survey (diagnostic) ──
+    // ReadV46Materials keeps only the texture section and skips every other parameter section. Those
+    // skipped sections carry the shader parameters that decide HOW a texture is used (detail tint,
+    // detail UV scale, blend/alpha mode). This walk reports every section a material actually contains,
+    // with its raw payload, so the vocabulary can be identified from real files instead of guessed.
+    public sealed record V46MaterialSection(ulong SectionHash, int Count, int ByteSize, byte[] Payload);
+
+    public sealed record V46MaterialReport(ulong MaterialHash, List<V46MaterialSection> Sections, bool BailedOnUnknown);
+
+    public static List<V46MaterialReport> SurveyV46Materials(byte[] data)
+    {
+        var header = MetaStreamHeader.Parse(data);
+        var reader = new DataReader(data);
+        if (header.DataOffset > 0)
+        {
+            reader.Seek(header.DataOffset);
+        }
+
+        var nameHeaderLength = reader.ReadUInt32();
+        var nameLength = reader.ReadUInt32();
+        if (nameLength > nameHeaderLength)
+        {
+            reader.Seek(reader.Position - 4);
+            nameLength = nameHeaderLength;
+        }
+
+        reader.ReadAscii((int)nameLength);
+        var version = reader.ReadInt32();
+        if (version != 46)
+        {
+            throw new NotSupportedException($"Material survey is for .d3dmesh v46; this file is v{version}.");
+        }
+
+        reader.Skip(0x19);
+        var reports = new List<V46MaterialReport>();
+        if (reader.PeekUInt32() == 0)
+        {
+            return reports;
+        }
+
+        var materialCount = checked((int)reader.ReadUInt32());
+        for (var i = 0; i < materialCount; i++)
+        {
+            var matLow = reader.ReadUInt32();
+            var matHigh = reader.ReadUInt32();
+            reader.Skip(8);
+            var materialEnd = reader.Position + checked((int)reader.ReadUInt32());
+            reader.Skip(12);
+            var unkHashCount = checked((int)reader.ReadUInt32());
+            reader.Skip(unkHashCount * 8);
+            var parameterCount = checked((int)reader.ReadUInt32());
+
+            var sections = new List<V46MaterialSection>();
+            var bailed = false;
+            for (var p = 0; p < parameterCount && reader.Position < materialEnd; p++)
+            {
+                var sectionLow = reader.ReadUInt32();
+                var sectionHigh = reader.ReadUInt32();
+                var sectionCount = checked((int)reader.ReadUInt32());
+                var sectionHash = ((ulong)sectionHigh << 32) | sectionLow;
+                var bytes = V46MaterialParameterSize(sectionHigh, sectionLow);
+                if (bytes < 0)
+                {
+                    sections.Add(new V46MaterialSection(sectionHash, sectionCount, -1, []));
+                    bailed = true;
+                    break;
+                }
+
+                var size = checked(sectionCount * bytes);
+                var payload = reader.Slice(reader.Position, Math.Min(size, materialEnd - reader.Position));
+                sections.Add(new V46MaterialSection(sectionHash, sectionCount, size, payload));
+                reader.Skip(size);
+            }
+
+            reports.Add(new V46MaterialReport(((ulong)matHigh << 32) | matLow, sections, bailed));
+            reader.Seek(materialEnd);
+        }
+
+        return reports;
+    }
+
+    // The texture section carries 16 bytes per entry (typeHash + textureHash); the rest reuse the
+    // shared v25 parameter size table.
+    private static int V46MaterialParameterSize(uint high, uint low)
+        => (high, low) switch
+        {
+            (0x52A09151, 0xF1C3F2C7) => 16,
+            _ => V25MaterialParameterSize(high, low),
+        };
+
+    // Whether a v46 texture-parameter CRC64 is one the slot table understands. Used by the material
+    // survey to report slots that bind real textures but are still dropped on import.
+    public static bool IsMappedV46TextureSlot(ulong slotCrc)
+        => GetV46TextureSlot((uint)(slotCrc >> 32), (uint)slotCrc) is not null;
+
+    // Batman material texture slot identification by (typeHigh, typeLow) hash pair, mirroring the RTB
+    // importer's material map. Slot names match the rest of the tool's texture pipeline.
+    private static string? GetV46TextureSlot(uint typeHigh, uint typeLow)
+        => (typeHigh, typeLow) switch
+        {
+            (0x8648FA82, 0xD1DBEE1A) or
+            (0xDC6E83A0, 0x253F163A) => "diffuse",
+            (0x4930B970, 0xA7FD511F) or
+            (0xDF7E4122, 0x56E87E74) => "detail_diffuse",
+            // "Packed Detail Map" (RTB). Several detail channels packed into one texture, NOT a colour
+            // detail layer — it must never be composited onto albedo the way a plain detail map is.
+            (0xBDCD25F2, 0x0F4199E3) => "packed_detail",
+            // "Visibility Mask Map" (RTB). This is what hides the parts of a head the cowl covers
+            // (sk_bmSharedParts_headVisibility): the shipped sk61_batman_head is Bruce's head plus this
+            // mask. Naming it as a look-up "style" map hid what it actually does.
+            (0x87B579EC, 0x018FBD4D) => "visibility_mask",
+            // Second material layer ("Map B" in RTB). On terrain it is a second ground material; on
+            // characters the same slots carry the damage overlay (*_DamageGunshot). This used to be
+            // mapped as plain "diffuse", so a material lacking the canonical slot rendered its damage
+            // overlay as the base texture.
+            (0x94A590DE, 0x74B1F5C1) => "diffuse_b",
+            (0x3F380050, 0xAFD9F81F) or
+            (0x436206E6, 0x8A9E7CCA) => "bump_b",
+            (0x120621D5, 0xFAD4C090) => "specular_b",
+            (0xBDB4C92A, 0x546FB889) => "emissive_b",
+            // Masks that pair with the layer-B overlay. Not in RTB's table; named after their use.
+            (0x2B6C4784, 0x5F607734) => "layer_b_mask_a",
+            (0xEC7D65B8, 0xA55E2C81) => "layer_b_mask_b",
+            // Facial wrinkle system.
+            (0x0340C569, 0xCE9E059F) or
+            (0xA13D14FB, 0xB436F23B) => "wrinkle_bump",
+            (0xD7EA3553, 0x4DBC457D) => "wrinkle_mask_a",
+            (0x10FB176F, 0xB7821EC8) => "wrinkle_mask_b",
+            // Remaining GotG-family slots named by the RTB importer.
+            (0x64FBA83E, 0x34DD3959) => "gloss",
+            (0xCB433436, 0xEDCA9EFB) => "detail_gloss",
+            (0xBF468EF4, 0x80AEEB89) => "detail_mask",
+            (0xA45200A2, 0x22DC2D80) => "thickness",
+            (0x8CF38A52, 0x66AAA7A4) => "transition_bump",
+            (0x7498A5F1, 0xB80AD419) => "alternate_bump",
+            (0x37571B60, 0xB1F61180) => "tangent_b",
+            (0x017AFD53, 0x2445B8B8) => "microdetail_diffuse",
+            (0xCB5B9A7F, 0x52168A41) => "microdetail_bump",
+            (0x2AA89260, 0xD8661F89) => "grime",
+            (0x66CD6E57, 0xFA58A246) => "height",
+            (0x8CADB260, 0x98DF1108) => "flow",
+            (0x4E2ED73C, 0xE95B0E15) => "reflection",
+            // Per-instance colour swap mask (vehicle bodies, crates).
+            (0x72507EEA, 0x6EF21AEE) => "colorswap_mask",
+            // Global weather maps shared by every wet-surface material, not part of the model's own look.
+            (0x2EBA1F4B, 0xBA7A1543) => "rain_wet",
+            (0x533F479D, 0x08BF0E5E) => "rain_fall",
+            (0x1E3F6B9F, 0x2550389D) or
+            (0xB8B04DDF, 0x1796F446) => "bump",
+            (0x706CF2AA, 0x57A7A206) or
+            (0x063EE638, 0x83014F19) or
+            (0xD49D30F6, 0x4A580C6F) or
+            (0x138C12CA, 0xB06657DA) or
+            (0x517CF321, 0x198C6149) => "detail_bump",
+            (0xD5B57775, 0xDB361670) or
+            (0xC8C94155, 0xFB7C634B) or
+            (0x120621D5, 0xFAD4C090) => "specular",
+            (0xCAAAE643, 0x2AF348C0) or
+            (0x62C49575, 0x78189F07) => "occlusion",
+            (0x257C2A45, 0x683F7D2F) or
+            (0x13EEE658, 0x65DFC90F) => "environment",
+            (0xB3022EA7, 0xFD418B40) or
+            (0xBDB4C92A, 0x546FB889) => "emissive",
+            (0x2642D6B4, 0xC8ECCAA9) or
+            (0xA334F76C, 0x317A0C02) => "gradient",
+            (0xFF787A61, 0xEAC8A5B5) => "ink",
+            _ => null,
+        };
+
     private static MeshData ParseV13(DataReader reader, string name, int version)
     {
         reader.Skip(4);
@@ -1267,7 +1959,19 @@ public static class D3DMeshParser
 
     private static void SkipV25MaterialParameter(DataReader reader, uint high, uint low, int count, int materialEnd)
     {
-        var bytesPerEntry = (high, low) switch
+        var bytesPerEntry = V25MaterialParameterSize(high, low);
+        if (bytesPerEntry < 0)
+        {
+            reader.Seek(materialEnd);
+            return;
+        }
+
+        reader.Skip(checked(count * bytesPerEntry));
+    }
+
+    // Bytes per entry for a material parameter section, or -1 when the section is not yet identified.
+    private static int V25MaterialParameterSize(uint high, uint low)
+        => (high, low) switch
         {
             (0x00000000, 0x00000000) => 0,
             (0xA98F0652, 0x295DE685) => 0,
@@ -1287,15 +1991,6 @@ public static class D3DMeshParser
             (0xE2BA743E, 0x952F9338) => 24,
             _ => -1,
         };
-
-        if (bytesPerEntry < 0)
-        {
-            reader.Seek(materialEnd);
-            return;
-        }
-
-        reader.Skip(checked(count * bytesPerEntry));
-    }
 
     private static void SkipV25SizedBlock(DataReader reader, Action<DataReader, int> readEntries)
     {
@@ -2945,4 +3640,5 @@ public static class D3DMeshParser
     private readonly record struct AttrDescriptor(uint Offset = 0, uint Count = 0, uint Format = 0);
     private readonly record struct V25UvScale(float XMult, float YMult, float XStart, float YStart);
     private readonly record struct V25VertexElement(int Buffer, int Format, int Offset);
+    private readonly record struct V46VertexElement(int Type, int Format, int Layer, int Buffer, int Offset);
 }

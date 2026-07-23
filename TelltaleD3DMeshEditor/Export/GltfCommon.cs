@@ -23,6 +23,13 @@ internal static class GltfCommon
         bytes.AddRange(buffer.ToArray());
     }
 
+    public static byte[] SerializeFloat(float value)
+    {
+        var buf = new byte[4];
+        BinaryPrimitives.WriteSingleLittleEndian(buf, value);
+        return buf;
+    }
+
     public static void AddUInt16(List<byte> bytes, ushort value)
     {
         Span<byte> buffer = stackalloc byte[2];
@@ -120,9 +127,13 @@ internal static class GltfCommon
         var local = Formats.Mesh.BoneIndexConvention.ToPaletteIndex(rawBone, meshVersion);
         if (palette is null || palette.Count == 0)
         {
-            return meshVersion == 1 && local >= 0 && local < boneIndexByHash.Count
-                ? (ushort)local
-                : (ushort)0;
+            // No bone palette: vertex blend indices are already skeleton-relative.
+            // v1 always worked this way; v45 (and other modern toolkit-parsed meshes) often ship
+            // empty mBonePalettes and still store direct skeleton indices + weights.
+            var skeletonBoneCount = boneIndexByHash.Count;
+            if (local >= 0 && local < skeletonBoneCount)
+                return (ushort)local;
+            return 0;
         }
 
         if (local < 0 || local >= palette.Count) return 0;
