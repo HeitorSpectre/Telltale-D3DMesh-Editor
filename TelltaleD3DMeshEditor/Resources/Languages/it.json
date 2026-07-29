@@ -4,7 +4,7 @@
     "nativeName": "Italiano",
     "englishName": "Italian",
     "author": "HeitorSpectre",
-    "baseVersion": "1.11.0"
+    "baseVersion": "1.12.0"
   },
 
   "app.title": "Telltale D3DMesh Editor",
@@ -13,6 +13,7 @@
 
   "toolbar.open_folder": "Apri Cartella...",
   "toolbar.open_archive": "Apri Contenitore...",
+  "toolbar.extract": "Estrai",
   "toolbar.extract_selected": "Estrai Selezionati...",
   "toolbar.extract_all": "Estrai Tutto...",
   "msg.archive.protected_folder": "Questa cartella del gioco è protetta da Windows:\n{0}\n\nVuoi riavviare lo strumento come amministratore per estrarre accanto al gioco?\n\n• Sì — riavvia come amministratore ed estrai lì.\n• No — estrai in questa cartella:\n{1}\n• Annulla — non fare nulla.",
@@ -27,7 +28,7 @@
   "anim.need_skinned": "Seleziona un modello con scheletro (+ SKL) per esportare le animazioni.",
   "anim.none_found": "Nessuna animazione .anm corrispondente a \"{0}\" trovata nella cartella aperta.",
   "anim.export_done": "{0} esportato con {1} animazione(i) ({2} selezionate; i rig incompatibili vengono ignorati automaticamente).",
-  "toolbar.reimport_selected": "Reimporta Selezionato...",
+  "toolbar.reimport_selected": "Reimporta",
   "toolbar.texture_atlas": "Atlas delle Texture",
   "toolbar.combine_parts": "Combina Parti",
   "toolbar.credits": "Crediti",
@@ -86,6 +87,9 @@
 
   "settings.title": "Impostazioni",
   "settings.language_label": "Lingua:",
+  "settings.theme_label": "Tema:",
+  "settings.theme.light": "Chiaro",
+  "settings.theme.dark": "Scuro",
   "settings.output_format": "Formato di Output:",
   "settings.texture_atlas_label": "Atlas delle Texture:",
   "settings.generate_texture_atlas": "Genera atlas delle texture",
@@ -205,6 +209,13 @@
   "report.v45.no_prop_warning": " Avviso: file di materiale sk*.prop non trovati accanto alle mesh; gli slot texture sono stati dedotti dai nomi .d3dtx della cartella. Estrai gli archivi con questo strumento per includere i file .prop.",
   "report.invisible.v45_placeholder": "INVISIBILE {0}: nessuna primitiva importata assegnata; scritto un segnaposto MCSM Season 2 (V45) senza triangoli.",
   "report.companion.ok_v45": "OK {0}: parte companion portata da {1} (V45).",
+  "report.v46.kind_character": "Personaggio V46",
+  "report.v46.kind_static": "Statico V46",
+  "report.v46.reimported": "Reimportato ({0}): {1}\nInput: {2}\nOutput: {3}{4}{5}\nMesh di Batman reinserita preservando i LOD inferiori. Provala nel gioco.",
+  "report.ok_part_v46": "OK {0}: {1} primitive, {2} texture ({3}, LOD inferiori preservati).",
+  "report.v46.no_prop_warning": " Avviso: file sk*.prop non trovati; gli slot diffuse sono stati dedotti dai nomi .d3dtx.",
+  "report.invisible.v46_placeholder": "INVISIBILE {0}: nessuna primitiva assegnata; scritto un placeholder Batman (V46) senza triangoli.",
+  "report.companion.ok_v46": "OK {0}: parte complementare importata da {1} (V46).",
   "report.atlas_summary": ", atlas {0}->{1}x{2}",
   "report.atlas_auto_suffix": " (automatico: nomi di texture originali)",
 

@@ -4,7 +4,7 @@
     "nativeName": "Français",
     "englishName": "French",
     "author": "HeitorSpectre",
-    "baseVersion": "1.11.0"
+    "baseVersion": "1.12.0"
   },
 
   "app.title": "Telltale D3DMesh Editor",
@@ -13,6 +13,7 @@
 
   "toolbar.open_folder": "Ouvrir un Dossier...",
   "toolbar.open_archive": "Ouvrir un Conteneur...",
+  "toolbar.extract": "Extraire",
   "toolbar.extract_selected": "Extraire la Sélection...",
   "toolbar.extract_all": "Tout Extraire...",
   "msg.archive.protected_folder": "Ce dossier du jeu est protégé par Windows :\n{0}\n\nVoulez-vous redémarrer l'outil en tant qu'administrateur pour extraire à côté du jeu ?\n\n• Oui — redémarrer en administrateur et extraire là.\n• Non — extraire dans ce dossier :\n{1}\n• Annuler — ne rien faire.",
@@ -27,7 +28,7 @@
   "anim.need_skinned": "Sélectionnez un modèle avec squelette (+ SKL) pour exporter des animations.",
   "anim.none_found": "Aucune animation .anm correspondant à \"{0}\" n'a été trouvée dans le dossier ouvert.",
   "anim.export_done": "{0} exporté avec {1} animation(s) ({2} sélectionnées ; les rigs incompatibles sont ignorés automatiquement).",
-  "toolbar.reimport_selected": "Réimporter la Sélection...",
+  "toolbar.reimport_selected": "Réimporter",
   "toolbar.texture_atlas": "Atlas de Textures",
   "toolbar.combine_parts": "Combiner les Parties",
   "toolbar.credits": "Crédits",
@@ -86,6 +87,9 @@
 
   "settings.title": "Paramètres",
   "settings.language_label": "Langue :",
+  "settings.theme_label": "Thème :",
+  "settings.theme.light": "Clair",
+  "settings.theme.dark": "Sombre",
   "settings.output_format": "Format de Sortie :",
   "settings.texture_atlas_label": "Atlas de Textures :",
   "settings.generate_texture_atlas": "Générer un atlas de textures",
@@ -205,6 +209,13 @@
   "report.v45.no_prop_warning": " Avertissement : fichiers de matériau sk*.prop introuvables à côté des meshes ; les slots de texture ont été déduits des noms .d3dtx du dossier. Extrayez les archives avec cet outil pour inclure les .prop.",
   "report.invisible.v45_placeholder": "INVISIBLE {0} : aucune primitive importée assignée ; un espace réservé MCSM Season 2 (V45) sans triangles a été écrit.",
   "report.companion.ok_v45": "OK {0} : pièce compagnon portée depuis {1} (V45).",
+  "report.v46.kind_character": "Personnage V46",
+  "report.v46.kind_static": "Statique V46",
+  "report.v46.reimported": "Réimporté ({0}) : {1}\nEntrée : {2}\nSortie : {3}{4}{5}\nMaillage Batman réinséré avec les LOD inférieurs préservés. Testez-le dans le jeu.",
+  "report.ok_part_v46": "OK {0} : {1} primitive(s), {2} texture(s) ({3}, LOD inférieurs préservés).",
+  "report.v46.no_prop_warning": " Attention : fichiers sk*.prop introuvables ; les emplacements diffus ont été déduits des noms .d3dtx.",
+  "report.invisible.v46_placeholder": "INVISIBLE {0} : aucune primitive attribuée ; espace réservé Batman (V46) sans triangles écrit.",
+  "report.companion.ok_v46": "OK {0} : partie complémentaire portée depuis {1} (V46).",
   "report.atlas_summary": ", atlas {0}->{1}x{2}",
   "report.atlas_auto_suffix": " (auto : noms de texture d'origine)",
 

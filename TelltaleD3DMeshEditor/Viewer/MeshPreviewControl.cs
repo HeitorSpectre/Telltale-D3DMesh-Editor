@@ -40,6 +40,10 @@ public sealed class MeshPreviewControl : Control
     private const float DefaultPitch = 0.25f;
     private const float DefaultZoom = 1.0f;
     private const float DepthTieEpsilon = 0.00005f;
+    // Adjacent triangles can land a tiny fraction of a pixel apart after animated skinning and camera
+    // projection. Accept a narrow shared-edge margin so floating-point rounding cannot expose the
+    // transparent framebuffer as short light lines. Depth testing still decides the visible surface.
+    private const float EdgeCoverageTolerance = 0.0015f;
 
     private MeshData? _mesh;
     private SkeletonData? _skeleton;
@@ -301,18 +305,11 @@ public sealed class MeshPreviewControl : Control
 
             if (local.Translation is { } translation)
             {
-                var restLength = MathF.Sqrt(bone.X * bone.X + bone.Y * bone.Y + bone.Z * bone.Z);
-                if (restLength < 1e-8f)
-                {
-                    restLength = 1f;
-                }
+                var decodedTranslation = DecodeAnimationTranslation(bone, translation);
 
                 _boneOffsets[i] = additive
-                    ? new Vector3(translation.X * restLength, translation.Y * restLength, translation.Z * restLength)
-                    : new Vector3(
-                        translation.X * restLength - bone.X,
-                        translation.Y * restLength - bone.Y,
-                        translation.Z * restLength - bone.Z);
+                    ? decodedTranslation
+                    : decodedTranslation - new Vector3(bone.X, bone.Y, bone.Z);
             }
 
             if (local.Rotation is { } rotation)
@@ -334,6 +331,61 @@ public sealed class MeshPreviewControl : Control
         }
 
         Invalidate();
+    }
+
+    // Telltale stores animated translations in a normalized per-bone coordinate system. The engine
+    // reconstructs them with both the local-position length and a direction adjustment derived from
+    // mAnimTranslationScale (SkeletonInstance::_ApplySkeletonInstanceRestPose/_UpdateNode). Applying
+    // only the length is almost invisible on regular body bones, but it sends Batman's many cape
+    // control bones in different directions and stretches the cloth into long triangles.
+    private static Vector3 DecodeAnimationTranslation(BoneData bone, Vector3 encoded)
+    {
+        var local = new Vector3(bone.X, bone.Y, bone.Z);
+        var restLength = local.Length();
+        if (restLength < 1e-8f)
+        {
+            return encoded;
+        }
+
+        var scale = bone.AnimTranslationScale;
+        var safeScale = new Vector3(
+            MathF.Abs(scale.X) > 1e-8f ? scale.X : 1f,
+            MathF.Abs(scale.Y) > 1e-8f ? scale.Y : 1f,
+            MathF.Abs(scale.Z) > 1e-8f ? scale.Z : 1f);
+        var animationDirection = Vector3.Normalize(new Vector3(
+            local.X / safeScale.X,
+            local.Y / safeScale.Y,
+            local.Z / safeScale.Z));
+        var adjustment = RotationBetween(local, animationDirection);
+        return Vector3.Transform(encoded * restLength, adjustment);
+    }
+
+    private static Quaternion RotationBetween(Vector3 from, Vector3 to)
+    {
+        var fromLength = from.Length();
+        var toLength = to.Length();
+        if (fromLength < 1e-8f || toLength < 1e-8f)
+        {
+            return Quaternion.Identity;
+        }
+
+        var first = from / fromLength;
+        var second = to / toLength;
+        var dot = Math.Clamp(Vector3.Dot(first, second), -1f, 1f);
+        if (dot >= 0.99999f)
+        {
+            return Quaternion.Identity;
+        }
+
+        if (dot <= -0.99999f)
+        {
+            var basis = MathF.Abs(first.X) < 0.9f ? Vector3.UnitX : Vector3.UnitY;
+            var axis = Vector3.Normalize(Vector3.Cross(first, basis));
+            return Quaternion.CreateFromAxisAngle(axis, MathF.PI);
+        }
+
+        var rotationAxis = Vector3.Normalize(Vector3.Cross(first, second));
+        return Quaternion.CreateFromAxisAngle(rotationAxis, MathF.Acos(dot));
     }
 
     public void RotateBoneByHash(ulong hash, Quaternion delta)
@@ -772,7 +824,17 @@ public sealed class MeshPreviewControl : Control
                 }
 
                 _textures.TryGetValue(submeshIndex, out var textures);
-                var transparentMaterial = UsesTextureAlpha(_renderMode) && IsTransparentPreviewMaterial(submesh, textures);
+                if (IsBatmanEyeLensMaterial(submesh) &&
+                    textures?.Diffuse is null &&
+                    _renderMode is PreviewRenderMode.Shaded or PreviewRenderMode.Unlit)
+                {
+                    // Batman's eyeball has a separate cornea/specular shell. Some extracted sets do
+                    // not contain its diffuse texture; drawing the fallback grey material produces
+                    // an artificial milky film over the iris, so leave that unsupported shell clear.
+                    continue;
+                }
+
+                var transparentMaterial = UsesTextureAlpha(_renderMode) && IsTransparentPreviewMaterial(_mesh.Name, submesh, textures);
                 if (transparentMaterial != transparentPass)
                 {
                     continue;
@@ -810,21 +872,31 @@ public sealed class MeshPreviewControl : Control
                         debugColor.R, debugColor.G, debugColor.B, debugColor.A);
                 }
 
-                foreach (var (a, b, c) in submesh.Faces)
-                {
-                    if ((uint)a >= renderVertices.Length || (uint)b >= renderVertices.Length || (uint)c >= renderVertices.Length)
-                    {
-                        continue;
-                    }
-
-                    var writeDepth = !transparentPass && !IsTftbE3UiStrokeUnderlay(submesh);
-                    var useTextureAlpha = UsesTextureAlpha(_renderMode);
-                    var forceOpaqueTextureAlpha = useTextureAlpha && ShouldForceOpaqueTextureAlpha(submesh, textures);
-                    var forceDarkAlphaTexture = useTextureAlpha && ShouldForceDarkAlphaTexture(submesh, textures);
-                    var forceGlassAlpha = useTextureAlpha && transparentPass && IsBatmanGlassMaterial(submesh);
-                    var alphaCutoutThreshold = useTextureAlpha ? GetAlphaCutoutThreshold(submesh, textures) : 0;
-                    RasterizeTriangle(renderVertices[a], renderVertices[b], renderVertices[c], textures, pixels, depth, probeHits, submeshIndex, width, height, writeDepth, forceOpaqueTextureAlpha, forceDarkAlphaTexture, forceGlassAlpha, alphaCutoutThreshold, _renderMode);
-                }
+                var writeDepth = !transparentPass && !IsTftbE3UiStrokeUnderlay(submesh);
+                var useTextureAlpha = UsesTextureAlpha(_renderMode);
+                var forceOpaqueTextureAlpha = useTextureAlpha && ShouldForceOpaqueTextureAlpha(_mesh.Name, submesh, textures);
+                var forceDarkAlphaTexture = useTextureAlpha && ShouldForceDarkAlphaTexture(submesh, textures);
+                var forceGlassAlpha = useTextureAlpha &&
+                                      transparentPass &&
+                                      IsBatmanGlassMaterial(submesh) &&
+                                      !IsBatmanEyeLensMaterial(submesh);
+                var alphaCutoutThreshold = useTextureAlpha ? GetAlphaCutoutThreshold(submesh, textures) : 0;
+                RasterizeFaces(
+                    renderVertices,
+                    submesh.Faces,
+                    textures,
+                    pixels,
+                    depth,
+                    probeHits,
+                    submeshIndex,
+                    width,
+                    height,
+                    writeDepth,
+                    forceOpaqueTextureAlpha,
+                    forceDarkAlphaTexture,
+                    forceGlassAlpha,
+                    alphaCutoutThreshold,
+                    _renderMode);
             }
         }
 
@@ -886,9 +958,9 @@ public sealed class MeshPreviewControl : Control
         }
     }
 
-    private static bool IsTransparentPreviewMaterial(SubmeshData submesh, MaterialTextureSet? textures)
+    private static bool IsTransparentPreviewMaterial(string meshName, SubmeshData submesh, MaterialTextureSet? textures)
     {
-        if (ShouldForceOpaqueTextureAlpha(submesh, textures) ||
+        if (ShouldForceOpaqueTextureAlpha(meshName, submesh, textures) ||
             ShouldUseAlphaCutoutDepth(submesh, textures))
         {
             return false;
@@ -897,6 +969,7 @@ public sealed class MeshPreviewControl : Control
         var diffuse = textures?.Diffuse;
         return HasPreviewVertexAlpha(submesh) ||
                IsBatmanGlassMaterial(submesh) ||
+               IsBatmanPictureFrameGlassMaterial(meshName, submesh) ||
                (diffuse is not null &&
                 (diffuse.AverageAlpha < 0.95f || diffuse.NonOpaqueAlphaRatio > 0.08f));
     }
@@ -919,11 +992,67 @@ public sealed class MeshPreviewControl : Control
                (submesh.TextureNames.TryGetValue("diffuse", out var d) && Match(d));
     }
 
-    private static bool ShouldForceOpaqueTextureAlpha(SubmeshData submesh, MaterialTextureSet? textures)
+    private static bool IsBatmanEyeLensMaterial(SubmeshData submesh)
+    {
+        if (GameConfig.Current.Id != GameId.Batman)
+        {
+            return false;
+        }
+
+        static bool Match(string? name) => !string.IsNullOrWhiteSpace(name) &&
+            name.Contains("eyelens", StringComparison.OrdinalIgnoreCase);
+
+        return Match(submesh.Name) ||
+               Match(submesh.MaterialName) ||
+               submesh.TextureNames.Values.Any(Match);
+    }
+
+    private static bool IsBatmanEyeballMaterial(SubmeshData submesh)
+    {
+        if (GameConfig.Current.Id != GameId.Batman || IsBatmanEyeLensMaterial(submesh))
+        {
+            return false;
+        }
+
+        static bool Match(string? name)
+        {
+            var normalized = NormalizeTextureName(name);
+            return normalized.Contains("sharedparts_eyes", StringComparison.OrdinalIgnoreCase) &&
+                   !normalized.Contains("eyelash", StringComparison.OrdinalIgnoreCase);
+        }
+
+        return Match(submesh.Name) ||
+               Match(submesh.MaterialName) ||
+               submesh.TextureNames.Values.Any(Match);
+    }
+
+    private static bool ShouldForceOpaqueTextureAlpha(string meshName, SubmeshData submesh, MaterialTextureSet? textures)
     {
         if (textures?.Diffuse is null)
         {
             return false;
+        }
+
+        if (IsBatmanPictureFrameGlassMaterial(meshName, submesh))
+        {
+            // Its nearly uniform low alpha is intentional translucency. Do not let the generic
+            // packed-data detector below turn the glass plane or broken shards opaque.
+            return false;
+        }
+
+        if (IsBatmanPictureFrameBaseMaterial(meshName, submesh))
+        {
+            // This atlas stores reflectivity/material data in alpha. Applying it as coverage made
+            // the wooden frame, photograph and backing disappear, while the separate glass piece
+            // is identified by its mesh/submesh role below.
+            return true;
+        }
+
+        if (IsBatmanEyeballMaterial(submesh))
+        {
+            // The alpha in Batman's shared eye atlas is not transparency for the eyeball surface.
+            // Keeping it opaque prevents holes or a washed-out iris while eyelashes remain separate.
+            return true;
         }
 
         // Batman's newer engine packs a shading term (gloss/scatter) into the diffuse alpha of skin
@@ -942,6 +1071,49 @@ public sealed class MeshPreviewControl : Control
 
         return IsGameOfThronesCharacterPreviewMaterial(submesh, textures) &&
                !IsGameOfThronesTransparentPreviewMaterial(submesh, textures);
+    }
+
+    private static bool IsBatmanPictureFrameBaseMaterial(string meshName, SubmeshData submesh)
+    {
+        if (GameConfig.Current.Id != GameId.Batman ||
+            IsBatmanPictureFrameGlassMaterial(meshName, submesh))
+        {
+            return false;
+        }
+
+        static bool MatchBase(string? value)
+        {
+            var name = NormalizeTextureName(value);
+            return name.Equals("obj_pictureFrameBreakableWayne", StringComparison.OrdinalIgnoreCase);
+        }
+
+        return MatchBase(submesh.Name) ||
+               MatchBase(submesh.MaterialName) ||
+               (submesh.TextureNames.TryGetValue("diffuse", out var diffuse) && MatchBase(diffuse));
+    }
+
+    private static bool IsBatmanPictureFrameGlassMaterial(string meshName, SubmeshData submesh)
+    {
+        if (GameConfig.Current.Id != GameId.Batman)
+        {
+            return false;
+        }
+
+        static bool IsPictureFrame(string? value)
+            => value is not null &&
+               value.Contains("pictureFrame", StringComparison.OrdinalIgnoreCase);
+
+        static bool IsBrokenGlass(string? value)
+            => value is not null &&
+               IsPictureFrame(value) &&
+               value.Contains("BrokenGlass", StringComparison.OrdinalIgnoreCase);
+
+        var unbrokenGlassAsset = IsPictureFrame(meshName) &&
+                                 meshName.Contains("glassUnbroken", StringComparison.OrdinalIgnoreCase);
+        return unbrokenGlassAsset ||
+               IsBrokenGlass(submesh.Name) ||
+               IsBrokenGlass(submesh.MaterialName) ||
+               submesh.TextureNames.Values.Any(IsBrokenGlass);
     }
 
     private static bool IsGameOfThronesCharacterPreviewMaterial(SubmeshData submesh, MaterialTextureSet textures)
@@ -1091,6 +1263,81 @@ public sealed class MeshPreviewControl : Control
         return sum / submesh.Vertices.Count;
     }
 
+    private static void RasterizeFaces(
+        RenderVertex[] vertices,
+        IReadOnlyList<(int A, int B, int C)> faces,
+        MaterialTextureSet? textures,
+        int[] pixels,
+        float[] depth,
+        TextureProbeHit[]? probeHits,
+        int submeshIndex,
+        int width,
+        int height,
+        bool writeDepth,
+        bool forceOpaqueTextureAlpha,
+        bool forceDarkAlphaTexture,
+        bool forceGlassAlpha,
+        int alphaCutoutThreshold,
+        PreviewRenderMode renderMode)
+    {
+        void RasterizeBand(int clipMinY, int clipMaxY)
+        {
+            foreach (var (a, b, c) in faces)
+            {
+                if ((uint)a >= vertices.Length || (uint)b >= vertices.Length || (uint)c >= vertices.Length)
+                {
+                    continue;
+                }
+
+                RasterizeTriangle(
+                    vertices[a],
+                    vertices[b],
+                    vertices[c],
+                    textures,
+                    pixels,
+                    depth,
+                    probeHits,
+                    submeshIndex,
+                    width,
+                    height,
+                    clipMinY,
+                    clipMaxY,
+                    writeDepth,
+                    forceOpaqueTextureAlpha,
+                    forceDarkAlphaTexture,
+                    forceGlassAlpha,
+                    alphaCutoutThreshold,
+                    renderMode);
+            }
+        }
+
+        // Each worker owns complete scanlines, so z-buffering, transparency, texture sampling and
+        // draw order remain byte-for-byte equivalent without locks. Small batches stay sequential
+        // because task scheduling would cost more than their rasterization.
+        var processorCount = Environment.ProcessorCount;
+        var bandCount = Math.Min(processorCount, Math.Max(1, (height + 95) / 96));
+        if (processorCount <= 1 || bandCount <= 1 || faces.Count < 128)
+        {
+            RasterizeBand(0, height - 1);
+            return;
+        }
+
+        var bandHeight = (height + bandCount - 1) / bandCount;
+        Parallel.For(
+            0,
+            bandCount,
+            new ParallelOptions { MaxDegreeOfParallelism = Math.Max(1, processorCount - 1) },
+            band =>
+            {
+                var clipMinY = band * bandHeight;
+                var clipMaxY = Math.Min(height - 1, clipMinY + bandHeight - 1);
+                if (clipMinY <= clipMaxY)
+                {
+                    RasterizeBand(clipMinY, clipMaxY);
+                }
+            });
+    }
+
     private static void RasterizeTriangle(
         RenderVertex a,
         RenderVertex b,
@@ -1102,6 +1349,8 @@ public sealed class MeshPreviewControl : Control
         int submeshIndex,
         int width,
         int height,
+        int clipMinY,
+        int clipMaxY,
         bool writeDepth,
         bool forceOpaqueTextureAlpha,
         bool forceDarkAlphaTexture,
@@ -1126,12 +1375,19 @@ public sealed class MeshPreviewControl : Control
 
         var minX = Math.Clamp((int)MathF.Floor(rawMinX), 0, width - 1);
         var maxX = Math.Clamp((int)MathF.Ceiling(rawMaxX), 0, width - 1);
-        var minY = Math.Clamp((int)MathF.Floor(rawMinY), 0, height - 1);
-        var maxY = Math.Clamp((int)MathF.Ceiling(rawMaxY), 0, height - 1);
+        var minY = Math.Clamp((int)MathF.Floor(rawMinY), clipMinY, clipMaxY);
+        var maxY = Math.Clamp((int)MathF.Ceiling(rawMaxY), clipMinY, clipMaxY);
+        if (minY > maxY || rawMaxY < clipMinY || rawMinY > clipMaxY)
+        {
+            return;
+        }
         var baseColor = Color.FromArgb(255, 226, 229, 229);
         var invArea = 1f / area;
         var w0StepX = (c.Y - b.Y) * invArea;
         var w1StepX = (a.Y - c.Y) * invArea;
+        // Do not expand genuinely blended surfaces: overlapping coverage there would blend a shared
+        // edge twice. Opaque/depth-writing geometry can use the wider, z-buffer-safe crack guard.
+        var edgeTolerance = writeDepth ? EdgeCoverageTolerance : 0.0001f;
 
         for (var y = minY; y <= maxY; y++)
         {
@@ -1146,7 +1402,9 @@ public sealed class MeshPreviewControl : Control
                 rowW0 += w0StepX;
                 rowW1 += w1StepX;
                 var w2 = 1f - w0 - w1;
-                if (w0 < -0.0001f || w1 < -0.0001f || w2 < -0.0001f)
+                if (w0 < -edgeTolerance ||
+                    w1 < -edgeTolerance ||
+                    w2 < -edgeTolerance)
                 {
                     continue;
                 }
@@ -1187,7 +1445,15 @@ public sealed class MeshPreviewControl : Control
                     {
                         var normalBoost = SampleNormalBoost(textures.Normal, u, v);
                         var detailBoost = SampleDetailNormalBoost(textures.Detail, detailU, detailV);
-                        color = ShadeTexture(textures.Diffuse.Sample(u, v), shade * normalBoost * detailBoost);
+                        var diffuseSample = textures.Diffuse.Sample(u, v);
+                        if (forceOpaqueTextureAlpha)
+                        {
+                            // Packed Batman alpha is shading data, not coverage. Make it opaque before
+                            // ShadeTexture checks alpha; otherwise its rare near-zero data values are
+                            // converted to Color.Transparent and become isolated pinholes in the preview.
+                            diffuseSample |= unchecked((int)0xFF000000);
+                        }
+                        color = ShadeTexture(diffuseSample, shade * normalBoost * detailBoost);
                         color = ApplyDetail(color, textures.Detail, detailU, detailV);
                         color = ApplyBake(color, textures.Bake, bakeU, bakeV);
                         color = ApplyOcclusion(color, textures.Occlusion, u, v);
@@ -1225,15 +1491,9 @@ public sealed class MeshPreviewControl : Control
                         Math.Clamp((int)MathF.Round(debugB * 255f), 0, 255)).ToArgb();
                 }
 
-                // Force-opaque has to win BEFORE the cutout: when the diffuse alpha carries packed data
-                // instead of coverage (Batman skin averages ~0.64 with no fully opaque pixel), the cutout
-                // discards every texel under the threshold and punches micro-holes through the face and
-                // neck. A material whose alpha is not coverage must not be alpha-tested at all.
-                if (forceOpaqueTextureAlpha)
-                {
-                    color |= unchecked((int)0xFF000000);
-                }
-                else if (alphaCutoutThreshold > 0 && ((color >> 24) & 0xFF) < alphaCutoutThreshold)
+                if (!forceOpaqueTextureAlpha &&
+                    alphaCutoutThreshold > 0 &&
+                    ((color >> 24) & 0xFF) < alphaCutoutThreshold)
                 {
                     continue;
                 }
@@ -1241,6 +1501,14 @@ public sealed class MeshPreviewControl : Control
                 if (renderMode is PreviewRenderMode.Shaded or PreviewRenderMode.Unlit)
                 {
                     color = ApplyVertexColor(color, vertexColorR, vertexColorG, vertexColorB, vertexColorA);
+                }
+
+                // Batman stores gloss/scatter in diffuse alpha and can also carry non-coverage vertex
+                // alpha. Force opacity after vertex colour so that alpha cannot reopen isolated pinholes
+                // across skin that the material declares solid.
+                if (forceOpaqueTextureAlpha)
+                {
+                    color |= unchecked((int)0xFF000000);
                 }
 
                 // Glass/lens materials (e.g. Batman's eyeglasses) ship an opaque diffuse; the see-through
@@ -2826,12 +3094,41 @@ public sealed class MeshPreviewControl : Control
 
         var influenced = BuildInfluencedSkeletonBones();
         var current = boneIndex;
-        while (current >= 0 && !influenced.Contains(current))
+        while (current >= 0)
         {
+            if (influenced.Contains(current) || HasInfluencedDescendant(current, influenced))
+            {
+                return current;
+            }
+
             current = _skeleton.Bones[current].ParentIndex;
         }
 
-        return current >= 0 ? current : boneIndex;
+        return boneIndex;
+    }
+
+    private bool HasInfluencedDescendant(int boneIndex, IReadOnlySet<int> influenced)
+    {
+        if (_skeleton is null)
+        {
+            return false;
+        }
+
+        foreach (var influencedBone in influenced)
+        {
+            var current = influencedBone;
+            var guard = 0;
+            while (current >= 0 && current < _skeleton.Bones.Count && guard++ < _skeleton.Bones.Count)
+            {
+                current = _skeleton.Bones[current].ParentIndex;
+                if (current == boneIndex)
+                {
+                    return true;
+                }
+            }
+        }
+
+        return false;
     }
 
     private HashSet<int> BuildInfluencedSkeletonBones()
@@ -3013,10 +3310,11 @@ public sealed class MeshPreviewControl : Control
 
     private void DrawStudioBackground(Graphics g)
     {
+        var darkTheme = BackColor.GetBrightness() < 0.35f;
         using var brush = new LinearGradientBrush(
             ClientRectangle,
-            Color.FromArgb(142, 142, 140),
-            Color.FromArgb(102, 102, 100),
+            darkTheme ? Color.FromArgb(73, 75, 80) : Color.FromArgb(142, 142, 140),
+            darkTheme ? Color.FromArgb(47, 49, 53) : Color.FromArgb(102, 102, 100),
             LinearGradientMode.Vertical);
         g.FillRectangle(brush, ClientRectangle);
     }

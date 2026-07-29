@@ -4,7 +4,7 @@
     "nativeName": "English",
     "englishName": "English",
     "author": "HeitorSpectre",
-    "baseVersion": "1.11.0"
+    "baseVersion": "1.12.0"
   },
 
   "app.title": "Telltale D3DMesh Editor",
@@ -13,6 +13,7 @@
 
   "toolbar.open_folder": "Open Folder...",
   "toolbar.open_archive": "Open Archive...",
+  "toolbar.extract": "Extract",
   "toolbar.extract_selected": "Extract Selected...",
   "toolbar.extract_all": "Extract All...",
   "msg.archive.protected_folder": "This game folder is protected by Windows:\n{0}\n\nDo you want to restart the tool as administrator to extract next to the game?\n\n• Yes — restart as administrator and extract there.\n• No — extract to this folder instead:\n{1}\n• Cancel — do nothing.",
@@ -27,7 +28,7 @@
   "anim.need_skinned": "Select a model that has a skeleton (+ SKL) to export animations.",
   "anim.none_found": "No .anm animations matching \"{0}\" were found in the opened folder.",
   "anim.export_done": "Exported {0} with {1} animation(s) ({2} selected; incompatible rigs are skipped automatically).",
-  "toolbar.reimport_selected": "Reimport Selected...",
+  "toolbar.reimport_selected": "Reimport",
   "toolbar.texture_atlas": "Texture Atlas",
   "toolbar.combine_parts": "Combine Parts",
   "toolbar.credits": "Credits",
@@ -86,6 +87,9 @@
 
   "settings.title": "Settings",
   "settings.language_label": "Language:",
+  "settings.theme_label": "Theme:",
+  "settings.theme.light": "Light",
+  "settings.theme.dark": "Dark",
   "settings.output_format": "Output Format:",
   "settings.texture_atlas_label": "Texture Atlas:",
   "settings.generate_texture_atlas": "Generate texture atlas",
@@ -205,6 +209,13 @@
   "report.v45.no_prop_warning": " Warning: sk*.prop material files not found next to the meshes; texture slots were guessed from the folder's .d3dtx names. Extract the archives with this tool to include the .prop files.",
   "report.invisible.v45_placeholder": "INVISIBLE {0}: no imported primitives were assigned; wrote a no-triangle MCSM Season 2 (V45) placeholder.",
   "report.companion.ok_v45": "OK {0}: companion part ported from {1} (V45).",
+  "report.v46.kind_character": "V46 character",
+  "report.v46.kind_static": "V46 static",
+  "report.v46.reimported": "Reimported ({0}): {1}\nInput: {2}\nOutput: {3}{4}{5}\nBatman mesh reinserted with lower LODs preserved. Test it in-game.",
+  "report.ok_part_v46": "OK {0}: {1} primitive(s), {2} texture(s) ({3}, lower LODs preserved).",
+  "report.v46.no_prop_warning": " Warning: sk*.prop material files were not found next to the meshes; diffuse slots were inferred from the folder's .d3dtx names.",
+  "report.invisible.v46_placeholder": "INVISIBLE {0}: no imported primitives were assigned; wrote a no-triangle Batman (V46) placeholder.",
+  "report.companion.ok_v46": "OK {0}: companion part ported from {1} (V46).",
   "report.atlas_summary": ", atlas {0}->{1}x{2}",
   "report.atlas_auto_suffix": " (auto: original texture names)",
 
@@ -247,6 +258,16 @@
 
   "status.done": "Done.",
   "status.working_zero": "Working... 0%",
+  "status.reimport.loading": "Loading {0}...",
+  "status.reimport.preparing": "Preparing {0} for reimport...",
+  "status.reimport.preparing_combined": "Preparing the Combined model...",
+  "status.reimport.splitting_combined": "Splitting the Combined model parts...",
+  "status.reimport.textures": "Generating textures for {0}...",
+  "status.reimport.geometry": "Reinserting geometry for {0}...",
+  "status.reimport.skeleton": "Processing the skeleton...",
+  "status.reimport.part": "Reimporting part {0}/{1}: {2}",
+  "status.reimport.part_done": "Part {0}/{1} completed: {2}",
+  "status.reimport.finalizing": "Verifying and finalizing files...",
   "status.installing": "Installing update {0}...",
   "status.reinstalling": "Reinstalling version {0}...",
   "status.restarting_update": "Restarting to apply update...",

@@ -4,7 +4,7 @@
     "nativeName": "Русский",
     "englishName": "Russian",
     "author": "HeitorSpectre",
-    "baseVersion": "1.11.0"
+    "baseVersion": "1.12.0"
   },
 
   "app.title": "Telltale D3DMesh Editor",
@@ -13,6 +13,7 @@
 
   "toolbar.open_folder": "Открыть папку...",
   "toolbar.open_archive": "Открыть контейнер...",
+  "toolbar.extract": "Извлечь",
   "toolbar.extract_selected": "Извлечь выбранное...",
   "toolbar.extract_all": "Извлечь всё...",
   "msg.archive.protected_folder": "Эта папка игры защищена Windows:\n{0}\n\nПерезапустить инструмент от имени администратора, чтобы извлечь рядом с игрой?\n\n• Да — перезапустить от имени администратора и извлечь туда.\n• Нет — извлечь в эту папку:\n{1}\n• Отмена — ничего не делать.",
@@ -27,7 +28,7 @@
   "anim.need_skinned": "Выберите модель со скелетом (+ SKL), чтобы экспортировать анимации.",
   "anim.none_found": "В открытой папке не найдено анимаций .anm, соответствующих \"{0}\".",
   "anim.export_done": "{0} экспортирован с {1} анимацией(ями) (выбрано {2}; несовместимые риги пропускаются автоматически).",
-  "toolbar.reimport_selected": "Реимпорт выбранного...",
+  "toolbar.reimport_selected": "Реимпорт",
   "toolbar.texture_atlas": "Атлас текстур",
   "toolbar.combine_parts": "Объединить части",
   "toolbar.credits": "Авторы",
@@ -86,6 +87,9 @@
 
   "settings.title": "Настройки",
   "settings.language_label": "Язык:",
+  "settings.theme_label": "Тема:",
+  "settings.theme.light": "Светлая",
+  "settings.theme.dark": "Тёмная",
   "settings.output_format": "Формат вывода:",
   "settings.texture_atlas_label": "Атлас текстур:",
   "settings.generate_texture_atlas": "Создавать атлас текстур",
@@ -205,6 +209,13 @@
   "report.v45.no_prop_warning": " Предупреждение: файлы материалов sk*.prop не найдены рядом с мешами; слоты текстур определены по именам .d3dtx в папке. Извлеките архивы этим инструментом, чтобы включить файлы .prop.",
   "report.invisible.v45_placeholder": "НЕВИДИМО {0}: импортированные примитивы не назначены; записана заглушка MCSM Season 2 (V45) без треугольников.",
   "report.companion.ok_v45": "OK {0}: сопутствующая часть портирована из {1} (V45).",
+  "report.v46.kind_character": "Персонаж V46",
+  "report.v46.kind_static": "Статический V46",
+  "report.v46.reimported": "Реимпортировано ({0}): {1}\nВход: {2}\nВыход: {3}{4}{5}\nМеш Batman реимпортирован с сохранением нижних LOD. Проверьте в игре.",
+  "report.ok_part_v46": "OK {0}: примитивов: {1}, текстур: {2} ({3}, нижние LOD сохранены).",
+  "report.v46.no_prop_warning": " Предупреждение: файлы sk*.prop не найдены; diffuse-слоты определены по именам .d3dtx.",
+  "report.invisible.v46_placeholder": "НЕВИДИМЫЙ {0}: примитивы не назначены; записан шаблон Batman (V46) без треугольников.",
+  "report.companion.ok_v46": "OK {0}: сопутствующая часть перенесена из {1} (V46).",
   "report.atlas_summary": ", атлас {0}->{1}x{2}",
   "report.atlas_auto_suffix": " (авто: исходные имена текстур)",
 

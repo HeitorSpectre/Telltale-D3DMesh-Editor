@@ -1,4 +1,5 @@
 using System.Numerics;
+using System.Diagnostics;
 using TelltaleD3DMeshEditor.Core.Localization;
 using TelltaleD3DMeshEditor.Export;
 using TelltaleD3DMeshEditor.Viewer;
@@ -19,6 +20,7 @@ public sealed class AnimationPlayerPanel : Panel
     private readonly Label _timeLabel = new();
     private readonly Button _closeButton = new();
     private readonly System.Windows.Forms.Timer _timer = new() { Interval = 33 };
+    private readonly Stopwatch _playbackClock = new();
 
     private List<AnimationCollector.Candidate> _candidates = [];
     private Dictionary<ulong, List<Channel>> _channelsByBone = new();
@@ -72,7 +74,14 @@ public sealed class AnimationPlayerPanel : Panel
         _timeLabel.Anchor = AnchorStyles.Top | AnchorStyles.Right;
         _timeLabel.Text = "0.00 / 0.00s";
 
-        _timer.Tick += (_, _) => Advance(_timer.Interval / 1000f);
+        _timer.Tick += (_, _) =>
+        {
+            AdvanceFromPlaybackClock();
+        };
+        // WinForms timers share the UI message queue. A continuous camera drag can keep that queue
+        // occupied with mouse/paint messages, delaying Tick and making the animation appear paused.
+        // Consume the same stopwatch from drag events so camera and pose advance in one rendered frame.
+        _preview.MouseMove += PreviewMouseMove;
 
         Controls.AddRange([_animCombo, _playButton, _closeButton, _timeline, _timeLabel]);
         Resize += (_, _) => LayoutControls();
@@ -192,11 +201,13 @@ public sealed class AnimationPlayerPanel : Panel
         _playButton.Text = Loc.T(_playing ? "animplayer.pause" : "animplayer.play");
         if (_playing)
         {
+            _playbackClock.Restart();
             _timer.Start();
         }
         else
         {
             _timer.Stop();
+            _playbackClock.Reset();
         }
     }
 
@@ -207,13 +218,34 @@ public sealed class AnimationPlayerPanel : Panel
             return;
         }
 
-        _time += deltaSeconds;
-        if (_time > _duration)
-        {
-            _time -= _duration; // loop
-        }
+        _time = (_time + deltaSeconds) % _duration;
 
         ApplyCurrentFrame();
+    }
+
+    private void PreviewMouseMove(object? sender, MouseEventArgs e)
+    {
+        if (_playing && e.Button != MouseButtons.None)
+        {
+            AdvanceFromPlaybackClock();
+        }
+    }
+
+    private void AdvanceFromPlaybackClock()
+    {
+        if (!_playing)
+        {
+            return;
+        }
+
+        var elapsed = (float)_playbackClock.Elapsed.TotalSeconds;
+        if (elapsed <= 0f)
+        {
+            return;
+        }
+
+        _playbackClock.Restart();
+        Advance(elapsed);
     }
 
     private void ApplyCurrentFrame()
@@ -306,6 +338,7 @@ public sealed class AnimationPlayerPanel : Panel
     {
         if (disposing)
         {
+            _preview.MouseMove -= PreviewMouseMove;
             _timer.Dispose();
         }
 

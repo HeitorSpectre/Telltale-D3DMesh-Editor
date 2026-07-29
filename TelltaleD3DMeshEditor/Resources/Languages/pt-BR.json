@@ -4,7 +4,7 @@
     "nativeName": "Português (Brasil)",
     "englishName": "Brazilian Portuguese",
     "author": "HeitorSpectre",
-    "baseVersion": "1.11.0"
+    "baseVersion": "1.12.0"
   },
 
   "app.title": "Telltale D3DMesh Editor",
@@ -13,6 +13,7 @@
 
   "toolbar.open_folder": "Abrir Pasta...",
   "toolbar.open_archive": "Abrir Container...",
+  "toolbar.extract": "Extrair",
   "toolbar.extract_selected": "Extrair Selecionados...",
   "toolbar.extract_all": "Extrair Tudo...",
   "msg.archive.protected_folder": "Esta pasta do jogo é protegida pelo Windows:\n{0}\n\nDeseja reiniciar a ferramenta como administrador para extrair junto ao jogo?\n\n• Sim — reinicia como administrador e extrai lá.\n• Não — extrai nesta pasta:\n{1}\n• Cancelar — não faz nada.",
@@ -27,7 +28,7 @@
   "anim.need_skinned": "Selecione um modelo que tenha esqueleto (+ SKL) para exportar animações.",
   "anim.none_found": "Nenhuma animação .anm correspondente a \"{0}\" foi encontrada na pasta aberta.",
   "anim.export_done": "{0} exportado com {1} animação(ões) ({2} selecionadas; rigs incompatíveis são ignorados automaticamente).",
-  "toolbar.reimport_selected": "Reimportar Selecionado...",
+  "toolbar.reimport_selected": "Reimportar",
   "toolbar.texture_atlas": "Atlas de Textura",
   "toolbar.combine_parts": "Combinar Partes",
   "toolbar.credits": "Créditos",
@@ -86,6 +87,9 @@
 
   "settings.title": "Configurações",
   "settings.language_label": "Idioma:",
+  "settings.theme_label": "Tema:",
+  "settings.theme.light": "Claro",
+  "settings.theme.dark": "Escuro",
   "settings.output_format": "Formato de Saída:",
   "settings.texture_atlas_label": "Atlas de Textura:",
   "settings.generate_texture_atlas": "Gerar atlas de textura",
@@ -205,6 +209,13 @@
   "report.v45.no_prop_warning": " Aviso: arquivos de material sk*.prop não encontrados junto aos meshes; os slots de textura foram deduzidos pelos nomes dos .d3dtx da pasta. Extraia os containers com a ferramenta para incluir os .prop.",
   "report.invisible.v45_placeholder": "INVISÍVEL {0}: nenhuma primitiva importada foi atribuída; gravado um placeholder do MCSM Season 2 (V45) sem triângulos.",
   "report.companion.ok_v45": "OK {0}: parte companheira portada de {1} (V45).",
+  "report.v46.kind_character": "Personagem V46",
+  "report.v46.kind_static": "Estático V46",
+  "report.v46.reimported": "Reimportado ({0}): {1}\nEntrada: {2}\nSaída: {3}{4}{5}\nMalha do Batman reinserida com os LODs inferiores preservados. Teste no jogo.",
+  "report.ok_part_v46": "OK {0}: {1} primitiva(s), {2} textura(s) ({3}, LODs inferiores preservados).",
+  "report.v46.no_prop_warning": " Aviso: arquivos de material sk*.prop não encontrados junto aos meshes; os slots difusos foram deduzidos pelos nomes dos .d3dtx da pasta.",
+  "report.invisible.v46_placeholder": "INVISÍVEL {0}: nenhuma primitiva importada foi atribuída; gravado um placeholder do Batman (V46) sem triângulos.",
+  "report.companion.ok_v46": "OK {0}: parte complementar portada de {1} (V46).",
   "report.atlas_summary": ", atlas {0}->{1}x{2}",
   "report.atlas_auto_suffix": " (automático: nomes de textura originais)",
 
@@ -247,6 +258,16 @@
 
   "status.done": "Concluído.",
   "status.working_zero": "Trabalhando... 0%",
+  "status.reimport.loading": "Carregando {0}...",
+  "status.reimport.preparing": "Preparando {0} para reinserção...",
+  "status.reimport.preparing_combined": "Preparando o modelo Combined...",
+  "status.reimport.splitting_combined": "Separando as partes do modelo Combined...",
+  "status.reimport.textures": "Gerando as texturas de {0}...",
+  "status.reimport.geometry": "Reinserindo a geometria de {0}...",
+  "status.reimport.skeleton": "Processando o esqueleto...",
+  "status.reimport.part": "Reinserindo parte {0}/{1}: {2}",
+  "status.reimport.part_done": "Parte {0}/{1} concluída: {2}",
+  "status.reimport.finalizing": "Verificando e finalizando os arquivos...",
   "status.installing": "Instalando atualização {0}...",
   "status.reinstalling": "Reinstalando versão {0}...",
   "status.restarting_update": "Reiniciando para aplicar a atualização...",

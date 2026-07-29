@@ -4,7 +4,7 @@
     "nativeName": "Türkçe",
     "englishName": "Turkish",
     "author": "HeitorSpectre",
-    "baseVersion": "1.11.0"
+    "baseVersion": "1.12.0"
   },
 
   "app.title": "Telltale D3DMesh Editor",
@@ -13,6 +13,7 @@
 
   "toolbar.open_folder": "Klasör Aç...",
   "toolbar.open_archive": "Kapsayıcı Aç...",
+  "toolbar.extract": "Çıkar",
   "toolbar.extract_selected": "Seçilenleri Çıkar...",
   "toolbar.extract_all": "Tümünü Çıkar...",
   "msg.archive.protected_folder": "Bu oyun klasörü Windows tarafından korunuyor:\n{0}\n\nOyunun yanına çıkarmak için aracı yönetici olarak yeniden başlatmak ister misiniz?\n\n• Evet — yönetici olarak yeniden başlat ve oraya çıkar.\n• Hayır — bunun yerine şu klasöre çıkar:\n{1}\n• İptal — hiçbir şey yapma.",
@@ -27,7 +28,7 @@
   "anim.need_skinned": "Animasyonları dışa aktarmak için iskeleti (+ SKL) olan bir model seçin.",
   "anim.none_found": "Açık klasörde \"{0}\" ile eşleşen .anm animasyonu bulunamadı.",
   "anim.export_done": "{0}, {1} animasyonla dışa aktarıldı ({2} seçildi; uyumsuz rigler otomatik atlanır).",
-  "toolbar.reimport_selected": "Seçileni Yeniden İçe Aktar...",
+  "toolbar.reimport_selected": "Yeniden İçe Aktar",
   "toolbar.texture_atlas": "Doku Atlası",
   "toolbar.combine_parts": "Parçaları Birleştir",
   "toolbar.credits": "Katkıda Bulunanlar",
@@ -86,6 +87,9 @@
 
   "settings.title": "Ayarlar",
   "settings.language_label": "Dil:",
+  "settings.theme_label": "Tema:",
+  "settings.theme.light": "Açık",
+  "settings.theme.dark": "Koyu",
   "settings.output_format": "Çıkış Biçimi:",
   "settings.texture_atlas_label": "Doku Atlası:",
   "settings.generate_texture_atlas": "Doku atlası oluştur",
@@ -205,6 +209,13 @@
   "report.v45.no_prop_warning": " Uyarı: sk*.prop malzeme dosyaları meshlerin yanında bulunamadı; doku slotları klasördeki .d3dtx adlarından tahmin edildi. .prop dosyalarını dahil etmek için arşivleri bu araçla çıkarın.",
   "report.invisible.v45_placeholder": "GÖRÜNMEZ {0}: içe aktarılan primitif atanmadı; üçgensiz MCSM Season 2 (V45) yer tutucusu yazıldı.",
   "report.companion.ok_v45": "Tamam {0}: eş parça {1} kaynağından taşındı (V45).",
+  "report.v46.kind_character": "V46 karakter",
+  "report.v46.kind_static": "V46 statik",
+  "report.v46.reimported": "Yeniden içe aktarıldı ({0}): {1}\nGirdi: {2}\nÇıktı: {3}{4}{5}\nBatman ağı alt LOD'lar korunarak yeniden eklendi. Oyunda test edin.",
+  "report.ok_part_v46": "OK {0}: {1} ilkel, {2} doku ({3}, alt LOD'lar korundu).",
+  "report.v46.no_prop_warning": " Uyarı: sk*.prop dosyaları bulunamadı; diffuse yuvaları .d3dtx adlarından çıkarıldı.",
+  "report.invisible.v46_placeholder": "GÖRÜNMEZ {0}: ilkel atanmadı; üçgensiz Batman (V46) yer tutucusu yazıldı.",
+  "report.companion.ok_v46": "OK {0}: tamamlayıcı parça {1} kaynağından taşındı (V46).",
   "report.atlas_summary": ", atlas {0}->{1}x{2}",
   "report.atlas_auto_suffix": " (otomatik: orijinal doku adları)",
 

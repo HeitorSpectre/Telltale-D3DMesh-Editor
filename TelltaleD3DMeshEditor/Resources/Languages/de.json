@@ -4,7 +4,7 @@
     "nativeName": "Deutsch",
     "englishName": "German",
     "author": "HeitorSpectre",
-    "baseVersion": "1.11.0"
+    "baseVersion": "1.12.0"
   },
 
   "app.title": "Telltale D3DMesh Editor",
@@ -13,6 +13,7 @@
 
   "toolbar.open_folder": "Ordner Öffnen...",
   "toolbar.open_archive": "Container Öffnen...",
+  "toolbar.extract": "Extrahieren",
   "toolbar.extract_selected": "Auswahl Extrahieren...",
   "toolbar.extract_all": "Alles Extrahieren...",
   "msg.archive.protected_folder": "Dieser Spielordner ist durch Windows geschützt:\n{0}\n\nMöchtest du das Tool als Administrator neu starten, um neben dem Spiel zu extrahieren?\n\n• Ja — als Administrator neu starten und dort extrahieren.\n• Nein — stattdessen in diesen Ordner extrahieren:\n{1}\n• Abbrechen — nichts tun.",
@@ -27,7 +28,7 @@
   "anim.need_skinned": "Wähle ein Modell mit Skelett (+ SKL), um Animationen zu exportieren.",
   "anim.none_found": "Keine .anm-Animationen für \"{0}\" im geöffneten Ordner gefunden.",
   "anim.export_done": "{0} mit {1} Animation(en) exportiert ({2} ausgewählt; inkompatible Rigs werden automatisch übersprungen).",
-  "toolbar.reimport_selected": "Auswahl Reimportieren...",
+  "toolbar.reimport_selected": "Reimportieren",
   "toolbar.texture_atlas": "Textur-Atlas",
   "toolbar.combine_parts": "Teile Kombinieren",
   "toolbar.credits": "Credits",
@@ -86,6 +87,9 @@
 
   "settings.title": "Einstellungen",
   "settings.language_label": "Sprache:",
+  "settings.theme_label": "Design:",
+  "settings.theme.light": "Hell",
+  "settings.theme.dark": "Dunkel",
   "settings.output_format": "Ausgabeformat:",
   "settings.texture_atlas_label": "Textur-Atlas:",
   "settings.generate_texture_atlas": "Textur-Atlas erzeugen",
@@ -205,6 +209,13 @@
   "report.v45.no_prop_warning": " Warnung: sk*.prop-Materialdateien nicht neben den Meshes gefunden; Textur-Slots wurden aus den .d3dtx-Namen des Ordners abgeleitet. Extrahiere die Archive mit diesem Tool, um die .prop-Dateien einzuschließen.",
   "report.invisible.v45_placeholder": "UNSICHTBAR {0}: keine importierten Primitive zugewiesen; MCSM-Season-2-Platzhalter (V45) ohne Dreiecke geschrieben.",
   "report.companion.ok_v45": "OK {0}: Begleitteil aus {1} portiert (V45).",
+  "report.v46.kind_character": "V46-Charakter",
+  "report.v46.kind_static": "V46-Statisch",
+  "report.v46.reimported": "Reimportiert ({0}): {1}\nEingabe: {2}\nAusgabe: {3}{4}{5}\nBatman-Mesh mit erhaltenen unteren LODs reimportiert. Im Spiel testen.",
+  "report.ok_part_v46": "OK {0}: {1} Primitive(n), {2} Textur(en) ({3}, untere LODs erhalten).",
+  "report.v46.no_prop_warning": " Warnung: sk*.prop-Dateien fehlen; Diffuse-Slots wurden aus den .d3dtx-Namen abgeleitet.",
+  "report.invisible.v46_placeholder": "UNSICHTBAR {0}: keine Primitive zugewiesen; dreiecksloser Batman-Platzhalter (V46) geschrieben.",
+  "report.companion.ok_v46": "OK {0}: Begleitteil aus {1} portiert (V46).",
   "report.atlas_summary": ", Atlas {0}->{1}x{2}",
   "report.atlas_auto_suffix": " (automatisch: originale Texturnamen)",
 
