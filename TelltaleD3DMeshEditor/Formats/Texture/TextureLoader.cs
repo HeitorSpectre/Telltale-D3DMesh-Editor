@@ -345,7 +345,15 @@ public static class TextureLoader
                 _ => null,
             };
 
-            return pixels is null ? null : new TextureImage(width, height, pixels, path, texture.AlphaMode);
+            return pixels is null
+                ? null
+                : new TextureImage(
+                    width,
+                    height,
+                    pixels,
+                    path,
+                    texture.AlphaMode,
+                    unchecked((uint)texture.SurfaceFormat));
         }
         catch
         {

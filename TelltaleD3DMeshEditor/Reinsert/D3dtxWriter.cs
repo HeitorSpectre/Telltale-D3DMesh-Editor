@@ -53,9 +53,10 @@ public static class D3dtxWriter
             return BuildLegacyErtmFromTemplate(template, pixels, width, height);
         }
 
-        // MCSM Season 2 textures use a modern T3Texture layout the hand-rolled TtgTexture parser
-        // cannot read; rewrite them through the Telltale Toolkit (verified byte-identical roundtrip).
-        if (Core.GameConfig.Current.Id == Core.GameId.MinecraftStoryModeSeason2 &&
+        // MCSM Season 2 and Batman textures use a modern T3Texture layout the hand-rolled
+        // TtgTexture parser cannot read; rewrite them through the Telltale Toolkit.
+        if (Core.GameConfig.Current.Id is
+                Core.GameId.MinecraftStoryModeSeason2 or Core.GameId.Batman &&
             template.Length >= 4 &&
             Encoding.ASCII.GetString(template, 0, 4) is "5VSM" or "6VSM" &&
             TryBuildModernV45FromTemplate(template, pixels, width, height, forceUncompressed) is { } modernBytes)

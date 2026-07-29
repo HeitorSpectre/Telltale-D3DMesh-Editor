@@ -4653,7 +4653,9 @@ public static class ReinsertCli
         => slot.Equals("normal", StringComparison.OrdinalIgnoreCase) ? "bump" : slot;
 
     private static byte[] RebuildSkeletonBytesForGame(string skeletonPath, SkeletonData skeleton, GameConfig gameConfig)
-        => SkeletonRebuilder.RebuildWithEdits(skeletonPath, skeleton, gameConfig);
+        => gameConfig.Id is GameId.MinecraftStoryModeSeason2 or GameId.Batman
+            ? SkeletonRebuilder.RebuildV45WithEdits(skeletonPath, skeleton)
+            : SkeletonRebuilder.RebuildWithEdits(skeletonPath, skeleton, gameConfig);
 
     private static void PrintAttrs(VertexAttrLayout a)
     {

@@ -17,6 +17,7 @@ public sealed class TextureImage
         AlphaMode = alphaMode;
         SourceFormat = sourceFormat;
         AverageAlpha = ComputeAverageAlpha(pixels);
+        AverageLuminance = ComputeAverageLuminance(pixels);
         NonOpaqueAlphaRatio = ComputeNonOpaqueAlphaRatio(pixels);
     }
 
@@ -34,7 +35,52 @@ public sealed class TextureImage
     // BC5 stores two channels (R,G); the tool's decoder reconstructs Z into B. Telltale's newer engine
     // uses that layout for detail maps that perturb the surface normal, not for colour that belongs in
     // albedo. Compositing one as ink paints black blotches where the perturbation is strongest.
-    public bool IsTwoChannelDerivativeMap => SourceFormat == 0x44;
+    public bool IsTwoChannelDerivativeMap =>
+        SourceFormat == 0x44 ||
+        IsReencodedBatmanTwoChannelDetailMap;
+
+    // A Batman detail map can legitimately come back from the GLB round-trip as RGBA8 even though
+    // its pixels still carry the decoded BC5 channels. The game knows the slot semantics from the
+    // material, but the preview previously relied only on format 0x44 and therefore ignored the
+    // reinserted texture. Recognize that preserved channel layout without changing the written asset.
+    //
+    // The blue-channel check is important: an ordinary grayscale/BC4 detail rewritten as RGBA8 has
+    // R == G == B and must keep using the colour-detail path. A decoded BC5 image has its reconstructed
+    // Z in B, so B materially differs from R/G.
+    private bool IsReencodedBatmanTwoChannelDetailMap =>
+        _reencodedBatmanTwoChannelDetailMap ??= ComputeReencodedBatmanTwoChannelDetailMap();
+
+    private bool? _reencodedBatmanTwoChannelDetailMap;
+
+    private bool ComputeReencodedBatmanTwoChannelDetailMap()
+    {
+        if (Core.GameConfig.Current.Id != Core.GameId.Batman ||
+            SourceFormat is not (0x09 or 0x0A) ||
+            !Path.GetFileNameWithoutExtension(SourcePath).EndsWith("_detail", StringComparison.OrdinalIgnoreCase) ||
+            Pixels.Length == 0)
+        {
+            return false;
+        }
+
+        var materiallyDifferentBlue = 0;
+        var samples = 0;
+        var step = Math.Max(1, Pixels.Length / 4096);
+        for (var i = 0; i < Pixels.Length; i += step)
+        {
+            var pixel = Pixels[i];
+            var r = (pixel >> 16) & 0xFF;
+            var g = (pixel >> 8) & 0xFF;
+            var b = pixel & 0xFF;
+            samples++;
+
+            if (Math.Abs(b - r) >= 4 || Math.Abs(b - g) >= 4)
+            {
+                materiallyDifferentBlue++;
+            }
+        }
+
+        return materiallyDifferentBlue >= Math.Max(1, samples / 20);
+    }
 
     // BC4 is a single channel expanded to grey; Telltale uses it for grime/wear that multiplies albedo.
     public bool IsSingleChannelMap => SourceFormat == 0x43;
@@ -72,6 +118,7 @@ public sealed class TextureImage
     }
 
     public float AverageAlpha { get; }
+    public float AverageLuminance { get; }
     public float NonOpaqueAlphaRatio { get; }
 
     // True when the alpha channel carries packed DATA rather than opacity. Telltale's newer engine
@@ -160,6 +207,25 @@ public sealed class TextureImage
         }
 
         return sum / (pixels.Length * 255f);
+    }
+
+    private static float ComputeAverageLuminance(int[] pixels)
+    {
+        if (pixels.Length == 0)
+        {
+            return 1f;
+        }
+
+        double sum = 0;
+        foreach (var pixel in pixels)
+        {
+            var r = (pixel >> 16) & 0xFF;
+            var g = (pixel >> 8) & 0xFF;
+            var b = pixel & 0xFF;
+            sum += 0.299 * r + 0.587 * g + 0.114 * b;
+        }
+
+        return (float)(sum / (pixels.Length * 255.0));
     }
 
     private static float ComputeNonOpaqueAlphaRatio(int[] pixels)

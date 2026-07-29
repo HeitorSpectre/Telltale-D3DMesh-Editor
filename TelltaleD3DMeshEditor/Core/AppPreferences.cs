@@ -2,6 +2,12 @@ using System.Text.Json;
 
 namespace TelltaleD3DMeshEditor.Core;
 
+public enum AppTheme
+{
+    Light = 0,
+    Dark = 1,
+}
+
 public sealed record AppPreferences
 {
     public GameId LastGame { get; init; } = GameId.Generic;
@@ -9,6 +15,7 @@ public sealed record AppPreferences
     public bool TextureAtlas { get; init; }
     public bool ViewerAntiAliasing { get; init; }
     public bool ViewerFlightCamera { get; init; }
+    public AppTheme Theme { get; init; } = AppTheme.Light;
 
     // When true, textures written on reimport are saved uncompressed (ARGB8) instead of DXT.
     // Needed for games like Minecraft: Story Mode whose low-resolution character ("skin") textures
@@ -86,7 +93,8 @@ public sealed record AppPreferences
         bool normalizeFacialBonesOnReimport,
         bool viewerAntiAliasing,
         bool viewerFlightCamera,
-        bool discordRichPresence)
+        bool discordRichPresence,
+        AppTheme theme)
     {
         var current = Load();
         Save(current with
@@ -99,6 +107,7 @@ public sealed record AppPreferences
             ViewerAntiAliasing = viewerAntiAliasing,
             ViewerFlightCamera = viewerFlightCamera,
             DiscordRichPresence = discordRichPresence,
+            Theme = theme,
         });
     }
 

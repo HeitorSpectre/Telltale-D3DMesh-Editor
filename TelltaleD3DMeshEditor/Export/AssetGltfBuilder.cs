@@ -1,6 +1,7 @@
 using System.Drawing;
 using System.Drawing.Imaging;
 using System.Numerics;
+using System.Runtime.InteropServices;
 using TelltaleD3DMeshEditor.Core;
 using TelltaleD3DMeshEditor.Formats.Mesh;
 using TelltaleD3DMeshEditor.Formats.Skeleton;
@@ -77,10 +78,13 @@ internal static class AssetGltfBuilder
         var imageIndexByName = new Dictionary<string, int>(StringComparer.OrdinalIgnoreCase);
         var pngByName = new Dictionary<string, byte[]>(StringComparer.OrdinalIgnoreCase);
         var lowAlphaByName = new Dictionary<string, bool>(StringComparer.OrdinalIgnoreCase);
+        var packedDataAlphaByName = new Dictionary<string, bool>(StringComparer.OrdinalIgnoreCase);
         var lineOverlayAlphaModeByName = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
         foreach (var (name, entry) in baseColorPngByName)
         {
             lowAlphaByName[name] = entry.AvgAlpha < 0.95f;
+            packedDataAlphaByName[name] = GameConfig.Current.Id == GameId.Batman &&
+                                          IsPackedDataAlpha(entry.Png);
             var imageIndex = images.Count;
             images.Add((name, entry.Png));
             pngByName[name] = entry.Png;
@@ -280,6 +284,10 @@ internal static class AssetGltfBuilder
                     ["doubleSided"] = true,
                 };
                 var renderDiffuseName = diffuseName;
+                var isBatmanPictureFrameBase = IsBatmanPictureFrameBaseMaterial(mesh.Name, submesh, materialName, diffuseName);
+                var isBatmanPictureFrameGlass = IsBatmanPictureFrameGlassMaterial(mesh.Name, submesh, materialName, diffuseName);
+                var isBatmanEyeLens = IsBatmanEyeLensMaterial(submesh, materialName, diffuseName);
+                var isBatmanEyeball = IsBatmanEyeballMaterial(submesh, materialName, diffuseName);
                 if (IsDarkAlphaMaterial(materialName, diffuseName))
                 {
                     renderDiffuseName = GetOrCreateDarkAlphaTexture(
@@ -290,11 +298,16 @@ internal static class AssetGltfBuilder
                         imageIndexByName,
                         textureIndexByName);
                 }
-                if (textureIndexByName.TryGetValue(renderDiffuseName, out var texIndex))
+                var hasResolvedDiffuseTexture = textureIndexByName.TryGetValue(renderDiffuseName, out var texIndex);
+                if (hasResolvedDiffuseTexture)
                 {
                     pbr["baseColorTexture"] = new Dictionary<string, object> { ["index"] = texIndex };
                     var isBttfBlendAlpha = IsBackToTheFutureBlendAlphaMaterial(submesh, materialName, diffuseName);
-                    if ((lowAlphaByName.TryGetValue(diffuseName, out var low) && low) || isBttfBlendAlpha)
+                    var hasPackedDataAlpha = packedDataAlphaByName.TryGetValue(diffuseName, out var packed) && packed;
+                    if (((lowAlphaByName.TryGetValue(diffuseName, out var low) && low) &&
+                         !hasPackedDataAlpha &&
+                         !isBatmanPictureFrameBase) ||
+                        isBttfBlendAlpha)
                     {
                         if (isBttfBlendAlpha)
                         {
@@ -311,6 +324,44 @@ internal static class AssetGltfBuilder
                 if (exportMichonneVertexAlpha)
                 {
                     materialDict["alphaMode"] = "BLEND";
+                    materialDict["doubleSided"] = true;
+                }
+                if (isBatmanEyeball)
+                {
+                    // The shared Batman eye atlas carries alpha outside/inside its packed regions,
+                    // but the eyeball itself is a solid surface. Do not export it as MASK/BLEND.
+                    pbr["baseColorFactor"] = new[] { 1f, 1f, 1f, 1f };
+                    materialDict.Remove("alphaMode");
+                    materialDict.Remove("alphaCutoff");
+                }
+                if (isBatmanEyeLens)
+                {
+                    // The separate cornea shell is specular/refractive in-engine. When its diffuse
+                    // asset is absent, a translucent white fallback creates a false milky film.
+                    // Keep the shell in the GLB hierarchy but make that unsupported fallback clear.
+                    pbr["baseColorFactor"] = hasResolvedDiffuseTexture
+                        ? new[] { 1f, 1f, 1f, 1f }
+                        : new[] { 1f, 1f, 1f, 0f };
+                    materialDict["alphaMode"] = "BLEND";
+                    materialDict.Remove("alphaCutoff");
+                    materialDict["doubleSided"] = true;
+                }
+                else if (IsBatmanLensMaterial(submesh, materialName, diffuseName))
+                {
+                    // Batman eye/glass lenses are material-driven transparency. Some lens meshes have
+                    // no resolvable diffuse at all; exporting the default white OPAQUE material covered
+                    // the textured eyeball beneath it and made Bruce's irises disappear.
+                    pbr["baseColorFactor"] = new[] { 1f, 1f, 1f, 110f / 255f };
+                    materialDict["alphaMode"] = "BLEND";
+                    materialDict["doubleSided"] = true;
+                }
+                if (isBatmanPictureFrameGlass)
+                {
+                    // The unbroken plane and broken shards are separate glass geometry. Their BC3
+                    // alpha is translucency, whereas the matching frame/photo atlas uses alpha as
+                    // material data and must remain opaque.
+                    materialDict["alphaMode"] = "BLEND";
+                    materialDict.Remove("alphaCutoff");
                     materialDict["doubleSided"] = true;
                 }
                 if (TryGetSlotTexture(submesh.TextureNames, textureIndexByName, "bump", out var normalTextureName, out var normalTexIndex))
@@ -341,18 +392,28 @@ internal static class AssetGltfBuilder
                     };
                 }
                 else if (GameConfig.Current.Id == GameId.Batman &&
-                         TryGetSlotTexture(submesh.TextureNames, textureIndexByName, "detail_diffuse", out var batDetailName, out var batDetailTexIndex) &&
+                         TryGetSlotTexture(submesh.TextureNames, textureIndexByName, "detail_diffuse", out var batDetailName, out _) &&
                          !batDetailName.StartsWith("packdetail", StringComparison.OrdinalIgnoreCase))
                 {
-                    // Batman's detail is a coverage map that darkens the surface, so occlusionTexture is
+                    // Batman detail maps do not have one fixed polarity. Convert their coverage to
                     // the closest standard slot — it makes the detail actually visible in GLB viewers
                     // instead of being exported as an inert lines-overlay material. extras.telltaleTextures
                     // still records the original "detail_diffuse" slot for reimport.
-                    materialDict["occlusionTexture"] = new Dictionary<string, object>
+                    if (TryGetOrCreateBatmanDetailOcclusionTexture(
+                            batDetailName,
+                            pngByName,
+                            images,
+                            textures,
+                            imageIndexByName,
+                            textureIndexByName,
+                            out var batDetailOcclusionTexIndex))
                     {
-                        ["index"] = batDetailTexIndex,
-                        ["texCoord"] = TexCoordForSlot("diffuse"),
-                    };
+                        materialDict["occlusionTexture"] = new Dictionary<string, object>
+                        {
+                            ["index"] = batDetailOcclusionTexIndex,
+                            ["texCoord"] = TexCoordForSlot("diffuse"),
+                        };
+                    }
                 }
                 else if (TryGetLightmapSlotTexture(submesh.TextureNames, textureIndexByName, out _, out var bakeTexIndex))
                 {
@@ -1569,6 +1630,248 @@ internal static class AssetGltfBuilder
                diffuseName.Contains("eyelash", StringComparison.OrdinalIgnoreCase) ||
                diffuseName.Contains("eyelashes", StringComparison.OrdinalIgnoreCase) ||
                diffuseName.Contains("lashes", StringComparison.OrdinalIgnoreCase);
+    }
+
+    private static bool IsBatmanLensMaterial(SubmeshData submesh, string materialName, string diffuseName)
+    {
+        if (GameConfig.Current.Id != GameId.Batman)
+        {
+            return false;
+        }
+
+        static bool IsLensName(string? name) =>
+            !string.IsNullOrWhiteSpace(name) &&
+            name.Contains("lens", StringComparison.OrdinalIgnoreCase);
+
+        return IsLensName(submesh.Name) ||
+               IsLensName(materialName) ||
+               IsLensName(diffuseName);
+    }
+
+    private static bool IsBatmanEyeLensMaterial(SubmeshData submesh, string materialName, string diffuseName)
+    {
+        if (GameConfig.Current.Id != GameId.Batman)
+        {
+            return false;
+        }
+
+        static bool Match(string? name) =>
+            !string.IsNullOrWhiteSpace(name) &&
+            name.Contains("eyelens", StringComparison.OrdinalIgnoreCase);
+
+        return Match(submesh.Name) || Match(materialName) || Match(diffuseName);
+    }
+
+    private static bool IsBatmanEyeballMaterial(SubmeshData submesh, string materialName, string diffuseName)
+    {
+        if (GameConfig.Current.Id != GameId.Batman ||
+            IsBatmanEyeLensMaterial(submesh, materialName, diffuseName))
+        {
+            return false;
+        }
+
+        static bool Match(string? name)
+        {
+            var normalized = NormalizeTextureStem(name ?? string.Empty);
+            return normalized.Contains("sharedparts_eyes", StringComparison.OrdinalIgnoreCase) &&
+                   !normalized.Contains("eyelash", StringComparison.OrdinalIgnoreCase);
+        }
+
+        return Match(submesh.Name) || Match(materialName) || Match(diffuseName);
+    }
+
+    private static bool IsBatmanPictureFrameBaseMaterial(
+        string meshName,
+        SubmeshData submesh,
+        string materialName,
+        string diffuseName)
+    {
+        if (GameConfig.Current.Id != GameId.Batman ||
+            IsBatmanPictureFrameGlassMaterial(meshName, submesh, materialName, diffuseName))
+        {
+            return false;
+        }
+
+        static bool MatchBase(string? value)
+            => NormalizeTextureStem(value ?? string.Empty)
+                .Equals("obj_pictureFrameBreakableWayne", StringComparison.OrdinalIgnoreCase);
+
+        return MatchBase(submesh.Name) || MatchBase(materialName) || MatchBase(diffuseName);
+    }
+
+    private static bool IsBatmanPictureFrameGlassMaterial(
+        string meshName,
+        SubmeshData submesh,
+        string materialName,
+        string diffuseName)
+    {
+        if (GameConfig.Current.Id != GameId.Batman)
+        {
+            return false;
+        }
+
+        static bool IsPictureFrame(string? value)
+            => value is not null &&
+               value.Contains("pictureFrame", StringComparison.OrdinalIgnoreCase);
+
+        static bool IsBrokenGlass(string? value)
+            => value is not null &&
+               IsPictureFrame(value) &&
+               value.Contains("BrokenGlass", StringComparison.OrdinalIgnoreCase);
+
+        return (IsPictureFrame(meshName) &&
+                meshName.Contains("glassUnbroken", StringComparison.OrdinalIgnoreCase)) ||
+               IsBrokenGlass(submesh.Name) ||
+               IsBrokenGlass(materialName) ||
+               IsBrokenGlass(diffuseName);
+    }
+
+    private static bool IsPackedDataAlpha(byte[] png)
+    {
+        var (_, _, pixels) = DecodePngPixels(png);
+        if (pixels.Length == 0)
+        {
+            return false;
+        }
+
+        var opaque = 0;
+        var transparent = 0;
+        foreach (var pixel in pixels)
+        {
+            var alpha = (pixel >> 24) & 0xFF;
+            if (alpha >= 250)
+            {
+                opaque++;
+            }
+            else if (alpha <= 5)
+            {
+                transparent++;
+            }
+        }
+
+        // Packed gloss/scatter has almost no pixels at either coverage extreme. Real masks retain
+        // substantial opaque or transparent populations and therefore do not pass this test.
+        return opaque < pixels.Length / 100 && transparent < pixels.Length / 100;
+    }
+
+    private static bool TryGetOrCreateBatmanDetailOcclusionTexture(
+        string sourceTextureName,
+        IReadOnlyDictionary<string, byte[]> pngByName,
+        List<(string Name, byte[] Png)> images,
+        List<Dictionary<string, object>> textures,
+        Dictionary<string, int> imageIndexByName,
+        Dictionary<string, int> textureIndexByName,
+        out int textureIndex)
+    {
+        var derivedName = sourceTextureName + "__tt_batman_detail_ao";
+        if (textureIndexByName.TryGetValue(derivedName, out textureIndex))
+        {
+            return true;
+        }
+        if (!pngByName.TryGetValue(sourceTextureName, out var sourcePng))
+        {
+            textureIndex = -1;
+            return false;
+        }
+
+        var (width, height, pixels) = DecodePngPixels(sourcePng);
+        if (pixels.Length == 0)
+        {
+            textureIndex = -1;
+            return false;
+        }
+
+        long differenceRg = 0;
+        long differenceRb = 0;
+        long redSum = 0;
+        foreach (var pixel in pixels)
+        {
+            var r = (pixel >> 16) & 0xFF;
+            var g = (pixel >> 8) & 0xFF;
+            var b = pixel & 0xFF;
+            differenceRg += Math.Abs(r - g);
+            differenceRb += Math.Abs(r - b);
+            redSum += r;
+        }
+
+        var averageDifferenceRg = differenceRg / (double)pixels.Length;
+        var averageDifferenceRb = differenceRb / (double)pixels.Length;
+        if (averageDifferenceRg > 2.0)
+        {
+            // R and G differ materially: this is a genuine BC5 derivative-normal detail. It belongs
+            // to lighting, not occlusion, so keep it only in the Telltale metadata/extras.
+            textureIndex = -1;
+            return false;
+        }
+
+        var grayscale = averageDifferenceRb <= 2.0;
+        var averageRed = redSum / (double)pixels.Length;
+        // Environment detail commonly stores sparse marks over a black empty background, while
+        // some AO-like grayscale maps use the conventional bright background. Infer the polarity
+        // from the actual decoded image instead of applying the character-oriented rule globally.
+        var darkBackgroundCoverage = !grayscale || averageRed < 127.5;
+        var aoPixels = new int[pixels.Length];
+        for (var i = 0; i < pixels.Length; i++)
+        {
+            var coverage = (pixels[i] >> 16) & 0xFF;
+            var ao = darkBackgroundCoverage
+                ? 255 - (int)MathF.Round(coverage * 0.45f)
+                : 128 + coverage / 2;
+            ao = Math.Clamp(ao, 0, 255);
+            aoPixels[i] = unchecked((int)0xFF000000) | (ao << 16) | (ao << 8) | ao;
+        }
+
+        var aoPng = EncodeArgbPng(width, height, aoPixels);
+        var imageIndex = images.Count;
+        images.Add((derivedName, aoPng));
+        imageIndexByName[derivedName] = imageIndex;
+        textureIndex = textures.Count;
+        textures.Add(new Dictionary<string, object> { ["source"] = imageIndex, ["sampler"] = 0 });
+        textureIndexByName[derivedName] = textureIndex;
+        return true;
+    }
+
+    private static (int Width, int Height, int[] Pixels) DecodePngPixels(byte[] png)
+    {
+        using var input = new MemoryStream(png);
+        using var source = new Bitmap(input);
+        using var argb = new Bitmap(source.Width, source.Height, PixelFormat.Format32bppArgb);
+        using (var graphics = Graphics.FromImage(argb))
+        {
+            graphics.DrawImageUnscaled(source, 0, 0);
+        }
+
+        var rectangle = new Rectangle(0, 0, argb.Width, argb.Height);
+        var data = argb.LockBits(rectangle, ImageLockMode.ReadOnly, PixelFormat.Format32bppArgb);
+        try
+        {
+            var pixels = new int[argb.Width * argb.Height];
+            Marshal.Copy(data.Scan0, pixels, 0, pixels.Length);
+            return (argb.Width, argb.Height, pixels);
+        }
+        finally
+        {
+            argb.UnlockBits(data);
+        }
+    }
+
+    private static byte[] EncodeArgbPng(int width, int height, int[] pixels)
+    {
+        using var bitmap = new Bitmap(width, height, PixelFormat.Format32bppArgb);
+        var rectangle = new Rectangle(0, 0, width, height);
+        var data = bitmap.LockBits(rectangle, ImageLockMode.WriteOnly, PixelFormat.Format32bppArgb);
+        try
+        {
+            Marshal.Copy(pixels, 0, data.Scan0, pixels.Length);
+        }
+        finally
+        {
+            bitmap.UnlockBits(data);
+        }
+
+        using var output = new MemoryStream();
+        bitmap.Save(output, ImageFormat.Png);
+        return output.ToArray();
     }
 
     private static string GetOrCreateDarkAlphaTexture(

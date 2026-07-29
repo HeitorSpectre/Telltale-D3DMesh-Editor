@@ -83,6 +83,21 @@ public static class MeshReinserter
     public static byte[] BuildInvisibleV45MeshBytes(string meshPath)
         => V45MeshReinserter.BuildInvisible(File.ReadAllBytes(meshPath));
 
+    // Batman: The Telltale Series (.d3dmesh v46). Unlike v45, Batman stores the
+    // lower LODs after LOD0 in the same vertex/index buffers, so its writer keeps
+    // those suffixes intact and rebuilds only the editable LOD0 prefix.
+    public static byte[] ReinsertV46Geometry(byte[] templateBytes, GltfModel model)
+        => V45MeshReinserter.ReinsertV46(templateBytes, model);
+
+    public static V45MeshReinserter.ReinsertResult ReinsertV46GeometryWithAssignments(
+        byte[] templateBytes,
+        GltfModel model,
+        IReadOnlyList<string?> batchTemplateDiffuse)
+        => V45MeshReinserter.ReinsertV46WithAssignments(templateBytes, model, batchTemplateDiffuse);
+
+    public static byte[] BuildInvisibleV46MeshBytes(string meshPath)
+        => V45MeshReinserter.BuildInvisibleV46(File.ReadAllBytes(meshPath));
+
     public static V25MeshLayout? TryFindV25SourceMaterialLayout(
         GltfModel model,
         string templateMeshPath,
@@ -3365,14 +3380,44 @@ public static class V45MeshReinserter
         byte[] templateBytes,
         GltfModel model,
         IReadOnlyList<string?>? batchTemplateDiffuse)
+        => ReinsertWithAssignmentsCore(
+            templateBytes,
+            model,
+            batchTemplateDiffuse,
+            Core.GameConfig.MinecraftStoryModeSeason2.ModernTextureToolkitGameName!,
+            "v45",
+            preserveLowerLods: false);
+
+    public static byte[] ReinsertV46(byte[] templateBytes, GltfModel model)
+        => ReinsertV46WithAssignments(templateBytes, model, batchTemplateDiffuse: null).MeshBytes;
+
+    public static ReinsertResult ReinsertV46WithAssignments(
+        byte[] templateBytes,
+        GltfModel model,
+        IReadOnlyList<string?>? batchTemplateDiffuse)
+        => ReinsertWithAssignmentsCore(
+            templateBytes,
+            model,
+            batchTemplateDiffuse,
+            Core.GameConfig.Batman.ModernTextureToolkitGameName!,
+            "v46",
+            preserveLowerLods: true);
+
+    private static ReinsertResult ReinsertWithAssignmentsCore(
+        byte[] templateBytes,
+        GltfModel model,
+        IReadOnlyList<string?>? batchTemplateDiffuse,
+        string toolkitGameName,
+        string formatLabel,
+        bool preserveLowerLods)
     {
         var mesh = TelltaleToolkitMeshParser.ParseModernMeshRaw(
-            templateBytes, Core.GameConfig.MinecraftStoryModeSeason2.ModernTextureToolkitGameName)
-            ?? throw new InvalidDataException("The Telltale Toolkit could not read the v45 template mesh.");
-        var meshData = mesh.MeshData ?? throw new InvalidDataException("v45 template has no T3MeshData.");
+            templateBytes, toolkitGameName)
+            ?? throw new InvalidDataException($"The Telltale Toolkit could not read the {formatLabel} template mesh.");
+        var meshData = mesh.MeshData ?? throw new InvalidDataException($"{formatLabel} template has no T3MeshData.");
         if (meshData.LODs is not { Count: > 0 } || meshData.VertexStates is not { Count: > 0 })
         {
-            throw new InvalidDataException("v45 template has no LODs/vertex states.");
+            throw new InvalidDataException($"{formatLabel} template has no LODs/vertex states.");
         }
 
         MetaStreamParams streamParams;
@@ -3389,8 +3434,12 @@ public static class V45MeshReinserter
         var templateBatches = lod.Batches is { Count: > 0 } ? lod.Batches : lod.Batches1;
         if (templateBatches is not { Count: > 0 })
         {
-            throw new InvalidDataException("v45 template LOD0 has no batches.");
+            throw new InvalidDataException($"{formatLabel} template LOD0 has no batches.");
         }
+
+        var v46State = preserveLowerLods
+            ? CapturePreservedLodState(meshData, vertexState, templateBatches)
+            : null;
 
         var (batchGroups, textureAssignments) =
             GroupPrimitivesForBatches(model, templateBatches, meshData, batchTemplateDiffuse);
@@ -3463,7 +3512,7 @@ public static class V45MeshReinserter
         // Shadow batches (mBatches[1]): one covering batch is the common case; otherwise mirror the
         // default batches one-to-one.
         var shadowTris = 0;
-        if (lod.Batches2 is { Count: > 0 })
+        if (v46State is null && lod.Batches2 is { Count: > 0 })
         {
             if (lod.Batches2.Count == 1)
             {
@@ -3490,12 +3539,26 @@ public static class V45MeshReinserter
         }
 
         // ── Encode the GFX buffers using the template's attribute layout ──
-        EncodeVertexBuffers(vertexState, meshData, pool);
-        EncodeIndexBuffers(vertexState, globalIndices, pool.Length);
+        if (v46State is null)
+        {
+            EncodeVertexBuffers(vertexState, meshData, pool);
+            EncodeIndexBuffers(vertexState, globalIndices, pool.Length);
+        }
+        else
+        {
+            shadowTris = EncodeV46BuffersPreservingLowerLods(
+                meshData,
+                vertexState,
+                lod,
+                templateBatches,
+                pool,
+                globalIndices,
+                v46State);
+        }
 
         // ── Counts and bounds ──
         var (meshBox, meshSphere) = ComputeBounds(pool, 0, pool.Length);
-        meshData.VertexCount = (uint)pool.Length;
+        meshData.VertexCount = (uint)(pool.Length + (v46State?.PreservedVertexCount ?? 0));
         meshData.BoundingBox = meshBox;
         meshData.BoundingSphere = meshSphere;
         lod.BoundingBox = meshBox;
@@ -3525,10 +3588,14 @@ public static class V45MeshReinserter
 
         // Sanity: the produced file must parse back.
         var check = TelltaleToolkitMeshParser.ParseModernMeshRaw(
-            output, Core.GameConfig.MinecraftStoryModeSeason2.ModernTextureToolkitGameName);
+            output, toolkitGameName);
         if (check?.MeshData is null)
         {
-            throw new InvalidDataException("v45 reinsertion produced a file the toolkit cannot read back.");
+            throw new InvalidDataException($"{formatLabel} reinsertion produced a file the toolkit cannot read back.");
+        }
+        if (v46State is not null)
+        {
+            ValidatePreservedV46Output(check.MeshData, v46State);
         }
 
         return new ReinsertResult(output, textureAssignments);
@@ -3538,11 +3605,22 @@ public static class V45MeshReinserter
     // every batch draws zero triangles. Empty GFX buffers break the toolkit's reader, so counts —
     // not payloads — are what get zeroed.
     public static byte[] BuildInvisible(byte[] templateBytes)
+        => BuildInvisibleCore(
+            templateBytes,
+            Core.GameConfig.MinecraftStoryModeSeason2.ModernTextureToolkitGameName!,
+            "v45");
+
+    public static byte[] BuildInvisibleV46(byte[] templateBytes)
+        => BuildInvisibleCore(
+            templateBytes,
+            Core.GameConfig.Batman.ModernTextureToolkitGameName!,
+            "v46");
+
+    private static byte[] BuildInvisibleCore(byte[] templateBytes, string toolkitGameName, string formatLabel)
     {
-        var mesh = TelltaleToolkitMeshParser.ParseModernMeshRaw(
-            templateBytes, Core.GameConfig.MinecraftStoryModeSeason2.ModernTextureToolkitGameName)
-            ?? throw new InvalidDataException("The Telltale Toolkit could not read the v45 template mesh.");
-        var meshData = mesh.MeshData ?? throw new InvalidDataException("v45 template has no T3MeshData.");
+        var mesh = TelltaleToolkitMeshParser.ParseModernMeshRaw(templateBytes, toolkitGameName)
+            ?? throw new InvalidDataException($"The Telltale Toolkit could not read the {formatLabel} template mesh.");
+        var meshData = mesh.MeshData ?? throw new InvalidDataException($"{formatLabel} template has no T3MeshData.");
 
         MetaStreamParams streamParams;
         using (var paramStream = new MemoryStream(templateBytes))
@@ -4059,6 +4137,591 @@ public static class V45MeshReinserter
 
     // ── Buffer encoding ──
 
+    private sealed record BatchGeometrySnapshot(
+        uint MinVertIndex,
+        uint MaxVertIndex,
+        uint BaseIndex,
+        uint StartIndex,
+        uint NumPrimitives,
+        uint NumIndices,
+        uint AdjacencyStartIndex);
+
+    private sealed class PreservedLodState
+    {
+        public required int OriginalLod0VertexCount { get; init; }
+        public required int PreservedVertexCount { get; init; }
+        public required int OriginalMainPrefixCount { get; init; }
+        public required int OriginalShadowPrefixCount { get; init; }
+        public required byte[][] VertexBuffers { get; init; }
+        public required byte[][] IndexBuffers { get; init; }
+        public required BatchGeometrySnapshot[] MainBatches { get; init; }
+        public required BatchGeometrySnapshot[] ShadowBatches { get; init; }
+        public required Vector2[] OriginalUvScales { get; init; }
+        public required Vector2[] OriginalUvOffsets { get; init; }
+        public int NewLod0VertexCount { get; set; }
+        public int NewMainPrefixCount { get; set; }
+        public int NewShadowPrefixCount { get; set; }
+    }
+
+    private static PreservedLodState CapturePreservedLodState(
+        T3MeshData meshData,
+        T3GFXVertexState vertexState,
+        List<T3MeshBatch> lod0MainBatches)
+    {
+        if (vertexState.VertexBuffer is not { Count: > 0 } ||
+            vertexState.IndexBuffer is not { Count: >= 2 })
+        {
+            throw new InvalidDataException(
+                "Batman v46 reinsertion requires the template's vertex buffer and its main/shadow index buffers.");
+        }
+
+        var originalVertexCount = checked((int)meshData.VertexCount);
+        var firstLowerVertex = (meshData.LODs ?? [])
+            .Skip(1)
+            .SelectMany(GetAllBatches)
+            .Select(batch => (int)batch.BaseIndex)
+            .Where(index => index > 0)
+            .DefaultIfEmpty(originalVertexCount)
+            .Min();
+        firstLowerVertex = Math.Clamp(firstLowerVertex, 0, originalVertexCount);
+
+        var mainBufferCount = checked((int)vertexState.IndexBuffer[0].Count);
+        var shadowBufferCount = checked((int)vertexState.IndexBuffer[1].Count);
+        var firstLowerMainIndex = (meshData.LODs ?? [])
+            .Skip(1)
+            .SelectMany(GetMainBatches)
+            .Select(batch => (int)batch.StartIndex)
+            .Where(index => index > 0)
+            .DefaultIfEmpty(mainBufferCount)
+            .Min();
+        var firstLowerShadowIndex = (meshData.LODs ?? [])
+            .Skip(1)
+            .SelectMany(lod => lod.Batches2 ?? [])
+            .Select(batch => (int)batch.StartIndex)
+            .Where(index => index > 0)
+            .DefaultIfEmpty(shadowBufferCount)
+            .Min();
+
+        return new PreservedLodState
+        {
+            OriginalLod0VertexCount = firstLowerVertex,
+            PreservedVertexCount = originalVertexCount - firstLowerVertex,
+            OriginalMainPrefixCount = Math.Clamp(firstLowerMainIndex, 0, mainBufferCount),
+            OriginalShadowPrefixCount = Math.Clamp(firstLowerShadowIndex, 0, shadowBufferCount),
+            VertexBuffers = vertexState.VertexBuffer
+                .Select(buffer => (byte[])buffer.Buffer.Clone())
+                .ToArray(),
+            IndexBuffers = vertexState.IndexBuffer
+                .Select(buffer => (byte[])buffer.Buffer.Clone())
+                .ToArray(),
+            MainBatches = lod0MainBatches.Select(Snapshot).ToArray(),
+            ShadowBatches = (meshData.LODs![0].Batches2 ?? []).Select(Snapshot).ToArray(),
+            OriginalUvScales = meshData.TexCoordTransform.Select(transform => transform.Scale).ToArray(),
+            OriginalUvOffsets = meshData.TexCoordTransform.Select(transform => transform.Offset).ToArray(),
+        };
+    }
+
+    private static IEnumerable<T3MeshBatch> GetMainBatches(T3MeshLOD lod)
+        => lod.Batches is { Count: > 0 } ? lod.Batches : lod.Batches1 ?? [];
+
+    private static IEnumerable<T3MeshBatch> GetAllBatches(T3MeshLOD lod)
+        => GetMainBatches(lod).Concat(lod.Batches2 ?? []);
+
+    private static BatchGeometrySnapshot Snapshot(T3MeshBatch batch)
+        => new(
+            batch.MinVertIndex,
+            batch.MaxVertIndex,
+            batch.BaseIndex,
+            batch.StartIndex,
+            batch.NumPrimitives,
+            batch.NumIndices,
+            batch.AdjacencyStartIndex);
+
+    private static int EncodeV46BuffersPreservingLowerLods(
+        T3MeshData meshData,
+        T3GFXVertexState vertexState,
+        T3MeshLOD lod0,
+        List<T3MeshBatch> lod0MainBatches,
+        PoolVertex[] pool,
+        List<int> globalIndices,
+        PreservedLodState state)
+    {
+        EncodeVertexBuffersPreservingSuffix(vertexState, meshData, pool, state);
+
+        var mainPrefix = new List<int>(globalIndices.Count * 3);
+        mainPrefix.AddRange(globalIndices);
+        for (var batchIndex = 0; batchIndex < lod0MainBatches.Count; batchIndex++)
+        {
+            var batch = lod0MainBatches[batchIndex];
+            var start = checked((int)batch.StartIndex);
+            var count = checked((int)batch.NumIndices);
+            batch.AdjacencyStartIndex = (uint)mainPrefix.Count;
+            mainPrefix.AddRange(BuildTriangleAdjacency(globalIndices, start, count));
+        }
+
+        var shadowPrefix = new List<int>();
+        if (lod0.Batches2 is { Count: > 0 })
+        {
+            for (var shadowIndex = 0; shadowIndex < lod0.Batches2.Count; shadowIndex++)
+            {
+                var shadow = lod0.Batches2[shadowIndex];
+                BatchGeometrySnapshot? originalShadow = shadowIndex < state.ShadowBatches.Length
+                    ? state.ShadowBatches[shadowIndex]
+                    : null;
+                var selected = SelectShadowMainBatches(state.MainBatches, originalShadow);
+                var shadowVertices = new List<int>();
+                var start = shadowPrefix.Count;
+                foreach (var mainIndex in selected)
+                {
+                    if (mainIndex < 0 || mainIndex >= lod0MainBatches.Count)
+                    {
+                        continue;
+                    }
+
+                    var source = lod0MainBatches[mainIndex];
+                    var sourceStart = checked((int)source.StartIndex);
+                    var sourceCount = checked((int)source.NumIndices);
+                    for (var i = sourceStart; i < sourceStart + sourceCount; i++)
+                    {
+                        var index = globalIndices[i];
+                        shadowPrefix.Add(index);
+                        shadowVertices.Add(index);
+                    }
+                }
+
+                shadow.BaseIndex = 0;
+                shadow.StartIndex = (uint)start;
+                shadow.NumIndices = (uint)(shadowPrefix.Count - start);
+                shadow.NumPrimitives = shadow.NumIndices / 3;
+                shadow.MinVertIndex = shadowVertices.Count == 0 ? 0u : (uint)shadowVertices.Min();
+                shadow.MaxVertIndex = shadowVertices.Count == 0 ? 0u : (uint)shadowVertices.Max();
+                var (box, sphere) = ComputeBoundsFromIndices(pool.ToList(), shadowVertices.ToArray());
+                shadow.BoundingBox = box;
+                shadow.BoundingSphere = sphere;
+            }
+        }
+
+        EncodeV46IndexBuffer(
+            vertexState.IndexBuffer![0],
+            mainPrefix,
+            state.IndexBuffers[0],
+            state.OriginalMainPrefixCount,
+            pool.Length + state.PreservedVertexCount);
+        EncodeV46IndexBuffer(
+            vertexState.IndexBuffer[1],
+            shadowPrefix,
+            state.IndexBuffers[1],
+            state.OriginalShadowPrefixCount,
+            pool.Length + state.PreservedVertexCount);
+        state.NewLod0VertexCount = pool.Length;
+        state.NewMainPrefixCount = mainPrefix.Count;
+        state.NewShadowPrefixCount = shadowPrefix.Count;
+
+        var vertexDelta = pool.Length - state.OriginalLod0VertexCount;
+        var mainIndexDelta = mainPrefix.Count - state.OriginalMainPrefixCount;
+        var shadowIndexDelta = shadowPrefix.Count - state.OriginalShadowPrefixCount;
+        foreach (var lowerLod in (meshData.LODs ?? []).Skip(1))
+        {
+            var shiftedMain = new HashSet<T3MeshBatch>(ReferenceEqualityComparer.Instance);
+            foreach (var batchList in new[] { lowerLod.Batches, lowerLod.Batches1 })
+            {
+                foreach (var batch in batchList ?? [])
+                {
+                    if (!shiftedMain.Add(batch))
+                    {
+                        continue;
+                    }
+
+                    batch.BaseIndex = AddDelta(batch.BaseIndex, vertexDelta, "vertex base");
+                    batch.StartIndex = AddDelta(batch.StartIndex, mainIndexDelta, "main index start");
+                    if (batch.AdjacencyStartIndex != 0)
+                    {
+                        batch.AdjacencyStartIndex = AddDelta(
+                            batch.AdjacencyStartIndex,
+                            mainIndexDelta,
+                            "adjacency index start");
+                    }
+                }
+            }
+
+            foreach (var batch in lowerLod.Batches2 ?? [])
+            {
+                batch.BaseIndex = AddDelta(batch.BaseIndex, vertexDelta, "shadow vertex base");
+                batch.StartIndex = AddDelta(batch.StartIndex, shadowIndexDelta, "shadow index start");
+            }
+        }
+
+        for (var bufferIndex = 2; bufferIndex < vertexState.IndexBuffer.Count; bufferIndex++)
+        {
+            vertexState.IndexBuffer[bufferIndex].Buffer = (byte[])state.IndexBuffers[bufferIndex].Clone();
+            vertexState.IndexBuffer[bufferIndex].Count =
+                (uint)(state.IndexBuffers[bufferIndex].Length / (int)vertexState.IndexBuffer[bufferIndex].Stride);
+        }
+
+        return shadowPrefix.Count / 3;
+    }
+
+    private static void ValidatePreservedV46Output(T3MeshData meshData, PreservedLodState state)
+    {
+        if (meshData.VertexStates is not { Count: > 0 })
+        {
+            throw new InvalidDataException("Batman v46 output lost its vertex state.");
+        }
+
+        var vertexState = meshData.VertexStates[0];
+        if (vertexState.VertexBuffer is null || vertexState.IndexBuffer is not { Count: >= 2 })
+        {
+            throw new InvalidDataException("Batman v46 output lost its main vertex/index buffers.");
+        }
+
+        for (var bufferIndex = 0; bufferIndex < vertexState.VertexBuffer.Count; bufferIndex++)
+        {
+            var stride = checked((int)vertexState.VertexBuffer[bufferIndex].Stride);
+            var expectedOffset = checked(state.OriginalLod0VertexCount * stride);
+            var actualOffset = checked(state.NewLod0VertexCount * stride);
+            var length = checked(state.PreservedVertexCount * stride);
+            var expected = state.VertexBuffers[bufferIndex]
+                .AsSpan(expectedOffset, length)
+                .ToArray();
+            var actual = vertexState.VertexBuffer[bufferIndex].Buffer
+                .AsSpan(actualOffset, length)
+                .ToArray();
+
+            foreach (var attr in (vertexState.Attributes ?? [])
+                         .Where(attribute =>
+                             attribute.Attribute == GFXPlatformVertexAttribute.TexCoord &&
+                             attribute.BufferIndex == (uint)bufferIndex))
+            {
+                var channel = checked((int)attr.AttributeIndex);
+                var byteCount = UvFormatSize(attr);
+                for (var lowerVertex = 0; lowerVertex < state.PreservedVertexCount; lowerVertex++)
+                {
+                    var localOffset = checked(lowerVertex * stride + (int)attr.BufferOffset);
+                    var expectedUv = ReadPreservedUv(attr, state, lowerVertex);
+                    var raw = ReadRawUv(actual, localOffset, attr);
+                    var transform = meshData.TexCoordTransform[channel];
+                    var actualUv = raw * transform.Scale + transform.Offset;
+                    if (Vector2.Distance(expectedUv, actualUv) > 0.0015f)
+                    {
+                        throw new InvalidDataException(
+                            $"Batman v46 output changed preserved lower-LOD UV channel {channel}.");
+                    }
+
+                    Array.Clear(expected, localOffset, byteCount);
+                    Array.Clear(actual, localOffset, byteCount);
+                }
+            }
+
+            if (!actual.AsSpan().SequenceEqual(expected))
+            {
+                throw new InvalidDataException(
+                    $"Batman v46 output changed non-UV data in preserved lower-LOD vertex buffer {bufferIndex}.");
+            }
+        }
+
+        ValidateIndexSuffix(0, state.OriginalMainPrefixCount, state.NewMainPrefixCount);
+        ValidateIndexSuffix(1, state.OriginalShadowPrefixCount, state.NewShadowPrefixCount);
+        return;
+
+        void ValidateIndexSuffix(int bufferIndex, int originalPrefix, int newPrefix)
+        {
+            var buffer = vertexState.IndexBuffer[bufferIndex];
+            var stride = checked((int)buffer.Stride);
+            var expected = state.IndexBuffers[bufferIndex].AsSpan(originalPrefix * stride);
+            var actual = buffer.Buffer.AsSpan(newPrefix * stride);
+            if (!actual.SequenceEqual(expected))
+            {
+                throw new InvalidDataException(
+                    $"Batman v46 output changed preserved lower-LOD index buffer {bufferIndex}.");
+            }
+        }
+
+        static int UvFormatSize(GFXPlatformAttributeParams attr) => attr.Format switch
+        {
+            GFXPlatformFormat.F32x2 => 8,
+            GFXPlatformFormat.F16x2 or GFXPlatformFormat.UN16x2 or GFXPlatformFormat.SN16x2 => 4,
+            _ => throw Unsupported(attr),
+        };
+
+        static Vector2 ReadRawUv(byte[] bytes, int offset, GFXPlatformAttributeParams attr)
+            => attr.Format switch
+            {
+                GFXPlatformFormat.F32x2 => new Vector2(
+                    BinaryPrimitives.ReadSingleLittleEndian(bytes.AsSpan(offset)),
+                    BinaryPrimitives.ReadSingleLittleEndian(bytes.AsSpan(offset + 4))),
+                GFXPlatformFormat.F16x2 => new Vector2(
+                    (float)BinaryPrimitives.ReadHalfLittleEndian(bytes.AsSpan(offset)),
+                    (float)BinaryPrimitives.ReadHalfLittleEndian(bytes.AsSpan(offset + 2))),
+                GFXPlatformFormat.UN16x2 => new Vector2(
+                    BinaryPrimitives.ReadUInt16LittleEndian(bytes.AsSpan(offset)) / 65535f,
+                    BinaryPrimitives.ReadUInt16LittleEndian(bytes.AsSpan(offset + 2)) / 65535f),
+                GFXPlatformFormat.SN16x2 => new Vector2(
+                    Math.Max(-1f, BinaryPrimitives.ReadInt16LittleEndian(bytes.AsSpan(offset)) / 32767f),
+                    Math.Max(-1f, BinaryPrimitives.ReadInt16LittleEndian(bytes.AsSpan(offset + 2)) / 32767f)),
+                _ => throw Unsupported(attr),
+            };
+    }
+
+    private static int[] SelectShadowMainBatches(
+        BatchGeometrySnapshot[] mainBatches,
+        BatchGeometrySnapshot? shadow)
+    {
+        if (shadow is null)
+        {
+            return Enumerable.Range(0, mainBatches.Length).ToArray();
+        }
+
+        var selected = mainBatches
+            .Select((batch, index) => (batch, index))
+            .Where(item =>
+                item.batch.MinVertIndex >= shadow.MinVertIndex &&
+                item.batch.MaxVertIndex <= shadow.MaxVertIndex)
+            .Select(item => item.index)
+            .ToArray();
+        return selected.Length > 0 ? selected : Enumerable.Range(0, mainBatches.Length).ToArray();
+    }
+
+    private static List<int> BuildTriangleAdjacency(List<int> indices, int start, int count)
+    {
+        var triangleCount = count / 3;
+        var oppositeByEdge = new Dictionary<(int A, int B), List<(int Triangle, int Opposite)>>();
+        for (var triangle = 0; triangle < triangleCount; triangle++)
+        {
+            var offset = start + triangle * 3;
+            var a = indices[offset];
+            var b = indices[offset + 1];
+            var c = indices[offset + 2];
+            AddEdge(a, b, triangle, c);
+            AddEdge(b, c, triangle, a);
+            AddEdge(c, a, triangle, b);
+        }
+
+        var result = new List<int>(triangleCount * 6);
+        for (var triangle = 0; triangle < triangleCount; triangle++)
+        {
+            var offset = start + triangle * 3;
+            var a = indices[offset];
+            var b = indices[offset + 1];
+            var c = indices[offset + 2];
+            result.Add(a);
+            result.Add(Adjacent(a, b, triangle, c));
+            result.Add(b);
+            result.Add(Adjacent(b, c, triangle, a));
+            result.Add(c);
+            result.Add(Adjacent(c, a, triangle, b));
+        }
+
+        return result;
+
+        void AddEdge(int a, int b, int triangle, int opposite)
+        {
+            var key = a <= b ? (a, b) : (b, a);
+            if (!oppositeByEdge.TryGetValue(key, out var values))
+            {
+                values = [];
+                oppositeByEdge[key] = values;
+            }
+
+            values.Add((triangle, opposite));
+        }
+
+        int Adjacent(int a, int b, int triangle, int boundaryOpposite)
+        {
+            var key = a <= b ? (a, b) : (b, a);
+            foreach (var candidate in oppositeByEdge[key])
+            {
+                if (candidate.Triangle != triangle)
+                {
+                    return candidate.Opposite;
+                }
+            }
+
+            return boundaryOpposite;
+        }
+    }
+
+    private static void EncodeVertexBuffersPreservingSuffix(
+        T3GFXVertexState vertexState,
+        T3MeshData meshData,
+        PoolVertex[] pool,
+        PreservedLodState state)
+    {
+        if (vertexState.VertexBuffer is null || vertexState.Attributes is null)
+        {
+            throw new InvalidDataException("Batman v46 template vertex state has no buffers/attributes.");
+        }
+
+        FitTexCoordTransforms(vertexState, meshData, pool, allowRewrite: true, state);
+        var totalVertexCount = pool.Length + state.PreservedVertexCount;
+        var newBuffers = new byte[vertexState.VertexBuffer.Count][];
+        for (var bufferIndex = 0; bufferIndex < vertexState.VertexBuffer.Count; bufferIndex++)
+        {
+            var stride = checked((int)vertexState.VertexBuffer[bufferIndex].Stride);
+            var original = state.VertexBuffers[bufferIndex];
+            var suffixOffset = checked(state.OriginalLod0VertexCount * stride);
+            var suffixLength = checked(state.PreservedVertexCount * stride);
+            if (suffixOffset + suffixLength > original.Length)
+            {
+                throw new InvalidDataException("Batman v46 lower-LOD vertex suffix is outside the template buffer.");
+            }
+
+            var target = new byte[checked(totalVertexCount * stride)];
+            Array.Copy(original, suffixOffset, target, pool.Length * stride, suffixLength);
+            newBuffers[bufferIndex] = target;
+        }
+
+        foreach (var attr in vertexState.Attributes)
+        {
+            var bufferIndex = checked((int)attr.BufferIndex);
+            if (bufferIndex < 0 || bufferIndex >= newBuffers.Length)
+            {
+                continue;
+            }
+
+            var stride = checked((int)vertexState.VertexBuffer[bufferIndex].Stride);
+            for (var vertex = 0; vertex < pool.Length; vertex++)
+            {
+                EncodeAttribute(
+                    newBuffers[bufferIndex],
+                    vertex * stride + checked((int)attr.BufferOffset),
+                    attr,
+                    pool[vertex],
+                    meshData);
+            }
+
+            if (attr.Attribute == GFXPlatformVertexAttribute.TexCoord)
+            {
+                ReencodePreservedLowerLodUvs(
+                    newBuffers[bufferIndex],
+                    attr,
+                    meshData,
+                    state,
+                    pool.Length,
+                    stride);
+            }
+        }
+
+        for (var bufferIndex = 0; bufferIndex < vertexState.VertexBuffer.Count; bufferIndex++)
+        {
+            vertexState.VertexBuffer[bufferIndex].Buffer = newBuffers[bufferIndex];
+            vertexState.VertexBuffer[bufferIndex].Count = (uint)totalVertexCount;
+        }
+    }
+
+    private static void ReencodePreservedLowerLodUvs(
+        byte[] target,
+        GFXPlatformAttributeParams attr,
+        T3MeshData meshData,
+        PreservedLodState state,
+        int newLod0VertexCount,
+        int stride)
+    {
+        var channel = checked((int)attr.AttributeIndex);
+        if (channel >= state.OriginalUvScales.Length ||
+            channel >= meshData.TexCoordTransform.Length)
+        {
+            return;
+        }
+
+        for (var lowerVertex = 0; lowerVertex < state.PreservedVertexCount; lowerVertex++)
+        {
+            var uv = ReadPreservedUv(attr, state, lowerVertex);
+            var targetOffset =
+                checked((newLod0VertexCount + lowerVertex) * stride + (int)attr.BufferOffset);
+            EncodeUv(target, targetOffset, attr, uv, meshData);
+        }
+    }
+
+    private static Vector2 ReadPreservedUv(
+        GFXPlatformAttributeParams attr,
+        PreservedLodState state,
+        int lowerVertex)
+    {
+        var bufferIndex = checked((int)attr.BufferIndex);
+        var channel = checked((int)attr.AttributeIndex);
+        var original = state.VertexBuffers[bufferIndex];
+        var vertexBufferLength = original.Length;
+        var originalVertexCount = state.OriginalLod0VertexCount + state.PreservedVertexCount;
+        var stride = vertexBufferLength / Math.Max(1, originalVertexCount);
+        var offset = checked(
+            (state.OriginalLod0VertexCount + lowerVertex) * stride +
+            (int)attr.BufferOffset);
+        Vector2 raw = attr.Format switch
+        {
+            GFXPlatformFormat.F32x2 => new Vector2(
+                BinaryPrimitives.ReadSingleLittleEndian(original.AsSpan(offset)),
+                BinaryPrimitives.ReadSingleLittleEndian(original.AsSpan(offset + 4))),
+            GFXPlatformFormat.F16x2 => new Vector2(
+                (float)BinaryPrimitives.ReadHalfLittleEndian(original.AsSpan(offset)),
+                (float)BinaryPrimitives.ReadHalfLittleEndian(original.AsSpan(offset + 2))),
+            GFXPlatformFormat.UN16x2 => new Vector2(
+                BinaryPrimitives.ReadUInt16LittleEndian(original.AsSpan(offset)) / 65535f,
+                BinaryPrimitives.ReadUInt16LittleEndian(original.AsSpan(offset + 2)) / 65535f),
+            GFXPlatformFormat.SN16x2 => new Vector2(
+                Math.Max(-1f, BinaryPrimitives.ReadInt16LittleEndian(original.AsSpan(offset)) / 32767f),
+                Math.Max(-1f, BinaryPrimitives.ReadInt16LittleEndian(original.AsSpan(offset + 2)) / 32767f)),
+            _ => throw Unsupported(attr),
+        };
+
+        var scale = state.OriginalUvScales[channel];
+        var uvOffset = state.OriginalUvOffsets[channel];
+        return raw * scale + uvOffset;
+    }
+
+    private static void EncodeV46IndexBuffer(
+        T3GFXBuffer indexBuffer,
+        IReadOnlyList<int> rebuiltPrefix,
+        byte[] original,
+        int originalPrefixCount,
+        int vertexCount)
+    {
+        var stride = checked((int)indexBuffer.Stride);
+        if (stride == 2 && vertexCount > ushort.MaxValue)
+        {
+            throw new InvalidDataException(
+                $"The new Batman model has {vertexCount} vertices, but this mesh uses 16-bit indices (max 65535).");
+        }
+
+        var suffixOffset = checked(originalPrefixCount * stride);
+        if (suffixOffset > original.Length)
+        {
+            throw new InvalidDataException("Batman v46 lower-LOD index suffix is outside the template buffer.");
+        }
+
+        var suffixLength = original.Length - suffixOffset;
+        var bytes = new byte[checked(rebuiltPrefix.Count * stride + suffixLength)];
+        for (var index = 0; index < rebuiltPrefix.Count; index++)
+        {
+            if (stride == 2)
+            {
+                WriteU16(bytes, index * 2, checked((ushort)rebuiltPrefix[index]));
+            }
+            else if (stride == 4)
+            {
+                BinaryPrimitives.WriteUInt32LittleEndian(bytes.AsSpan(index * 4), checked((uint)rebuiltPrefix[index]));
+            }
+            else
+            {
+                throw new NotSupportedException($"Batman v46 index stride {stride} is not supported.");
+            }
+        }
+
+        Array.Copy(original, suffixOffset, bytes, rebuiltPrefix.Count * stride, suffixLength);
+        indexBuffer.Buffer = bytes;
+        indexBuffer.Count = (uint)(bytes.Length / stride);
+    }
+
+    private static uint AddDelta(uint value, int delta, string field)
+    {
+        var result = (long)value + delta;
+        if (result < 0 || result > uint.MaxValue)
+        {
+            throw new InvalidDataException($"Batman v46 {field} overflowed while preserving lower LODs.");
+        }
+
+        return (uint)result;
+    }
+
     private static void EncodeVertexBuffers(T3GFXVertexState vertexState, T3MeshData meshData, PoolVertex[] pool)
     {
         if (vertexState.VertexBuffer is null || vertexState.Attributes is null)
@@ -4071,7 +4734,7 @@ public static class V45MeshReinserter
         // UVs fall outside the template's scale/offset window would clamp and distort. The transform
         // is plain per-channel scale/offset data, so it is rewritten to exactly cover the new range
         // (a same-model round-trip reproduces the original window within float precision).
-        FitTexCoordTransforms(vertexState, meshData, pool);
+        FitTexCoordTransforms(vertexState, meshData, pool, allowRewrite: true);
 
         // Fresh zeroed buffers with the template strides.
         var newBuffers = new byte[vertexState.VertexBuffer.Count][];
@@ -4113,7 +4776,14 @@ public static class V45MeshReinserter
                 break;
 
             case GFXPlatformVertexAttribute.Normal:
-                EncodeSnormVector(target, offset, attr, vertex.Normal, 0f);
+                var normalValue = attr.AttributeIndex == 0
+                    ? vertex.Normal
+                    : SafeNormalize(
+                        Vector3.Cross(
+                            vertex.Normal,
+                            new Vector3(vertex.Tangent.X, vertex.Tangent.Y, vertex.Tangent.Z))) *
+                      (vertex.Tangent.W < 0f ? -1f : 1f);
+                EncodeSnormVector(target, offset, attr, normalValue, 0f);
                 break;
 
             case GFXPlatformVertexAttribute.Tangent:
@@ -4199,7 +4869,12 @@ public static class V45MeshReinserter
     // transform is plain per-channel scale/offset data, so it is refitted to exactly cover the
     // incoming range — but ONLY when the template window cannot hold it (scene meshes with
     // tiling/lightmap channels keep their authored transform untouched).
-    private static void FitTexCoordTransforms(T3GFXVertexState vertexState, T3MeshData meshData, PoolVertex[] pool)
+    private static void FitTexCoordTransforms(
+        T3GFXVertexState vertexState,
+        T3MeshData meshData,
+        PoolVertex[] pool,
+        bool allowRewrite,
+        PreservedLodState? preservedState = null)
     {
         if (pool.Length == 0 || vertexState.Attributes is null)
         {
@@ -4229,6 +4904,18 @@ public static class V45MeshReinserter
                 min = Vector2.Min(min, uv);
                 max = Vector2.Max(max, uv);
                 hasData = true;
+            }
+            if (preservedState is not null)
+            {
+                for (var lowerVertex = 0;
+                     lowerVertex < preservedState.PreservedVertexCount;
+                     lowerVertex++)
+                {
+                    var uv = ReadPreservedUv(attr, preservedState, lowerVertex);
+                    min = Vector2.Min(min, uv);
+                    max = Vector2.Max(max, uv);
+                    hasData = true;
+                }
             }
 
             if (!hasData)
@@ -4281,6 +4968,10 @@ public static class V45MeshReinserter
             case GFXPlatformFormat.F32x2:
                 BinaryPrimitives.WriteSingleLittleEndian(target.AsSpan(offset), rawU);
                 BinaryPrimitives.WriteSingleLittleEndian(target.AsSpan(offset + 4), rawV);
+                break;
+            case GFXPlatformFormat.F16x2:
+                BinaryPrimitives.WriteHalfLittleEndian(target.AsSpan(offset), (Half)rawU);
+                BinaryPrimitives.WriteHalfLittleEndian(target.AsSpan(offset + 2), (Half)rawV);
                 break;
             case GFXPlatformFormat.UN16x2:
                 WriteU16(target, offset, (ushort)Math.Clamp(MathF.Round(rawU * 65535f), 0f, 65535f));

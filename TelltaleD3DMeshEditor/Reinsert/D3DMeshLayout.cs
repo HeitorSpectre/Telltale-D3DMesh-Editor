@@ -113,7 +113,9 @@ public sealed class D3DMeshLayout
                 throw new NotSupportedException("The Walking Dead: Michonne (V25): use single-asset 'Reimport Selected' for static meshes. Combine-Parts and skinned V25 reinsertion are not supported yet.");
             }
 
-            throw new NotSupportedException($"D3DMeshLayout currently supports only V13/14/17/18 (got {version}).");
+            throw new NotSupportedException(
+                $"No reinsertion writer is registered for D3DMesh version {version}. " +
+                "Supported reinsertion paths currently include V1, V13/14, V17/18, V25, V45 and V46.");
         }
 
         var isV18Layout = version is 17 or 18;

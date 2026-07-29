@@ -66,10 +66,24 @@ public static class DetailCompositor
 
             if (detail.IsSingleChannelMap)
             {
-                // Single-channel grime/cavity follows the ambient-occlusion convention: white leaves the
-                // albedo untouched and darker values occlude. Centring on mid-grey instead (the previous
-                // behaviour) BRIGHTENED every pixel above 0.5, which reads as an inverted detail layer.
                 var lum = (0.299f * dr + 0.587f * dg + 0.114f * db) / 255f;
+
+                // Batman also uses BC4 as a black-background COVERAGE map on scenery: zero is empty and
+                // brighter pixels mark grime, plaster specks and wear. Treating it as ordinary AO made
+                // the black background darken the whole object while the authored detail stayed bright.
+                if (detail.AverageLuminance < 0.5f)
+                {
+                    if (lum < 0.01f)
+                    {
+                        return baseArgb;
+                    }
+
+                    var shade = Math.Clamp(1f - lum * 0.45f, 0.55f, 1f);
+                    return Color.FromArgb(ba, (int)(bbr * shade), (int)(bbg * shade), (int)(bbb * shade)).ToArgb();
+                }
+
+                // Bright-background BC4 maps already follow the ambient-occlusion convention: white
+                // leaves albedo untouched and darker values occlude.
                 var factor = Math.Clamp(0.5f + lum * 0.5f, 0.5f, 1f);
                 return Color.FromArgb(ba, Math.Clamp((int)(bbr * factor), 0, 255),
                     Math.Clamp((int)(bbg * factor), 0, 255), Math.Clamp((int)(bbb * factor), 0, 255)).ToArgb();

@@ -247,7 +247,126 @@ public static class TextureResolver
             return ForceOpaque(texture);
         }
 
+        if (IsBatmanSolidHairDiffuse(candidate, texture))
+        {
+            return RepairBatmanSolidHair(texture);
+        }
+
         return texture;
+    }
+
+    private static bool IsBatmanSolidHairDiffuse(TextureCandidate candidate, TextureImage texture)
+    {
+        if (GameConfig.Current.Id != GameId.Batman ||
+            candidate.Role != TextureRole.Diffuse ||
+            texture.AverageAlpha < 0.98f ||
+            texture.NonOpaqueAlphaRatio <= 0f ||
+            texture.NonOpaqueAlphaRatio > 0.02f)
+        {
+            return false;
+        }
+
+        var stem = NormalizeStem(Path.GetFileNameWithoutExtension(candidate.Path));
+        if (!stem.Contains("hair", StringComparison.OrdinalIgnoreCase) ||
+            stem.Contains("alpha", StringComparison.OrdinalIgnoreCase) ||
+            stem.Contains("_alp", StringComparison.OrdinalIgnoreCase) ||
+            stem.Contains("lash", StringComparison.OrdinalIgnoreCase))
+        {
+            return false;
+        }
+
+        var lowAlpha = 0;
+        var whiteLowAlpha = 0;
+        foreach (var argb in texture.Pixels)
+        {
+            if (((argb >> 24) & 0xFF) >= 8)
+            {
+                continue;
+            }
+
+            lowAlpha++;
+            var r = (argb >> 16) & 0xFF;
+            var g = (argb >> 8) & 0xFF;
+            var b = argb & 0xFF;
+            if (r >= 240 && g >= 240 && b >= 240)
+            {
+                whiteLowAlpha++;
+            }
+        }
+
+        // Bruce's solid hair texture is 99.65% opaque; every remaining transparent texel contains
+        // white padding. A real hair cutout has a predominantly transparent background instead.
+        return lowAlpha > 0 && whiteLowAlpha >= lowAlpha * 3 / 4;
+    }
+
+    private static TextureImage RepairBatmanSolidHair(TextureImage source)
+    {
+        var pixels = (int[])source.Pixels.Clone();
+        for (var i = 0; i < source.Pixels.Length; i++)
+        {
+            if (((source.Pixels[i] >> 24) & 0xFF) >= 8)
+            {
+                pixels[i] |= unchecked((int)0xFF000000);
+                continue;
+            }
+
+            var x = i % source.Width;
+            var y = i / source.Width;
+            var replacement = FindNearestOpaquePixel(source, x, y);
+            pixels[i] = unchecked((int)0xFF000000) | (replacement & 0x00FFFFFF);
+        }
+
+        return new TextureImage(
+            source.Width,
+            source.Height,
+            pixels,
+            source.SourcePath,
+            source.AlphaMode,
+            source.SourceFormat);
+    }
+
+    private static int FindNearestOpaquePixel(TextureImage source, int x, int y)
+    {
+        const int MaxRadius = 16;
+        for (var radius = 1; radius <= MaxRadius; radius++)
+        {
+            var minX = Math.Max(0, x - radius);
+            var maxX = Math.Min(source.Width - 1, x + radius);
+            var minY = Math.Max(0, y - radius);
+            var maxY = Math.Min(source.Height - 1, y + radius);
+
+            for (var sampleX = minX; sampleX <= maxX; sampleX++)
+            {
+                var top = source.Pixels[minY * source.Width + sampleX];
+                if (((top >> 24) & 0xFF) >= 8)
+                {
+                    return top;
+                }
+
+                var bottom = source.Pixels[maxY * source.Width + sampleX];
+                if (((bottom >> 24) & 0xFF) >= 8)
+                {
+                    return bottom;
+                }
+            }
+
+            for (var sampleY = minY + 1; sampleY < maxY; sampleY++)
+            {
+                var left = source.Pixels[sampleY * source.Width + minX];
+                if (((left >> 24) & 0xFF) >= 8)
+                {
+                    return left;
+                }
+
+                var right = source.Pixels[sampleY * source.Width + maxX];
+                if (((right >> 24) & 0xFF) >= 8)
+                {
+                    return right;
+                }
+            }
+        }
+
+        return unchecked((int)0xFF000000);
     }
 
     private static bool IsTftbE3OpaqueDiffuseWithAuxiliaryAlpha(TextureCandidate candidate, TextureImage texture)
